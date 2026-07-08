@@ -1,0 +1,23 @@
+{
+  "name": "pk-deposco-console",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PK ↔ Deposco manual sync console (one-off web UI, Railway-deployable)",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node server.mjs",
+    "dev": "npm run build && node server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
