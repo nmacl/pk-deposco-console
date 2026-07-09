@@ -122,14 +122,35 @@ interface DeposcoCustomerOrderPayload {
     externalOrderNumber: string;
     orderSource: string;
     placedDate: string;
+    shipVia?: string;
+    shipVendor?: string;
+    freightTermsType?: string;
     shipToContact: DeposcoShipToContact;
     channels: unknown[];
     coLines: { data: DeposcoCoLine[] };
   };
 }
 
+// Ship-via comes straight off the SO header (unlike TO, which borrows it from a source SO).
+// Without it Deposco parks the customerOrder "in review" with a blank ship via.
+// PK's shipping runs on the E-Ship (LAX_*) fields, so we source from those — the combined
+// LAX_E_Ship_Agent_Service code (e.g. "FEDEX_GROUND") is exactly what the E-Ship Agent
+// Service box shows on the order, NOT the standard Shipping_Agent_Service_Code ("GROUND").
+interface ShipInfo { shipVia: string; shipVendor: string; freightTermsType: string }
+function headerShipping(header: BcRow): ShipInfo | null {
+  const service = pick(header, 'LAX_E_Ship_Agent_Service');
+  const agent = pick(header, 'LAX_Shipping_Agent_Code', 'Shipping_Agent_Code');
+  if (!service && !agent) return null;
+  return {
+    shipVia: service || agent,
+    shipVendor: agent,
+    freightTermsType: pick(header, 'LAX_Shipping_Payment_Type') || 'Prepaid',
+  };
+}
+
 function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOrderPayload {
   const soNumber = pick(header, 'No');
+  const ship = headerShipping(header);
   const data: DeposcoCoLine[] = rawLines.map((l) => {
     const num = pick(l, 'WebshopVariantCode', 'No');
     const qty = numOf(l, 'Quantity');
@@ -148,6 +169,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
       externalOrderNumber: soNumber,
       orderSource: ORDER_SOURCE,
       placedDate: toDateTime(pick(header, 'Order_Date', 'Document_Date')),
+      ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       shipToContact: shipToContact(header),
       channels: [],
       coLines: { data },
@@ -196,7 +218,9 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow)
     return;
   }
   const payload = buildCustomerOrder(header, lines);
-  await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)`);
+  const via = payload.customerOrder.shipVia;
+  if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
+  await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
