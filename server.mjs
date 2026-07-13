@@ -63,6 +63,8 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   button:disabled { opacity:.45; cursor:not-allowed; }
   .push { background:#1f6feb; border-color:#1f6feb; }
   .post { background:#238636; border-color:#238636; }
+  .inv { background:#8957e5; border-color:#8957e5; }
+  .sep { width:1px; align-self:stretch; background:#30363d; margin:0 4px; }
   .clear { background:#161b22; margin-left:auto; }
   #log { margin:0 20px 20px; padding:12px 14px; background:#010409; border:1px solid #21262d; border-radius:8px;
          height:calc(100vh - 190px); overflow:auto; font:12.5px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; }
@@ -77,6 +79,9 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   <span id="type" class="chip">enter an order</span>
   <button class="push" id="btnPush" disabled>① Push → Deposco</button>
   <button class="post" id="btnPost" disabled>② Ship / Receive → BC</button>
+  <span class="sep"></span>
+  <button class="inv" id="btnInvPull">Inventory Pull (Deposco → BC)</button>
+  <button class="inv" id="btnInvPush">Inventory Push (BC → Deposco)</button>
   <button class="clear" id="btnClear">Clear log</button>
 </div>
 <div id="log"></div>
@@ -108,6 +113,18 @@ function run(mode){
 }
 $('btnPush').onclick=()=>run('push');
 $('btnPost').onclick=()=>run('post');
+function runInv(dir){
+  const label=dir==='pull'?'INVENTORY PULL (Deposco → BC)':'INVENTORY PUSH (BC → Deposco)';
+  line('\\n──────── '+label+'  '+new Date().toLocaleTimeString()+' ────────','run');
+  $('btnInvPull').disabled=true; $('btnInvPush').disabled=true;
+  const es=new EventSource('/inv?dir='+dir);
+  es.onmessage=(e)=>line(e.data, classify(e.data));
+  const stop=()=>{ $('btnInvPull').disabled=false; $('btnInvPush').disabled=false; es.close(); };
+  es.addEventListener('done',(e)=>{ line('▸ exit '+e.data,'dim'); stop(); });
+  es.onerror=()=>{ line('▸ stream closed','dim'); stop(); };
+}
+$('btnInvPull').onclick=()=>runInv('pull');
+$('btnInvPush').onclick=()=>runInv('push');
 $('btnClear').onclick=()=>log.innerHTML='';
 order.addEventListener('keydown',(e)=>{ if(e.key==='Enter'&&!$('btnPush').disabled) run('push'); });
 refresh(); order.focus();
@@ -138,6 +155,31 @@ const server = createServer((req, res) => {
     const flag = mode === 'push' ? '--push-only' : '--post-only';
     send(`▸ ${w.kind}: node ${w.script} --order ${order} ${flag}`);
     const child = spawn('node', [resolve(ROOT, w.script), '--order', order, flag], { cwd: ROOT, env: process.env });
+
+    let buf = '';
+    const onData = (chunk) => {
+      buf += chunk.toString();
+      const parts = buf.split('\n');
+      buf = parts.pop() ?? '';
+      for (const l of parts) send(l);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('close', (code) => { if (buf) send(buf); res.write(`event: done\ndata: ${code ?? 0}\n\n`); res.end(); });
+    child.on('error', (err) => { send(`spawn error: ${err.message}`); res.write('event: done\ndata: 1\n\n'); res.end(); });
+    req.on('close', () => { child.kill(); });
+    return;
+  }
+  // Inventory-adjustment sync — one batch tick, either direction. Not order-scoped.
+  if (url.pathname === '/inv') {
+    const dir = url.searchParams.get('dir') === 'push' ? 'push' : 'pull';
+    res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+    const send = (data) => res.write(`data: ${String(data).replace(/\n/g, '\ndata: ')}\n\n`);
+
+    const flag = dir === 'pull' ? '--pull-only' : '--push-only';
+    const args = [resolve(ROOT, 'dist/inv/sync-inv.js'), '--once', flag];
+    send(`▸ inventory ${dir}: node dist/inv/sync-inv.js --once ${flag}`);
+    const child = spawn('node', args, { cwd: ROOT, env: process.env });
 
     let buf = '';
     const onData = (chunk) => {
