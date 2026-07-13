@@ -48,10 +48,12 @@ const BACKFILL = (process.env.INV_BACKFILL ?? 'false').toLowerCase() === 'true';
 const DEFAULT_FACILITY = process.env.INV_DEFAULT_FACILITY || 'HIVE';
 const DRY_RUN = process.argv.includes('--dry-run');
 
-// Deposco facility ⇄ BC location. "HIVE:WMS,DC2:MAIN" → facility HIVE = location WMS. Identity if absent.
+// Deposco facility ⇄ BC location. "HIVE:WMS,DC2:MAIN" → facility HIVE = location WMS.
+// Defaults to HIVE:WMS (the only WMS location) so the pull works without extra env config;
+// the Deposco facility number is NOT a valid BC Location Code, so this map is required.
 const facToLoc = new Map<string, string>();
 const locToFac = new Map<string, string>();
-for (const pair of (process.env.INV_LOCATION_MAP ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+for (const pair of (process.env.INV_LOCATION_MAP ?? 'HIVE:WMS').split(',').map((s) => s.trim()).filter(Boolean)) {
   const [fac, loc] = pair.split(':').map((s) => s.trim());
   if (fac && loc) { facToLoc.set(fac.toUpperCase(), loc); locToFac.set(loc.toUpperCase(), fac); }
 }
