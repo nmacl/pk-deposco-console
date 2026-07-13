@@ -81,7 +81,6 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   <button class="post" id="btnPost" disabled>② Ship / Receive → BC</button>
   <span class="sep"></span>
   <button class="inv" id="btnInvPull">Inventory Pull (Deposco → BC)</button>
-  <button class="inv" id="btnInvPush">Inventory Push (BC → Deposco)</button>
   <button class="clear" id="btnClear">Clear log</button>
 </div>
 <div id="log"></div>
@@ -113,18 +112,16 @@ function run(mode){
 }
 $('btnPush').onclick=()=>run('push');
 $('btnPost').onclick=()=>run('post');
-function runInv(dir){
-  const label=dir==='pull'?'INVENTORY PULL (Deposco → BC)':'INVENTORY PUSH (BC → Deposco)';
-  line('\\n──────── '+label+'  '+new Date().toLocaleTimeString()+' ────────','run');
-  $('btnInvPull').disabled=true; $('btnInvPush').disabled=true;
-  const es=new EventSource('/inv?dir='+dir);
+function runInvPull(){
+  line('\\n──────── INVENTORY PULL (Deposco → BC)  '+new Date().toLocaleTimeString()+' ────────','run');
+  $('btnInvPull').disabled=true;
+  const es=new EventSource('/inv?dir=pull');
   es.onmessage=(e)=>line(e.data, classify(e.data));
-  const stop=()=>{ $('btnInvPull').disabled=false; $('btnInvPush').disabled=false; es.close(); };
+  const stop=()=>{ $('btnInvPull').disabled=false; es.close(); };
   es.addEventListener('done',(e)=>{ line('▸ exit '+e.data,'dim'); stop(); });
   es.onerror=()=>{ line('▸ stream closed','dim'); stop(); };
 }
-$('btnInvPull').onclick=()=>runInv('pull');
-$('btnInvPush').onclick=()=>runInv('push');
+$('btnInvPull').onclick=runInvPull;
 $('btnClear').onclick=()=>log.innerHTML='';
 order.addEventListener('keydown',(e)=>{ if(e.key==='Enter'&&!$('btnPush').disabled) run('push'); });
 refresh(); order.focus();
@@ -170,15 +167,15 @@ const server = createServer((req, res) => {
     req.on('close', () => { child.kill(); });
     return;
   }
-  // Inventory-adjustment sync — one batch tick, either direction. Not order-scoped.
+  // Inventory-adjustment sync — one batch PULL tick (Deposco → BC). Not order-scoped.
+  // Push (BC → Deposco) is intentionally not exposed: Deposco's inventoryAdjustments endpoint
+  // is read-only and the write path needs the DISCRETE_INVENTORY_API subscription (off on HIVE).
   if (url.pathname === '/inv') {
-    const dir = url.searchParams.get('dir') === 'push' ? 'push' : 'pull';
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const send = (data) => res.write(`data: ${String(data).replace(/\n/g, '\ndata: ')}\n\n`);
 
-    const flag = dir === 'pull' ? '--pull-only' : '--push-only';
-    const args = [resolve(ROOT, 'dist/inv/sync-inv.js'), '--once', flag];
-    send(`▸ inventory ${dir}: node dist/inv/sync-inv.js --once ${flag}`);
+    const args = [resolve(ROOT, 'dist/inv/sync-inv.js'), '--once', '--pull-only'];
+    send('▸ inventory pull: node dist/inv/sync-inv.js --once --pull-only');
     const child = spawn('node', args, { cwd: ROOT, env: process.env });
 
     let buf = '';
