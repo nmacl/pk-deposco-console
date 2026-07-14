@@ -2,9 +2,11 @@
  * INVENTORY-ADJUSTMENT sync worker — a SEPARATE module from the po/co/to order sync, but
  * riding the same BC + Deposco auth and shared layer. Bidirectional:
  *
- *   PULL  Deposco → BC : new /inventory/inventoryAdjustments (actionType=Adjustment) become
- *                        BC item-journal Positive/Negative Adjmt. via the bmiInventoryAdjustments
- *                        write API. Cursor = highest Deposco adjustment self.id seen.
+ *   PULL  Deposco → BC : new /inventory/inventoryAdjustments NETTED per item (Deposco is the
+ *                        1:1 source of truth) → one BC item-journal Positive/Negative Adjmt. per
+ *                        item via the bmiInventoryAdjustments write API. Netting makes it
+ *                        order-independent and avoids intermediate negative-inventory underflow.
+ *                        Cursor = highest Deposco adjustment self.id seen; failures dead-lettered.
  *   PUSH  BC → Deposco : new adjustment item-ledger entries (bmiItemLedgerEntries) become
  *                        Deposco inventory adjustments. Cursor = highest BC ILE entryNo seen.
  *
@@ -29,7 +31,7 @@
  *      INV_DEFAULT_FACILITY(HIVE), BC_* / DEPOSCO_*.
  */
 import 'dotenv/config';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, appendFile } from 'node:fs/promises';
 import { type AxiosError } from 'axios';
 import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
@@ -78,49 +80,82 @@ async function saveState(s: State): Promise<void> {
   await writeFile(STATE_FILE, JSON.stringify(s, null, 2));
 }
 
+// Adjustments that can't post (unmappable item, or a net that BC still rejects) are appended
+// here rather than blocking the batch — surfaced for manual resolution / re-drive.
+const DEADLETTER_FILE = process.env.INV_DEADLETTER_FILE || '.inv-failed.jsonl';
+async function deadLetter(entry: Record<string, unknown>): Promise<void> {
+  if (DRY_RUN) return;
+  const at = new Date().toISOString();
+  try { await appendFile(DEADLETTER_FILE, JSON.stringify({ at, ...entry }) + '\n'); }
+  catch { /* best-effort; the console log already shows it */ }
+}
+
 // ── PULL: Deposco adjustments → BC item journal ────────────────────────────────
+// 1:1 model — Deposco is the source of truth. Each adjustment is applied EXACTLY ONCE, in id
+// order (idempotent via externalAdjustmentId = the Deposco id). BC never goes below zero: the
+// AL codeunit floors decrements at BC's actual on-hand. When BC can't fully match a Deposco
+// decrement (it was already lower), that's a real DESYNC — logged per item + summarized at the
+// end. A hard failure (unmappable item, unexpected BC error) is dead-lettered and the batch
+// continues — one bad adjustment never blocks the rest.
+interface Desync { id: number; webshop: string; item: string; location: string; requested: number; posted: number; note: string }
 async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, state: State, onlyId?: number): Promise<void> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const bToken = await getBcToken(cfg);
-  const all = await fetchInventoryAdjustments(deposcoCfg, dToken, { actionType: onlyId ? undefined : 'Adjustment' });
+  const all = await fetchInventoryAdjustments(deposcoCfg, dToken, {}); // all types — cursor must clear the whole range
 
-  let candidates = all.filter((a) => a.self?.id != null);
-  if (onlyId) candidates = candidates.filter((a) => a.self.id === onlyId);
-  else candidates = candidates.filter((a) => a.self.id > state.lastDeposcoAdjId);
-  candidates.sort((a, b) => a.self.id - b.self.id); // oldest first
+  let inRange = all.filter((a) => a.self?.id != null);
+  if (onlyId) inRange = inRange.filter((a) => a.self.id === onlyId);
+  else inRange = inRange.filter((a) => a.self.id > state.lastDeposcoAdjId);
+  inRange.sort((a, b) => a.self.id - b.self.id); // chronological — apply in the order Deposco recorded them
+  if (inRange.length === 0) { console.log(`[pull] no new adjustments (cursor id=${state.lastDeposcoAdjId})`); return; }
+  console.log(`[pull] ${inRange.length} adjustment(s) #${inRange[0].self.id}-#${inRange[inRange.length - 1].self.id} → BC (exactly-once, floor-at-zero)`);
 
-  if (candidates.length === 0) { console.log(`[pull] no new adjustments (cursor id=${state.lastDeposcoAdjId})`); return; }
-  console.log(`[pull] ${candidates.length} new adjustment(s) to apply to BC`);
+  const desyncs: Desync[] = [];
+  let posted = 0, floored = 0, skipped = 0, failed = 0;
+  const advance = (id: number) => { if (!onlyId) state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); };
 
-  for (const a of candidates) {
+  for (const a of inRange) {
     const id = a.self.id;
     try {
-      if (a.actionType !== 'Adjustment') { console.log(`[pull] #${id}: actionType='${a.actionType}' (status change) — skip+log`); state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); continue; }
-      if ((a.reasonCode ?? '') === PUSH_REASON) { console.log(`[pull] #${id}: reasonCode=${PUSH_REASON} → BC-origin echo, skip`); state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); continue; }
+      if (a.actionType !== 'Adjustment') { console.log(`[pull] #${id}: '${a.actionType}' (status change) — skip`); skipped++; advance(id); await saveState(state); continue; }
+      if ((a.reasonCode ?? '') === PUSH_REASON) { console.log(`[pull] #${id}: ${PUSH_REASON} echo — skip`); skipped++; advance(id); await saveState(state); continue; }
 
       const webshop = a.item?.businessKey?.number ?? '';
       const ref = await resolveByWebshopCode(cfg, bToken, webshop);
-      if (!ref) { console.warn(`[pull] #${id}: no BC variant for WebshopVariantCode '${webshop}' — skip`); state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); continue; }
+      if (!ref) { console.warn(`[pull] #${id}: no BC variant for '${webshop}' — DEAD-LETTER`); await deadLetter({ id, webshop, reason: 'no BC variant' }); failed++; advance(id); await saveState(state); continue; }
       const location = facilityToLocation(a.facility?.businessKey?.number ?? DEFAULT_FACILITY);
-      const line = `#${id} ${webshop} → ${ref.itemNo}/${ref.variantCode} @${location} qty=${a.quantity} reason=${a.reasonCode ?? ''}`;
+      const desc = `#${id} ${webshop} → ${ref.itemNo}/${ref.variantCode} @${location} ${a.quantity > 0 ? '+' : ''}${a.quantity}`;
 
-      if (DRY_RUN) { console.log(`[pull] DRY ${line}`); state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); continue; }
+      if (DRY_RUN) { console.log(`[pull] DRY ${desc}`); advance(id); continue; }
 
       const res = await postBcAdjustment(cfg, companyId, bToken, {
-        itemNo: ref.itemNo, variantCode: ref.variantCode, locationCode: location,
-        quantity: a.quantity, reasonCode: a.reasonCode || undefined, externalAdjustmentId: String(id),
+        itemNo: ref.itemNo, variantCode: ref.variantCode, locationCode: location, quantity: a.quantity, externalAdjustmentId: String(id),
       });
-      console.log(`[pull] ✅ ${line} → ILE ${res.itemLedgerEntryNo ?? '?'} doc ${res.documentNo ?? '?'}`);
-      state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id);
-      await saveState(state);
+      if (res.errorMessage) {
+        // floored/clamped by the AL codeunit — BC could not fully match Deposco = a real desync
+        console.warn(`[pull] ⚠ ${desc} — ${res.errorMessage}`);
+        desyncs.push({ id, webshop, item: `${ref.itemNo}/${ref.variantCode}`, location, requested: a.quantity, posted: res.postedQuantity ?? 0, note: res.errorMessage });
+        floored++;
+      } else {
+        console.log(`[pull] ✅ ${desc} → posted ${res.postedQuantity ?? a.quantity}, ILE ${res.itemLedgerEntryNo ?? '?'}`);
+        posted++;
+      }
+      advance(id); await saveState(state);
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
-      // "already been posted" = idempotency hit → advance cursor, it's fine.
-      if (/already been posted/i.test(body)) { console.log(`[pull] #${id}: already posted (idempotent) — advancing cursor`); state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); await saveState(state); continue; }
-      console.error(`[pull] #${id} FAILED HTTP ${e.response?.status}: ${body}`);
-      break; // stop so the cursor doesn't skip past an unposted adjustment
+      if (/already been posted/i.test(body)) { console.log(`[pull] #${id}: already posted (idempotent)`); advance(id); await saveState(state); continue; }
+      console.error(`[pull] #${id} FAILED HTTP ${e.response?.status}: ${body} — DEAD-LETTER, continuing`);
+      await deadLetter({ id, error: body }); failed++; advance(id); await saveState(state);
     }
+  }
+
+  console.log(`[pull] done: ${posted} posted, ${floored} floored, ${skipped} skipped, ${failed} dead-lettered → cursor id=${state.lastDeposcoAdjId}`);
+  if (desyncs.length) {
+    console.log(`[pull] ⚠ ${desyncs.length} BC↔Deposco DESYNC(s) — BC on-hand was lower than Deposco's decrement:`);
+    for (const d of desyncs) console.log(`   • ${d.webshop} (${d.item}) @${d.location}: Deposco ${d.requested > 0 ? '+' : ''}${d.requested}, BC posted ${d.posted} — ${d.note}`);
+  } else if (!DRY_RUN && (posted > 0 || floored === 0)) {
+    console.log('[pull] ✓ no desyncs — BC is in sync with Deposco for this batch');
   }
 }
 

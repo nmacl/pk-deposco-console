@@ -7,3 +7,5 @@ dist
 *.log
 
 .inv-state.json
+
+.inv-failed.jsonl

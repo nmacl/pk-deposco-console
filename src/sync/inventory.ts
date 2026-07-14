@@ -109,7 +109,7 @@ export async function resolveWebshopCode(cfg: SyncBcConfig, token: string, itemN
 }
 
 // ── BC write (pull target) ────────────────────────────────────────────────────
-export interface BcAdjustmentResult { entryNo?: number; posted?: boolean; itemLedgerEntryNo?: number; documentNo?: string; errorMessage?: string }
+export interface BcAdjustmentResult { entryNo?: number; posted?: boolean; postedQuantity?: number; itemLedgerEntryNo?: number; documentNo?: string; errorMessage?: string }
 
 /** POST one adjustment to the new bmiInventoryAdjustments write API (posts to the item journal). */
 export async function postBcAdjustment(
