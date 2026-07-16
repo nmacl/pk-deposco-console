@@ -27,7 +27,7 @@
  *
  * Env: INV_SYNC_INTERVAL_MS(60000), INV_PULL_ENABLED(false), INV_PUSH_ENABLED(false),
  *      INV_PUSH_REASON(BCSYNC), INV_STATE_FILE(.inv-state.json), INV_BACKFILL(false),
- *      INV_LOCATION_MAP("HIVE:WMS" — Deposco facility ⇄ BC location; identity if unset),
+ *      INV_LOCATION_MAP("HIVE:WESTERLY" — Deposco facility ⇄ BC location; identity if unset),
  *      INV_DEFAULT_FACILITY(HIVE), BC_* / DEPOSCO_*.
  */
 import 'dotenv/config';
@@ -50,12 +50,13 @@ const BACKFILL = (process.env.INV_BACKFILL ?? 'false').toLowerCase() === 'true';
 const DEFAULT_FACILITY = process.env.INV_DEFAULT_FACILITY || 'HIVE';
 const DRY_RUN = process.argv.includes('--dry-run');
 
-// Deposco facility ⇄ BC location. "HIVE:WMS,DC2:MAIN" → facility HIVE = location WMS.
-// Defaults to HIVE:WMS (the only WMS location) so the pull works without extra env config;
-// the Deposco facility number is NOT a valid BC Location Code, so this map is required.
+// Deposco facility ⇄ BC location. "HIVE:WESTERLY,DC2:MAIN" → facility HIVE = location WESTERLY.
+// Defaults to HIVE:WESTERLY (warehouse activities are off there, so no bin-mandatory hassle)
+// so the pull works without extra env config; the Deposco facility number is NOT a valid BC
+// Location Code, so this map is required. Override via INV_LOCATION_MAP to retarget.
 const facToLoc = new Map<string, string>();
 const locToFac = new Map<string, string>();
-for (const pair of (process.env.INV_LOCATION_MAP ?? 'HIVE:WMS').split(',').map((s) => s.trim()).filter(Boolean)) {
+for (const pair of (process.env.INV_LOCATION_MAP ?? 'HIVE:WESTERLY').split(',').map((s) => s.trim()).filter(Boolean)) {
   const [fac, loc] = pair.split(':').map((s) => s.trim());
   if (fac && loc) { facToLoc.set(fac.toUpperCase(), loc); locToFac.set(loc.toUpperCase(), fac); }
 }
