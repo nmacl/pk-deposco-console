@@ -6,7 +6,7 @@
  * sync workers and streams their verbose stdout/stderr to the browser (SSE):
  *   TRFO...                      → dist/to/sync-to.js   (transfer)
  *   WSP...                       → dist/po/sync-po.js   (purchase order)
- *   PKSO/WSOD/HDSO/DISO...       → dist/co/sync-co.js   (sales -> customer order)
+ *   PKSO/WSOD/HDSO/DISO/TEST...  → dist/co/sync-co.js   (sales -> customer order)
  * Two buttons per order: "Push → Deposco" (--push-only) and "Ship/Receive → BC" (--post-only).
  *
  * Env:
@@ -40,7 +40,7 @@ function workerFor(order) {
   const u = order.toUpperCase();
   if (u.startsWith('TRFO')) return { script: 'dist/to/sync-to.js', kind: 'transfer' };
   if (u.startsWith('WSP')) return { script: 'dist/po/sync-po.js', kind: 'purchase order' };
-  if (/^(PKSO|WSOD|HDSO|DISO)/.test(u)) return { script: 'dist/co/sync-co.js', kind: 'sales order' };
+  if (/^(PKSO|WSOD|HDSO|DISO|TEST)/.test(u)) return { script: 'dist/co/sync-co.js', kind: 'sales order' };
   return null;
 }
 
@@ -73,7 +73,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
 <header><h1>PK ↔ Deposco Sync Console</h1>
-<div class="sub">Type a BC order # (TRFO / WSP / PKSO / WSOD / HDSO / DISO). ① pushes it to Deposco. ② posts the Deposco ship/receive back to BC.</div></header>
+<div class="sub">Type a BC order # (TRFO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes it to Deposco. ② posts the Deposco ship/receive back to BC.</div></header>
 <div class="bar">
   <input id="order" placeholder="TRFO001460" autocomplete="off" spellcheck="false"/>
   <span id="type" class="chip">enter an order</span>
@@ -87,7 +87,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
 <script>
 const $=(id)=>document.getElementById(id);
 const order=$('order'), type=$('type'), log=$('log');
-const kinds=[['TRFO','transfer'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order']];
+const kinds=[['TRFO','transfer'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
 function detect(v){ v=v.trim().toUpperCase(); const m=kinds.find(([p])=>v.startsWith(p)); return v?(m?m[1]:null):undefined; }
 function refresh(){
   const k=detect(order.value);
