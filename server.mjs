@@ -73,9 +73,9 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
 <header><h1>PK ↔ Deposco Sync Console</h1>
-<div class="sub">Type a BC order # (TRFO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes it to Deposco. ② posts the Deposco ship/receive back to BC.</div></header>
+<div class="sub">Type one or more BC order #s — space/comma separated (TRFO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
 <div class="bar">
-  <input id="order" placeholder="TRFO001460" autocomplete="off" spellcheck="false"/>
+  <input id="order" placeholder="WSOD139248, WSOD139249 TEST0001" autocomplete="off" spellcheck="false"/>
   <span id="type" class="chip">enter an order</span>
   <button class="push" id="btnPush" disabled>① Push → Deposco</button>
   <button class="post" id="btnPost" disabled>② Ship / Receive → BC</button>
@@ -88,26 +88,28 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
 const $=(id)=>document.getElementById(id);
 const order=$('order'), type=$('type'), log=$('log');
 const kinds=[['TRFO','transfer'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
-function detect(v){ v=v.trim().toUpperCase(); const m=kinds.find(([p])=>v.startsWith(p)); return v?(m?m[1]:null):undefined; }
+function parseOrders(v){ return [...new Set(v.split(/[\\s,]+/).map(s=>s.trim().toUpperCase()).filter(Boolean))]; }
+function detectOne(o){ const m=kinds.find(([p])=>o.startsWith(p)); return m?m[1]:null; }
 function refresh(){
-  const k=detect(order.value);
-  if(k===undefined){ type.textContent='enter an order'; type.className='chip'; }
-  else if(k===null){ type.textContent='unknown prefix'; type.className='chip bad'; }
-  else { type.textContent=k; type.className='chip ok'; }
-  const ok = !!k;
+  const list=parseOrders(order.value);
+  const valid=list.filter(detectOne), bad=list.filter(o=>!detectOne(o));
+  if(list.length===0){ type.textContent='enter order(s)'; type.className='chip'; }
+  else if(valid.length===0){ type.textContent='unknown prefix'; type.className='chip bad'; }
+  else { type.textContent=valid.length+' order'+(valid.length>1?'s':'')+(bad.length?' (+'+bad.length+' unknown)':''); type.className='chip ok'; }
+  const ok = valid.length>0;
   $('btnPush').disabled=!ok; $('btnPost').disabled=!ok;
 }
 order.addEventListener('input',refresh);
 function line(text,cls){ const el=document.createElement('span'); el.className='ln '+(cls||''); el.textContent=text; log.appendChild(el); log.scrollTop=log.scrollHeight; }
 function classify(t){ if(/error|fatal|❌|failed/i.test(t))return'err'; if(/warn|⚠|skip/i.test(t))return'warn'; if(/✅|posted|ok\\b|accepted|completed|HTTP 20/i.test(t))return'ok'; return ''; }
 function run(mode){
-  const o=order.value.trim().toUpperCase(); if(!o)return;
+  const list=parseOrders(order.value); if(!list.length)return;
   const label=mode==='push'?'PUSH → Deposco':'SHIP/RECEIVE → BC';
-  line('\\n──────── '+o+'  '+label+'  '+new Date().toLocaleTimeString()+' ────────','run');
+  line('\\n════════ '+list.length+' order(s)  '+label+'  '+new Date().toLocaleTimeString()+' ════════','run');
   $('btnPush').disabled=true; $('btnPost').disabled=true;
-  const es=new EventSource('/sync?order='+encodeURIComponent(o)+'&mode='+mode);
+  const es=new EventSource('/sync?orders='+encodeURIComponent(list.join(','))+'&mode='+mode);
   es.onmessage=(e)=>line(e.data, classify(e.data));
-  es.addEventListener('done',(e)=>{ line('▸ exit '+e.data,'dim'); es.close(); refresh(); });
+  es.addEventListener('done',(e)=>{ line('▸ batch done (exit '+e.data+')','dim'); es.close(); refresh(); });
   es.onerror=()=>{ line('▸ stream closed','dim'); es.close(); refresh(); };
 }
 $('btnPush').onclick=()=>run('push');
@@ -140,31 +142,50 @@ const server = createServer((req, res) => {
     return;
   }
   if (url.pathname === '/sync') {
-    const order = (url.searchParams.get('order') || '').trim();
+    // Accepts one or many orders (?orders=A,B,C — or legacy ?order=A). Mixed types are fine;
+    // each routes to its own worker and runs SEQUENTIALLY (readable logs, no concurrent posts).
+    const raw = url.searchParams.get('orders') || url.searchParams.get('order') || '';
     const mode = url.searchParams.get('mode') === 'post' ? 'post' : 'push';
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const send = (data) => res.write(`data: ${String(data).replace(/\n/g, '\ndata: ')}\n\n`);
+    const done = (code) => { res.write(`event: done\ndata: ${code}\n\n`); res.end(); };
 
-    if (!/^[A-Za-z0-9._-]+$/.test(order)) { send('invalid order number'); res.write('event: done\ndata: 1\n\n'); res.end(); return; }
-    const w = workerFor(order);
-    if (!w) { send(`unknown order prefix: ${order}`); res.write('event: done\ndata: 1\n\n'); res.end(); return; }
+    const orders = [...new Set(raw.split(/[\s,]+/).map((s) => s.trim().toUpperCase()).filter(Boolean))].slice(0, 50);
+    if (orders.length === 0) { send('no order numbers provided'); return done(1); }
 
     const flag = mode === 'push' ? '--push-only' : '--post-only';
-    send(`▸ ${w.kind}: node ${w.script} --order ${order} ${flag}`);
-    const child = spawn('node', [resolve(ROOT, w.script), '--order', order, flag], { cwd: ROOT, env: process.env });
+    let currentChild = null;
+    let aborted = false;
+    req.on('close', () => { aborted = true; if (currentChild) currentChild.kill(); });
 
-    let buf = '';
-    const onData = (chunk) => {
-      buf += chunk.toString();
-      const parts = buf.split('\n');
-      buf = parts.pop() ?? '';
-      for (const l of parts) send(l);
-    };
-    child.stdout.on('data', onData);
-    child.stderr.on('data', onData);
-    child.on('close', (code) => { if (buf) send(buf); res.write(`event: done\ndata: ${code ?? 0}\n\n`); res.end(); });
-    child.on('error', (err) => { send(`spawn error: ${err.message}`); res.write('event: done\ndata: 1\n\n'); res.end(); });
-    req.on('close', () => { child.kill(); });
+    const runOne = (order) => new Promise((resolveRun) => {
+      if (!/^[A-Za-z0-9._-]+$/.test(order)) { send(`⚠ ${order}: invalid order number — skipped`); return resolveRun(); }
+      const w = workerFor(order);
+      if (!w) { send(`⚠ ${order}: unknown order prefix — skipped`); return resolveRun(); }
+      send(`\n──────── ${order}  (${w.kind})  ${flag} ────────`);
+      const child = spawn('node', [resolve(ROOT, w.script), '--order', order, flag], { cwd: ROOT, env: process.env });
+      currentChild = child;
+      let buf = '';
+      const onData = (chunk) => {
+        buf += chunk.toString();
+        const parts = buf.split('\n');
+        buf = parts.pop() ?? '';
+        for (const l of parts) send(l);
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      child.on('close', (code) => { if (buf) send(buf); send(`▸ ${order} exit ${code ?? 0}`); currentChild = null; resolveRun(); });
+      child.on('error', (err) => { send(`▸ ${order} spawn error: ${err.message}`); currentChild = null; resolveRun(); });
+    });
+
+    (async () => {
+      send(`▸ ${orders.length} order(s) [${mode}]: ${orders.join(', ')}`);
+      for (const order of orders) {
+        if (aborted) break;
+        await runOne(order);
+      }
+      if (!aborted) done(0);
+    })();
     return;
   }
   // Inventory-adjustment sync — one batch PULL tick (Deposco → BC). Not order-scoped.
