@@ -40,6 +40,7 @@ import {
   fetchInventoryAdjustments, postInventoryAdjustment, fetchBcAdjustmentEntries,
   maxBcAdjustmentEntryNo, postBcAdjustment, resolveByWebshopCode, resolveWebshopCode, companyIdFor,
 } from '../sync/inventory.js';
+import { startRun, finishRun, logEvent, closeDb, type SyncEvent } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.INV_SYNC_INTERVAL_MS ?? '60000', 10);
 const PULL_ENABLED = (process.env.INV_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
@@ -111,6 +112,11 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
   if (inRange.length === 0) { console.log(`[pull] no new adjustments (cursor id=${state.lastDeposcoAdjId})`); return; }
   console.log(`[pull] ${inRange.length} adjustment(s) #${inRange[0].self.id}-#${inRange[inRange.length - 1].self.id} → BC (exactly-once, floor-at-zero)`);
 
+  // Structured logging (no-ops without DATABASE_URL; skipped entirely on dry-run).
+  const runId = DRY_RUN ? null : await startRun('inv_pull', process.env.SYNC_TRIGGER || 'manual');
+  const ev = (id: number, status: SyncEvent['status'], extra: Partial<SyncEvent> = {}): Promise<void> | undefined =>
+    DRY_RUN ? undefined : logEvent({ runId, worker: 'inv_pull', direction: 'deposco->bc', entityType: 'inventory_adj', entityId: String(id), dedupeKey: `inv:${id}`, action: 'pull', status, ...extra });
+
   const desyncs: Desync[] = [];
   let posted = 0, floored = 0, skipped = 0, failed = 0;
   const advance = (id: number) => { if (!onlyId) state.lastDeposcoAdjId = Math.max(state.lastDeposcoAdjId, id); };
@@ -118,12 +124,12 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
   for (const a of inRange) {
     const id = a.self.id;
     try {
-      if (a.actionType !== 'Adjustment') { console.log(`[pull] #${id}: '${a.actionType}' (status change) — skip`); skipped++; advance(id); await saveState(state); continue; }
-      if ((a.reasonCode ?? '') === PUSH_REASON) { console.log(`[pull] #${id}: ${PUSH_REASON} echo — skip`); skipped++; advance(id); await saveState(state); continue; }
+      if (a.actionType !== 'Adjustment') { console.log(`[pull] #${id}: '${a.actionType}' (status change) — skip`); skipped++; await ev(id, 'skip', { message: `status change (actionType=${a.actionType})` }); advance(id); await saveState(state); continue; }
+      if ((a.reasonCode ?? '') === PUSH_REASON) { console.log(`[pull] #${id}: ${PUSH_REASON} echo — skip`); skipped++; await ev(id, 'skip', { message: `${PUSH_REASON} echo` }); advance(id); await saveState(state); continue; }
 
       const webshop = a.item?.businessKey?.number ?? '';
       const ref = await resolveByWebshopCode(cfg, bToken, webshop);
-      if (!ref) { console.warn(`[pull] #${id}: no BC variant for '${webshop}' — DEAD-LETTER`); await deadLetter({ id, webshop, reason: 'no BC variant' }); failed++; advance(id); await saveState(state); continue; }
+      if (!ref) { console.warn(`[pull] #${id}: no BC variant for '${webshop}' — DEAD-LETTER`); await deadLetter({ id, webshop, reason: 'no BC variant' }); failed++; await ev(id, 'fail', { side: 'bc', message: `no BC variant for '${webshop}'`, detail: { webshop } }); advance(id); await saveState(state); continue; }
       const location = facilityToLocation(a.facility?.businessKey?.number ?? DEFAULT_FACILITY);
       const desc = `#${id} ${webshop} → ${ref.itemNo}/${ref.variantCode} @${location} ${a.quantity > 0 ? '+' : ''}${a.quantity}`;
 
@@ -132,25 +138,29 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
       const res = await postBcAdjustment(cfg, companyId, bToken, {
         itemNo: ref.itemNo, variantCode: ref.variantCode, locationCode: location, quantity: a.quantity, externalAdjustmentId: String(id),
       });
+      const evDetail = { item: `${ref.itemNo}/${ref.variantCode}`, location, requested: a.quantity, posted: res.postedQuantity ?? a.quantity, ile: res.itemLedgerEntryNo };
       if (res.errorMessage) {
         // floored/clamped by the AL codeunit — BC could not fully match Deposco = a real desync
         console.warn(`[pull] ⚠ ${desc} — ${res.errorMessage}`);
         desyncs.push({ id, webshop, item: `${ref.itemNo}/${ref.variantCode}`, location, requested: a.quantity, posted: res.postedQuantity ?? 0, note: res.errorMessage });
         floored++;
+        await ev(id, 'desync', { action: 'floor', side: 'bc', message: res.errorMessage, detail: evDetail });
       } else {
         console.log(`[pull] ✅ ${desc} → posted ${res.postedQuantity ?? a.quantity}, ILE ${res.itemLedgerEntryNo ?? '?'}`);
         posted++;
+        await ev(id, 'ok', { action: 'post', message: desc, detail: evDetail });
       }
       advance(id); await saveState(state);
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
-      if (/already been posted/i.test(body)) { console.log(`[pull] #${id}: already posted (idempotent)`); advance(id); await saveState(state); continue; }
+      if (/already been posted/i.test(body)) { console.log(`[pull] #${id}: already posted (idempotent)`); await ev(id, 'skip', { message: 'already posted (idempotent)' }); advance(id); await saveState(state); continue; }
       console.error(`[pull] #${id} FAILED HTTP ${e.response?.status}: ${body} — DEAD-LETTER, continuing`);
-      await deadLetter({ id, error: body }); failed++; advance(id); await saveState(state);
+      await deadLetter({ id, error: body }); failed++; await ev(id, 'fail', { side: 'bc', message: `HTTP ${e.response?.status}`, detail: body }); advance(id); await saveState(state);
     }
   }
 
+  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted, floored, skipped, failed });
   console.log(`[pull] done: ${posted} posted, ${floored} floored, ${skipped} skipped, ${failed} dead-lettered → cursor id=${state.lastDeposcoAdjId}`);
   if (desyncs.length) {
     console.log(`[pull] ⚠ ${desyncs.length} BC↔Deposco DESYNC(s) — BC on-hand was lower than Deposco's decrement:`);
@@ -233,6 +243,7 @@ async function main(): Promise<void> {
   if (adjArg != null) {
     console.log(`[inv] single pull of Deposco adjustment #${adjArg}${DRY_RUN ? ' (dry-run)' : ''}`);
     await pull(cfg, deposcoCfg, companyId, state, adjArg);
+    await closeDb();
     return;
   }
 
@@ -242,7 +253,7 @@ async function main(): Promise<void> {
   console.log(`[inv-sync] starting — interval=${INTERVAL_MS}ms pull=${PULL_ENABLED}&${doPull} push=${PUSH_ENABLED}&${doPush} reason=${PUSH_REASON}${DRY_RUN ? ' DRY-RUN' : ''}${once ? ' (single tick)' : ''}`);
 
   const opts = { pull: doPull && (PULL_ENABLED || DRY_RUN || once), push: doPush && (PUSH_ENABLED || DRY_RUN || once) };
-  if (once) { await tick(cfg, deposcoCfg, companyId, state, opts); return; }
+  if (once) { await tick(cfg, deposcoCfg, companyId, state, opts); await closeDb(); return; }
   for (;;) {
     const t0 = Date.now();
     try { await tick(cfg, deposcoCfg, companyId, state, { pull: doPull && PULL_ENABLED, push: doPush && PUSH_ENABLED }); }
