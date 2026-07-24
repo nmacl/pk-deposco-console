@@ -30,6 +30,28 @@ function db() {
   return pgPool;
 }
 
+// Console-level logging for order piping — one sync_event per order (ok/fail + the error line),
+// so po/co/to runs show up in /logs uniformly without editing each worker. Never throws.
+async function logRunStart(worker, trigger) {
+  const p = db(); if (!p) return null;
+  try { return (await p.query('insert into sync_runs(worker,trigger) values($1,$2) returning id', [worker, trigger])).rows[0].id; }
+  catch (e) { console.warn('[logs] run start:', e.message); return null; }
+}
+async function logRunFinish(id, status, counts) {
+  const p = db(); if (!p || id == null) return;
+  try { await p.query('update sync_runs set finished_at=now(), status=$2, counts=$3 where id=$1', [id, status, JSON.stringify(counts)]); }
+  catch (e) { console.warn('[logs] run finish:', e.message); }
+}
+async function logOrderEvent(ev) {
+  const p = db(); if (!p) return;
+  try {
+    await p.query(
+      `insert into sync_events(run_id,worker,direction,entity_type,entity_id,action,status,side,message)
+       values($1,$2,$3,'order',$4,$5,$6,$7,$8)`,
+      [ev.runId ?? null, ev.worker, ev.direction ?? null, ev.entityId ?? null, ev.action ?? null, ev.status, ev.side ?? null, ev.message ?? null]);
+  } catch (e) { console.warn('[logs] event:', e.message); }
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -254,31 +276,41 @@ const server = createServer((req, res) => {
     req.on('close', () => { aborted = true; if (currentChild) currentChild.kill(); });
 
     const runOne = (order) => new Promise((resolveRun) => {
-      if (!/^[A-Za-z0-9._-]+$/.test(order)) { send(`⚠ ${order}: invalid order number — skipped`); return resolveRun(); }
+      if (!/^[A-Za-z0-9._-]+$/.test(order)) { send(`⚠ ${order}: invalid order number — skipped`); return resolveRun({ order, skipped: true }); }
       const w = workerFor(order);
-      if (!w) { send(`⚠ ${order}: unknown order prefix — skipped`); return resolveRun(); }
+      if (!w) { send(`⚠ ${order}: unknown order prefix — skipped`); return resolveRun({ order, skipped: true }); }
       send(`\n──────── ${order}  (${w.kind})  ${flag} ────────`);
       const child = spawn('node', [resolve(ROOT, w.script), '--order', order, flag], { cwd: ROOT, env: process.env });
       currentChild = child;
-      let buf = '';
+      const worker = w.script.split('/')[1]; // co | po | to
+      let buf = '', lastErr = '', lastLine = '';
       const onData = (chunk) => {
         buf += chunk.toString();
         const parts = buf.split('\n');
         buf = parts.pop() ?? '';
-        for (const l of parts) send(l);
+        for (const l of parts) { send(l); const t = l.trim(); if (t) lastLine = t; if (/error|fatal|failed|❌|not subscribed|not found|HTTP [45]\d\d/i.test(l)) lastErr = t; }
       };
       child.stdout.on('data', onData);
       child.stderr.on('data', onData);
-      child.on('close', (code) => { if (buf) send(buf); send(`▸ ${order} exit ${code ?? 0}`); currentChild = null; resolveRun(); });
-      child.on('error', (err) => { send(`▸ ${order} spawn error: ${err.message}`); currentChild = null; resolveRun(); });
+      child.on('close', (code) => { if (buf) { send(buf); const t = buf.trim(); if (t) lastLine = t; if (/error|fatal|failed|❌/i.test(buf)) lastErr = t; } send(`▸ ${order} exit ${code ?? 0}`); currentChild = null; resolveRun({ order, worker, code: code ?? 0, lastErr, lastLine }); });
+      child.on('error', (err) => { send(`▸ ${order} spawn error: ${err.message}`); currentChild = null; resolveRun({ order, worker, code: 1, lastErr: `spawn error: ${err.message}`, lastLine: '' }); });
     });
 
     (async () => {
       send(`▸ ${orders.length} order(s) [${mode}]: ${orders.join(', ')}`);
+      const runId = await logRunStart('orders', 'manual');
+      const direction = mode === 'push' ? 'bc->deposco' : 'deposco->bc';
+      let ok = 0, fail = 0;
       for (const order of orders) {
         if (aborted) break;
-        await runOne(order);
+        const r = await runOne(order);
+        if (r.skipped) continue;
+        const status = r.code === 0 ? 'ok' : 'fail';
+        if (status === 'ok') ok++; else fail++;
+        const side = /EOM|not subscribed|deposco/i.test(r.lastErr) ? 'deposco' : (status === 'fail' ? 'bc' : undefined);
+        await logOrderEvent({ runId, worker: r.worker, direction, action: mode, entityId: order, status, side, message: status === 'ok' ? 'ok' : (r.lastErr || r.lastLine || `exit ${r.code}`) });
       }
+      await logRunFinish(runId, fail > 0 ? 'partial' : 'ok', { ok, fail });
       if (!aborted) done(0);
     })();
     return;
