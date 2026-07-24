@@ -14,10 +14,21 @@
  *   WEB_USER, WEB_PASS  if BOTH set, gate the whole app behind HTTP Basic Auth
  *   plus the BC_ and DEPOSCO_ vars the workers need (see .env.example)
  */
+import 'dotenv/config'; // load .env locally (Railway injects env vars directly)
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import pg from 'pg';
+
+// Lazy read-only pool for rendering the sync logs (sync_runs / sync_events). Null if
+// DATABASE_URL isn't set — the /logs view then shows "logging not configured".
+let pgPool = null;
+function db() {
+  if (!process.env.DATABASE_URL) return null;
+  if (!pgPool) pgPool = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3, connectionTimeoutMillis: 10_000 });
+  return pgPool;
+}
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
@@ -72,7 +83,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .run { color:#58a6ff; font-weight:700; margin-top:10px; border-top:1px dashed #21262d; padding-top:8px; }
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
-<header><h1>PK ↔ Deposco Sync Console</h1>
+<header><h1>PK ↔ Deposco Sync Console &nbsp;<a href="/logs" style="font-size:12px;font-weight:500;color:#8957e5;">→ Sync Logs</a></h1>
 <div class="sub">Type one or more BC order #s — space/comma separated (TRFO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
 <div class="bar">
   <input id="order" placeholder="WSOD139248, WSOD139249 TEST0001" autocomplete="off" spellcheck="false"/>
@@ -129,6 +140,70 @@ order.addEventListener('keydown',(e)=>{ if(e.key==='Enter'&&!$('btnPush').disabl
 refresh(); order.focus();
 </script></body></html>`;
 
+// Read-only ops view of the sync logs (sync_runs / sync_events). Polls /logs/data.
+const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Sync Logs — PK ↔ Deposco</title>
+<style>
+  :root { color-scheme: dark; } * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:#0d1117; color:#c9d1d9; }
+  header { padding:14px 20px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:15px; font-weight:600; } a { color:#58a6ff; text-decoration:none; }
+  .sub { color:#8b949e; font-size:12px; }
+  .bar { display:flex; gap:8px; align-items:center; padding:12px 20px; flex-wrap:wrap; }
+  button { padding:6px 12px; border-radius:6px; border:1px solid #30363d; background:#161b22; color:#c9d1d9; cursor:pointer; font-size:12px; font-weight:600; }
+  button.on { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  .runs { display:flex; gap:8px; padding:0 20px 10px; flex-wrap:wrap; }
+  .run { border:1px solid #21262d; border-radius:6px; padding:6px 10px; font-size:11px; background:#0f141a; }
+  .run b { color:#e6edf3; }
+  table { width:calc(100% - 40px); margin:0 20px 24px; border-collapse:collapse; font-size:12.5px; }
+  th { text-align:left; color:#8b949e; font-weight:600; border-bottom:1px solid #21262d; padding:6px 8px; position:sticky; top:0; background:#0d1117; }
+  td { padding:6px 8px; border-bottom:1px solid #161b22; vertical-align:top; }
+  tr.ev { cursor:pointer; } tr.ev:hover { background:#0f141a; }
+  .badge { padding:1px 7px; border-radius:10px; font-size:11px; font-weight:700; }
+  .s-fail { background:#3d1418; color:#ff7b72; } .s-desync,.s-floor { background:#3a2d10; color:#e3b341; }
+  .s-ok { background:#12261a; color:#3fb950; } .s-skip { background:#1a1f26; color:#8b949e; }
+  .side { font-size:10px; color:#8b949e; text-transform:uppercase; }
+  .detail { display:none; white-space:pre-wrap; font:11px ui-monospace,Menlo,monospace; color:#8b949e; background:#010409; border:1px solid #21262d; border-radius:6px; padding:8px; margin-top:4px; }
+  .mono { font:12px ui-monospace,Menlo,monospace; } .dim { color:#6e7681; }
+</style></head><body>
+<header><h1>Sync Logs</h1><a href="/">← Console</a>
+  <span class="sub" id="status">loading…</span>
+  <label class="sub" style="margin-left:auto;"><input type="checkbox" id="auto" checked/> auto-refresh 10s</label></header>
+<div class="bar">
+  <button data-f="issues" class="on">Issues (fail / desync)</button>
+  <button data-f="fail">Failures only</button>
+  <button data-f="all">All events</button>
+  <button id="refresh" style="margin-left:auto;">Refresh now</button></div>
+<div class="runs" id="runs"></div>
+<table><thead><tr><th>Time</th><th>Worker</th><th>Entity</th><th>Status</th><th>Message</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+var filter='issues', timer=null;
+function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
+function fmt(ts){ return ts? new Date(ts).toLocaleString():''; }
+function badge(s){ return '<span class="badge s-'+esc(s)+'">'+esc(s)+'</span>'; }
+function load(){
+  fetch('/logs/data?filter='+filter).then(function(r){return r.json();}).then(function(d){
+    var st=document.getElementById('status');
+    if(!d.configured){ st.textContent='⚠ logging not configured (no DATABASE_URL on this deploy)'; return; }
+    if(d.error){ st.textContent='DB error: '+d.error; return; }
+    st.textContent='updated '+new Date().toLocaleTimeString()+' · '+d.events.length+' event(s) shown';
+    document.getElementById('runs').innerHTML=d.runs.map(function(r){ var c=r.counts||{}; return '<div class="run"><b>'+esc(r.worker)+'</b> '+esc(r.trigger)+' · '+esc(r.status||'…')+' <span class="dim">'+fmt(r.finished_at||r.started_at)+'</span><br>'+(c.posted||0)+' posted · '+(c.failed||0)+' fail · '+(c.floored||0)+' floor · '+(c.skipped||0)+' skip</div>'; }).join('');
+    document.getElementById('rows').innerHTML=d.events.map(function(e){
+      var detail=e.detail? JSON.stringify(e.detail,null,1):'';
+      return '<tr class="ev"><td class="dim mono">'+fmt(e.ts)+'</td><td>'+esc(e.worker)+'</td><td class="mono">'+esc(e.entity_id||'')+(e.side?' <span class="side">'+esc(e.side)+'</span>':'')+'</td><td>'+badge(e.status)+'</td><td>'+esc(e.message||'')+'</td></tr>'
+        +'<tr><td colspan="5" style="padding:0 8px 6px;"><div class="detail">'+esc(detail)+'</div></td></tr>';
+    }).join('')||'<tr><td colspan="5" class="dim">no events</td></tr>';
+  }).catch(function(e){ document.getElementById('status').textContent='fetch error: '+e.message; });
+}
+document.getElementById('rows').addEventListener('click',function(e){ var tr=e.target.closest('tr.ev'); if(!tr)return; var det=tr.nextElementSibling.querySelector('.detail'); if(det) det.style.display=det.style.display==='block'?'none':'block'; });
+Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(b){ b.onclick=function(){ filter=b.getAttribute('data-f'); Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(x){x.className=x===b?'on':'';}); load(); }; });
+document.getElementById('refresh').onclick=load;
+function schedule(){ if(timer)clearInterval(timer); if(document.getElementById('auto').checked) timer=setInterval(load,10000); }
+document.getElementById('auto').onchange=schedule;
+load(); schedule();
+</script></body></html>`;
+
 const server = createServer((req, res) => {
   if (!authOk(req)) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="PK Deposco Console"' });
@@ -139,6 +214,26 @@ const server = createServer((req, res) => {
   if (url.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(PAGE);
+    return;
+  }
+  if (url.pathname === '/logs') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(LOGS_PAGE);
+    return;
+  }
+  if (url.pathname === '/logs/data') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const p = db();
+    if (!p) { res.end(JSON.stringify({ configured: false })); return; }
+    const filter = url.searchParams.get('filter') || 'issues';
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '150', 10) || 150, 500);
+    // fixed allowlist → no injection from the filter param
+    const where = filter === 'fail' ? "where status = 'fail'"
+      : filter === 'issues' ? "where status in ('fail','desync','floor')" : '';
+    p.query(`select id,ts,worker,direction,entity_type,entity_id,action,status,side,message,detail from sync_events ${where} order by id desc limit $1`, [limit])
+      .then((ev) => p.query('select id,worker,trigger,started_at,finished_at,status,counts from sync_runs order by id desc limit 15')
+        .then((runs) => res.end(JSON.stringify({ configured: true, events: ev.rows, runs: runs.rows }))))
+      .catch((e) => res.end(JSON.stringify({ configured: true, error: e.message })));
     return;
   }
   if (url.pathname === '/sync') {
