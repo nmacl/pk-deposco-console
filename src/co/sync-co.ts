@@ -192,8 +192,10 @@ type PostResult = 'ok' | 'skip';
 
 // Find an existing Deposco CO for this BC SO — filters on `externalOrderNumber` (the BC SO
 // number we stamp on push; Deposco's own `number` is CO2835 and won't match ours).
+// NOTE: this ONE lookup hits the `beta` API version instead of `latest` (per ops request) —
+// swap the apiBase for just this call; every other Deposco call still uses the default base.
 const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externalOrderNumber: string) =>
-  lookupDeposcoOrderId(deposcoCfg, token, '/orders/customerOrders', { externalOrderNumber });
+  lookupDeposcoOrderId({ ...deposcoCfg, apiBase: deposcoCfg.apiBase.replace('/latest', '/beta') }, token, '/orders/customerOrders', { externalOrderNumber });
 
 async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, payload: DeposcoCustomerOrderPayload, label: string): Promise<PostResult> {
   return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label);
