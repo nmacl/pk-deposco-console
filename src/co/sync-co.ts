@@ -35,6 +35,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment } from '../sync/orders.js';
+import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -58,7 +59,9 @@ const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WMS').split(',')
 // ────────────────────────────────────────────────────────────────────────────
 
 async function listRecentSos(odata: string, token: string, prefix: string, count: number): Promise<BcRow[]> {
-  const filter = encodeURIComponent(`startswith(No,'${odataStr(prefix)}')`);
+  // Only RELEASED orders sync — an Open order is still being edited; we don't push it to the
+  // WMS until it's released. (BC Sales_Order Status is exactly 'Open' | 'Released'.)
+  const filter = encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released'`);
   const url = `${odata}/Sales_Order?$filter=${filter}&$orderby=Order_Date desc&$top=${count}`;
   const body = await bcGet<{ value: BcRow[] }>(url, token);
   return body.value ?? [];
@@ -201,14 +204,14 @@ async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: stri
   return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label);
 }
 
-async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow): Promise<void> {
+async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow): Promise<PostResult> {
   const odata = bcOdataBase(bcCfg);
   const soNumber = pick(header, 'No');
   const bcToken = await getBcToken(bcCfg);
   const lines = await getSoLines(odata, bcToken, soNumber);
   if (lines.length === 0) {
     console.log(`[push] ${soNumber}: 0 item lines — skipping`);
-    return;
+    return 'skip';
   }
   // customerOrders POST does NOT upsert — it creates a brand-new CO every time, so the
   // per-tick re-push was minting duplicate Deposco orders. Skip if one already exists.
@@ -217,12 +220,12 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow)
   const existing = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
   if (existing !== null) {
     console.log(`[push] ${soNumber}: already in Deposco (CO id ${existing}) — skipping create (no upsert yet)`);
-    return;
+    return 'skip';
   }
   const payload = buildCustomerOrder(header, lines);
   const via = payload.customerOrder.shipVia;
   if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
-  await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  return postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -395,6 +398,11 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   const odata = bcOdataBase(bcCfg);
   const bcToken = await getBcToken(bcCfg);
 
+  // One run per tick. Log only NEW pushes (ok) and failures — not the every-tick skips of
+  // already-synced orders (that would flood sync_events since most Released orders already exist).
+  const runId = await startRun('co', process.env.SYNC_TRIGGER || 'manual');
+  let ok = 0, skip = 0, fail = 0;
+
   for (const prefix of PREFIXES) {
     let sos: BcRow[];
     try {
@@ -409,10 +417,16 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     for (const header of sos) {
       const soNumber = pick(header, 'No');
       try {
-        await pushSo(bcCfg, deposcoCfg, header);
+        const r = await pushSo(bcCfg, deposcoCfg, header);
+        if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'ok', message: 'pushed to Deposco' }); }
+        else skip++;
       } catch (err) {
         const e = err as AxiosError;
-        console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 500)}`);
+        const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
+        const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+        console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
+        fail++;
+        await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
       }
       if (PULL_ENABLED) {
         try {
@@ -424,6 +438,9 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       }
     }
   }
+
+  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { ok, skip, fail });
+  console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} failed`);
 }
 
 async function main(): Promise<void> {
@@ -453,6 +470,7 @@ async function main(): Promise<void> {
   // --once: run a single tick and exit (testing / cron).
   if (once) {
     await tick(bcCfg, deposcoCfg);
+    await closeDb();
     return;
   }
 

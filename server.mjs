@@ -70,6 +70,22 @@ function runScheduledInvPull() {
   child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); invBusy = false; });
 }
 
+// Scheduled sales-order push — the CO worker's batch tick (--once) lists recent RELEASED SOs
+// per prefix and pushes any not yet in Deposco (idempotent existence check). Own lock so
+// overlapping ticks can't double-run. The worker logs each new push / failure to the DB.
+const ORDER_SCHEDULE_MS = parseInt(process.env.ORDER_SCHEDULE_MS ?? '300000', 10);
+let coBusy = false;
+function runScheduledOrderPush() {
+  if (coBusy) { console.log('[schedule] order push skipped — previous run still running'); return; }
+  coBusy = true;
+  console.log(`[schedule] order push tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/co/sync-co.js'), '--once'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule' } });
+  child.stdout.on('data', (d) => process.stdout.write('[co] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[co] ' + d));
+  child.on('close', () => { coBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); coBusy = false; });
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -372,5 +388,11 @@ server.listen(PORT, () => {
     setInterval(runScheduledInvPull, INV_SCHEDULE_MS);
   } else {
     console.log('[schedule] auto inventory pull DISABLED (INV_SCHEDULE_MS=0)');
+  }
+  if (ORDER_SCHEDULE_MS > 0) {
+    console.log(`[schedule] auto order push (Released SOs) every ${ORDER_SCHEDULE_MS / 1000}s (set ORDER_SCHEDULE_MS=0 to disable)`);
+    setInterval(runScheduledOrderPush, ORDER_SCHEDULE_MS);
+  } else {
+    console.log('[schedule] auto order push DISABLED (ORDER_SCHEDULE_MS=0)');
   }
 });
