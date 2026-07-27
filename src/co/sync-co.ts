@@ -439,7 +439,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     }
   }
 
-  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { ok, skip, fail });
+  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail });
   console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} failed`);
 }
 

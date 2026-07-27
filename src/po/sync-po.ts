@@ -21,6 +21,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, type PostResult } from '../sync/orders.js';
+import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -467,21 +468,36 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   const pos = await listOpenWspPosAbove(base, bcToken, companyId, PO_THRESHOLD);
   console.log(`[tick] ${pos.length} candidate PO(s) > ${PO_THRESHOLD}: ${pos.map((p) => p.number).join(', ') || '(none)'}`);
 
+  // PO push is an upsert (runs every tick), so log FAILURES only — logging every re-push would
+  // flood sync_events. The run row carries the processed/failed counts.
+  const runId = await startRun('po', process.env.SYNC_TRIGGER || 'manual');
+  let processed = 0, failed = 0;
+
   for (const po of pos) {
+    processed++;
     try {
       await pushPo(bcCfg, deposcoCfg, companyId, po);
     } catch (err) {
       const e = err as AxiosError;
-      console.error(`[push] ${po.number} FAILED HTTP ${e.response?.status}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 500)}`);
+      const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
+      const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      console.error(`[push] ${po.number} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
+      failed++;
+      await logEvent({ runId, worker: 'po', direction: 'bc->deposco', entityType: 'order', entityId: po.number, action: 'push', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
     }
     try {
       const fresh = await getPoByNumber(base, await getBcToken(bcCfg), companyId, po.number);
       if (fresh) await pullReceiptsForPo(bcCfg, deposcoCfg, companyId, fresh);
     } catch (err) {
       const e = err as AxiosError;
-      console.error(`[pull] ${po.number} FAILED HTTP ${e.response?.status}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 500)}`);
+      const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
+      console.error(`[pull] ${po.number} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
+      failed++;
+      await logEvent({ runId, worker: 'po', direction: 'deposco->bc', entityType: 'order', entityId: po.number, action: 'pull', status: 'fail', side: 'bc', message: `receipt pull: ${body.slice(0, 170)}` });
     }
   }
+
+  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed, failed });
 }
 
 async function main(): Promise<void> {
@@ -505,6 +521,9 @@ async function main(): Promise<void> {
     if (!pushOnly) await pullReceiptsForPo(bcCfg, deposcoCfg, companyId, po);
     return;
   }
+
+  // --once: single tick then exit (the scheduler / cron entry point).
+  if (process.argv.includes('--once')) { await tick(bcCfg, deposcoCfg); await closeDb(); return; }
 
   console.log(`[sync] starting — interval=${INTERVAL_MS}ms threshold=${PO_THRESHOLD}`);
 

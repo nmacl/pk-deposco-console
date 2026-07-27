@@ -30,6 +30,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment } from '../sync/orders.js';
+import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIX = process.env.TO_PREFIX ?? 'TRFO';
@@ -296,22 +297,38 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
   const odata = bcOdataBase(cfg);
   const token = await getBcToken(cfg);
   const companyId = await getCompanyId(cfg, token);
+  // Run row first so a list failure (e.g. the TransferOrders OData web service missing after a
+  // prod refresh — seen 2026-07-27) is visible in /logs instead of a silent early return.
+  const runId = await startRun('to', process.env.SYNC_TRIGGER || 'manual');
   let orders: BcRow[];
   try {
     orders = await listRecentTransferOrders(odata, token);
   } catch (err) {
-    console.error(`[tick] list FAILED: ${(err as AxiosError).response?.status ?? (err as Error).message}`);
+    const e = err as AxiosError;
+    const msg = `${e.response?.status ?? (e as Error).message} — TransferOrders OData feed (web service may be unpublished)`;
+    console.error(`[tick] list FAILED: ${msg}`);
+    await logEvent({ runId, worker: 'to', action: 'list', status: 'fail', side: 'bc', message: `list failed: ${msg}` });
+    await finishRun(runId, 'error', { posted: 0, failed: 1 });
     return;
   }
   console.log(`[tick] ${orders.length} transfer order(s)`);
+  // push/post re-run every tick (upsert / post-what's-outstanding), so log FAILURES only;
+  // the run row carries the processed/failed counts.
+  let processed = 0, failed = 0;
   for (const header of orders) {
+    processed++;
     try {
       await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
     } catch (err) {
       const e = err as AxiosError;
-      console.error(`[to] ${pick(header, 'No')} FAILED HTTP ${e.response?.status}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 400)}`);
+      const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
+      const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      console.error(`[to] ${pick(header, 'No')} FAILED HTTP ${e.response?.status}: ${body.slice(0, 400)}`);
+      failed++;
+      await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: pick(header, 'No'), action: 'sync', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
     }
   }
+  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed, failed });
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -337,7 +354,7 @@ async function main(): Promise<void> {
 
   const once = process.argv.includes('--once');
   console.log(`[to-sync] starting — interval=${INTERVAL_MS}ms prefix=${PREFIX} perTick=${PER_TICK} push=${PUSH_ENABLED} post=${POST_ENABLED} wms=[${[...WMS_LOCATIONS].join(',')}]${once ? ' (single tick)' : ''}`);
-  if (once) { await tick(cfg, deposcoCfg); return; }
+  if (once) { await tick(cfg, deposcoCfg); await closeDb(); return; }
   for (;;) {
     const t0 = Date.now();
     try { await tick(cfg, deposcoCfg); } catch (err) { console.error('[tick] FAILED:', err instanceof Error ? err.message : err); }

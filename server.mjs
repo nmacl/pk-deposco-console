@@ -86,6 +86,37 @@ function runScheduledOrderPush() {
   child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); coBusy = false; });
 }
 
+// Scheduled PO sync (BC→Deposco push + Deposco→BC receipt pull), batch --once.
+const PO_SCHEDULE_MS = parseInt(process.env.PO_SCHEDULE_MS ?? '300000', 10);
+let poBusy = false;
+function runScheduledPoSync() {
+  if (poBusy) { console.log('[schedule] PO sync skipped — previous run still running'); return; }
+  poBusy = true;
+  console.log(`[schedule] PO sync tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/po/sync-po.js'), '--once'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule' } });
+  child.stdout.on('data', (d) => process.stdout.write('[po] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[po] ' + d));
+  child.on('close', () => { poBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); poBusy = false; });
+}
+
+// Scheduled TO sync (transfer orders). Push is enabled for the scheduled run (TO_PUSH_ENABLED
+// defaults true here); BC-side posting stays gated by TO_POST_ENABLED (default off).
+// DEFAULT OFF: the TransferOrders OData web service is currently unpublished in PILOT (prod-
+// refresh casualty) so the list 404s — set TO_SCHEDULE_MS=300000 once that's re-published.
+const TO_SCHEDULE_MS = parseInt(process.env.TO_SCHEDULE_MS ?? '0', 10);
+let toBusy = false;
+function runScheduledToSync() {
+  if (toBusy) { console.log('[schedule] TO sync skipped — previous run still running'); return; }
+  toBusy = true;
+  console.log(`[schedule] TO sync tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/to/sync-to.js'), '--once'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule', TO_PUSH_ENABLED: process.env.TO_PUSH_ENABLED ?? 'true' } });
+  child.stdout.on('data', (d) => process.stdout.write('[to] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[to] ' + d));
+  child.on('close', () => { toBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); toBusy = false; });
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -394,5 +425,17 @@ server.listen(PORT, () => {
     setInterval(runScheduledOrderPush, ORDER_SCHEDULE_MS);
   } else {
     console.log('[schedule] auto order push DISABLED (ORDER_SCHEDULE_MS=0)');
+  }
+  if (PO_SCHEDULE_MS > 0) {
+    console.log(`[schedule] auto PO sync every ${PO_SCHEDULE_MS / 1000}s (set PO_SCHEDULE_MS=0 to disable)`);
+    setInterval(runScheduledPoSync, PO_SCHEDULE_MS);
+  } else {
+    console.log('[schedule] auto PO sync DISABLED (PO_SCHEDULE_MS=0)');
+  }
+  if (TO_SCHEDULE_MS > 0) {
+    console.log(`[schedule] auto TO sync every ${TO_SCHEDULE_MS / 1000}s (set TO_SCHEDULE_MS=0 to disable)`);
+    setInterval(runScheduledToSync, TO_SCHEDULE_MS);
+  } else {
+    console.log('[schedule] auto TO sync DISABLED (TO_SCHEDULE_MS=0)');
   }
 });
