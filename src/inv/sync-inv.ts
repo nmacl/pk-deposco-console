@@ -40,7 +40,7 @@ import {
   fetchInventoryAdjustments, postInventoryAdjustment, fetchBcAdjustmentEntries,
   maxBcAdjustmentEntryNo, postBcAdjustment, resolveByWebshopCode, resolveWebshopCode, companyIdFor,
 } from '../sync/inventory.js';
-import { startRun, finishRun, logEvent, closeDb, type SyncEvent } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, readCursor, writeCursor, hasDb, type SyncEvent } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.INV_SYNC_INTERVAL_MS ?? '60000', 10);
 const PULL_ENABLED = (process.env.INV_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
@@ -73,12 +73,26 @@ const PUSH_LOCATIONS = new Set(
 const isPushLocation = (l: string): boolean => PUSH_LOCATIONS.size === 0 || PUSH_LOCATIONS.has(l.toUpperCase());
 
 interface State { lastDeposcoAdjId: number; lastBcEntryNo: number }
+const CURSOR_WORKER = 'inv';
+// Cursor lives in the DB (sync_cursors) when DATABASE_URL is set — survives Railway restarts,
+// so the scheduler can't lose its place. Falls back to the local file otherwise.
 async function loadState(): Promise<State | null> {
+  if (hasDb()) {
+    const adj = await readCursor(CURSOR_WORKER, 'deposco_adj');
+    if (adj == null) return null; // no DB cursor yet → caller seeds (no backfill)
+    const bc = await readCursor(CURSOR_WORKER, 'bc_entry');
+    return { lastDeposcoAdjId: Number(adj), lastBcEntryNo: Number(bc ?? 0) };
+  }
   try { return JSON.parse(await readFile(STATE_FILE, 'utf8')) as State; }
   catch { return null; }
 }
 async function saveState(s: State): Promise<void> {
   if (DRY_RUN) return;
+  if (hasDb()) {
+    await writeCursor(CURSOR_WORKER, 'deposco_adj', String(s.lastDeposcoAdjId));
+    await writeCursor(CURSOR_WORKER, 'bc_entry', String(s.lastBcEntryNo));
+    return;
+  }
   await writeFile(STATE_FILE, JSON.stringify(s, null, 2));
 }
 

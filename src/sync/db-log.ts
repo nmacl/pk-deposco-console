@@ -70,6 +70,32 @@ export async function logEvent(ev: SyncEvent): Promise<void> {
   } catch (e) { console.warn(`[db-log] logEvent: ${(e as Error).message}`); }
 }
 
+// ── Cursors (sync_cursors) ─────────────────────────────────────────────────
+// High-water marks live in the DB so they survive Railway restarts / redeploys (the old
+// .inv-state.json file is ephemeral there). Returns null when no DB or no row yet.
+export async function readCursor(worker: string, key = ''): Promise<string | null> {
+  const p = getPool();
+  if (!p) return null;
+  try {
+    const r = await p.query('select last_synced from sync_cursors where worker=$1 and key=$2', [worker, key]);
+    return r.rows[0]?.last_synced ?? null;
+  } catch (e) { console.warn(`[db-log] readCursor: ${(e as Error).message}`); return null; }
+}
+
+export async function writeCursor(worker: string, key: string, value: string): Promise<void> {
+  const p = getPool();
+  if (!p) return;
+  try {
+    await p.query(
+      `insert into sync_cursors(worker,key,last_synced,updated_at) values($1,$2,$3,now())
+       on conflict (worker,key) do update set last_synced=excluded.last_synced, updated_at=now()`,
+      [worker, key, value]);
+  } catch (e) { console.warn(`[db-log] writeCursor: ${(e as Error).message}`); }
+}
+
+/** True when a DB is configured (so callers can prefer the DB cursor over the file). */
+export function hasDb(): boolean { return !!process.env.DATABASE_URL; }
+
 /** Must be called at worker exit so a --once process can terminate (open pool keeps it alive). */
 export async function closeDb(): Promise<void> {
   if (pool) { try { await pool.end(); } catch { /* ignore */ } pool = null; }

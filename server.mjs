@@ -52,6 +52,24 @@ async function logOrderEvent(ev) {
   } catch (e) { console.warn('[logs] event:', e.message); }
 }
 
+// ── Scheduled inventory pull ────────────────────────────────────────────────
+// Runs the pull automatically every INV_SCHEDULE_MS so Deposco adjustments flow without a
+// button click. `invBusy` is the run-lock, SHARED with the manual /inv route, so a scheduled
+// tick and a button press can't overlap and double-post (single Railway replica → in-process
+// flag is a sufficient lock). Set INV_SCHEDULE_MS=0 to disable. The worker logs to the DB itself.
+const INV_SCHEDULE_MS = parseInt(process.env.INV_SCHEDULE_MS ?? '300000', 10);
+let invBusy = false;
+function runScheduledInvPull() {
+  if (invBusy) { console.log('[schedule] inv pull skipped — previous sync still running'); return; }
+  invBusy = true;
+  console.log(`[schedule] inventory pull tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/inv/sync-inv.js'), '--once', '--pull-only'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule' } });
+  child.stdout.on('data', (d) => process.stdout.write('[inv] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[inv] ' + d));
+  child.on('close', () => { invBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); invBusy = false; });
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -322,9 +340,12 @@ const server = createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const send = (data) => res.write(`data: ${String(data).replace(/\n/g, '\ndata: ')}\n\n`);
 
+    // Share the scheduler's run-lock so a manual click can't overlap a scheduled tick.
+    if (invBusy) { send('⚠ a scheduled/previous inventory sync is still running — try again in a moment'); res.write('event: done\ndata: 1\n\n'); res.end(); return; }
+    invBusy = true;
     const args = [resolve(ROOT, 'dist/inv/sync-inv.js'), '--once', '--pull-only'];
     send('▸ inventory pull: node dist/inv/sync-inv.js --once --pull-only');
-    const child = spawn('node', args, { cwd: ROOT, env: process.env });
+    const child = spawn('node', args, { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'manual' } });
 
     let buf = '';
     const onData = (chunk) => {
@@ -335,8 +356,8 @@ const server = createServer((req, res) => {
     };
     child.stdout.on('data', onData);
     child.stderr.on('data', onData);
-    child.on('close', (code) => { if (buf) send(buf); res.write(`event: done\ndata: ${code ?? 0}\n\n`); res.end(); });
-    child.on('error', (err) => { send(`spawn error: ${err.message}`); res.write('event: done\ndata: 1\n\n'); res.end(); });
+    child.on('close', (code) => { invBusy = false; if (buf) send(buf); res.write(`event: done\ndata: ${code ?? 0}\n\n`); res.end(); });
+    child.on('error', (err) => { invBusy = false; send(`spawn error: ${err.message}`); res.write('event: done\ndata: 1\n\n'); res.end(); });
     req.on('close', () => { child.kill(); });
     return;
   }
@@ -346,4 +367,10 @@ const server = createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`[web] PK ↔ Deposco sync console → http://localhost:${PORT}`);
   console.log(`[web] basic auth: ${AUTH_ON ? 'ON' : 'OFF (set WEB_USER + WEB_PASS to enable)'}`);
+  if (INV_SCHEDULE_MS > 0) {
+    console.log(`[schedule] auto inventory pull every ${INV_SCHEDULE_MS / 1000}s (set INV_SCHEDULE_MS=0 to disable)`);
+    setInterval(runScheduledInvPull, INV_SCHEDULE_MS);
+  } else {
+    console.log('[schedule] auto inventory pull DISABLED (INV_SCHEDULE_MS=0)');
+  }
 });
