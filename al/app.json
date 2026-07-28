@@ -1,0 +1,22 @@
+{
+  "id": "55ffef3f-bd16-44fc-abd0-0a4fe8b99f36",
+  "name": "PK Deposco Read API",
+  "publisher": "Parsons Kellogg",
+  "brief": "Read-only line API pages for the BC-Deposco middleware",
+  "description": "Adds read-only API pages under api/bmi/pk/v1.0 that return document lines flattened (No., Line No., quantities, and later WebshopVariantCode + Location Code) in a single GET, eliminating GUID-resolution round-trips in the Node middleware.",
+  "version": "2.1.0.0",
+  "platform": "27.0.0.0",
+  "application": "27.0.0.0",
+  "runtime": "16.0",
+  "target": "Cloud",
+  "dependencies": [],
+  "idRanges": [
+    { "from": 60200, "to": 60249 }
+  ],
+  "features": [ "NoImplicitWith" ],
+  "resourceExposurePolicy": {
+    "allowDebugging": false,
+    "allowDownloadingSource": false,
+    "includeSourceInSymbolFile": false
+  }
+}

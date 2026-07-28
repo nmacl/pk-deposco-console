@@ -9,3 +9,6 @@ dist
 .inv-state.json
 
 .inv-failed.jsonl
+
+# AL extension: skip regenerable BC symbol packages (large binaries; pulled from BC /dev/packages)
+al/.alpackages/
