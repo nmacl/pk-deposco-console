@@ -385,9 +385,10 @@ const server = createServer((req, res) => {
         if (aborted) break;
         const r = await runOne(order);
         if (r.skipped) continue;
-        const status = r.code === 0 ? 'ok' : 'fail';
+        // exit 3 = push attempted but nothing pushable (data problem) → desync warning, not a hard fail.
+        const status = r.code === 0 ? 'ok' : r.code === 3 ? 'desync' : 'fail';
         if (status === 'ok') ok++; else fail++;
-        const side = /EOM|not subscribed|deposco/i.test(r.lastErr) ? 'deposco' : (status === 'fail' ? 'bc' : undefined);
+        const side = /EOM|not subscribed|deposco/i.test(r.lastErr) ? 'deposco' : (status === 'ok' ? undefined : 'bc');
         await logOrderEvent({ runId, worker: r.worker, direction, action: mode, entityId: order, status, side, message: status === 'ok' ? 'ok' : (r.lastErr || r.lastLine || `exit ${r.code}`) });
       }
       await logRunFinish(runId, fail > 0 ? 'partial' : 'ok', { ok, fail });

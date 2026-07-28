@@ -222,16 +222,31 @@ async function customerOrderExists(deposcoCfg: DeposcoConfig, externalOrderNumbe
   return (body.data?.length ?? 0) > 0;
 }
 
-async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan): Promise<void> {
+// Outcome of a push attempt — so the caller can log ok vs "nothing pushed" (a data problem)
+// vs "already in Deposco" (a legit no-op), instead of blindly recording every attempt as ok.
+type PushOutcome =
+  | { kind: 'pushed'; lines: number }
+  | { kind: 'exists' }                                             // CO already in Deposco, nothing new sent
+  | { kind: 'none'; attempted: number; noVariant: number; zeroQty: number }; // 0 pushable lines
+
+async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan): Promise<PushOutcome> {
   const no = pick(header, 'No');
   const asWhat = plan === 'receive' ? 'purchaseOrder' : plan === 'ship' ? 'customerOrder' : 'purchaseOrder + customerOrder';
   console.log(`[push] ${no}: reading BC transfer lines (bmiTransferOrderLines) → Deposco as ${asWhat}`);
-  const lines = pushableLines(await getBmiTransferLines(cfg, companyId, no), no);
-  if (lines.length === 0) { console.log(`[push] ${no}: 0 pushable line(s) — skipping`); return; }
+  const raw = await getBmiTransferLines(cfg, companyId, no);
+  const lines = pushableLines(raw, no);
+  if (lines.length === 0) {
+    const zeroQty = raw.filter((l) => l.quantity <= 0).length;
+    const noVariant = raw.filter((l) => l.quantity > 0 && !l.webshopVariantCode).length;
+    console.warn(`[push] ${no}: ⚠ 0 pushable line(s) — NOTHING sent to Deposco (${noVariant} missing WebshopVariantCode, ${zeroQty} zero-qty, of ${raw.length})`);
+    return { kind: 'none', attempted: raw.length, noVariant, zeroQty };
+  }
   for (const l of lines) console.log(`  L${l.lineNo} item=${l.itemNo} → ${l.webshopVariantCode} qty=${l.quantity}`);
 
+  let posted = 0;
   if (plan === 'receive' || plan === 'both') {
     await postDeposcoOrder(cfg, deposcoCfg, '/orders/purchaseOrders', buildTransferAsPurchaseOrder(header, lines), no, `${lines.length} line(s) as PO (receive)`);
+    posted++;
   }
   if (plan === 'ship' || plan === 'both') {
     if (await customerOrderExists(deposcoCfg, no)) {
@@ -242,8 +257,10 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
       const ship = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
       if (!ship) console.warn(`[push] ${no}: no source SO shipping found (source=${sourceNo || 'none'}) — CO may land in review`);
       await postDeposcoOrder(cfg, deposcoCfg, '/orders/customerOrders', buildTransferAsCustomerOrder(header, lines, ship), no, `${lines.length} line(s) as CO (ship)${ship ? `, via ${ship.shipVia}` : ''}`);
+      posted++;
     }
   }
+  return posted > 0 ? { kind: 'pushed', lines: lines.length } : { kind: 'exists' };
 }
 
 
@@ -322,18 +339,20 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
 }
 
 // ── Single-order sync (the web-UI button backend) + batch tick ──────────────
-async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<TransferPlan> {
+interface SyncResult { plan: TransferPlan; push?: PushOutcome; }
+async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<SyncResult> {
   const no = pick(header, 'No');
   const from = pick(header, 'Transfer_from_Code').toUpperCase();
   const to = pick(header, 'Transfer_to_Code').toUpperCase();
   const plan = classify(header);
-  if (plan === 'skip') { console.log(`[to] ${no}: ${from}→${to} not WMS-relevant — skip`); return plan; }
+  if (plan === 'skip') { console.log(`[to] ${no}: ${from}→${to} not WMS-relevant — skip`); return { plan }; }
   const direct = pick(header, 'Direct_Transfer') === 'true';
   console.log(`[to] ${no}: ${from}→${to} → ${plan}${direct ? ' (direct)' : ''}`);
 
-  if (opts.push) await pushTransfer(cfg, deposcoCfg, companyId, header, plan);
+  let push: PushOutcome | undefined;
+  if (opts.push) push = await pushTransfer(cfg, deposcoCfg, companyId, header, plan);
   if (opts.post) await pull(cfg, deposcoCfg, companyId, header, plan, direct);
-  return plan;
+  return { plan, push };
 }
 
 
@@ -357,14 +376,27 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
   console.log(`[tick] ${orders.length} transfer order(s)`);
   // push/post re-run every tick (upsert / post-what's-outstanding), so log FAILURES only;
   // the run row carries the processed/failed counts.
-  let processed = 0, failed = 0;
+  let processed = 0, failed = 0, desynced = 0;
   for (const header of orders) {
     processed++;
     const no = pick(header, 'No');
     try {
-      const plan = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
-      if (plan === 'skip') await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });
-      else await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'ok', message: `synced (${plan})`, dedupeKey: dailyDedupe('to', no, `ok:${plan}`) });
+      const { plan, push } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      if (plan === 'skip') {
+        await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });
+      } else if (push?.kind === 'none') {
+        // Classified as ship/receive but NOTHING was pushable — a real data problem (lines with no
+        // WebshopVariantCode or 0 qty). Log as desync (surfaces under /logs "Issues"), not ok.
+        desynced++;
+        const msg = `0 pushable line(s) — NOTHING sent to Deposco (${push.noVariant} missing WebshopVariantCode, ${push.zeroQty} zero-qty, of ${push.attempted})`;
+        console.warn(`[to] ${no}: ${msg}`);
+        await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'push', status: 'desync', side: 'bc', message: msg, dedupeKey: dailyDedupe('to-nopush', no, msg) });
+      } else if (push?.kind === 'exists') {
+        await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'already in Deposco (no upsert)', dedupeKey: dailyDedupe('to-exists', no, 'exists') });
+      } else {
+        const extra = push?.kind === 'pushed' ? `, ${push.lines} line(s)` : '';
+        await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'ok', message: `synced (${plan})${extra}`, dedupeKey: dailyDedupe('to', no, `ok:${plan}`) });
+      }
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
@@ -375,7 +407,7 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
       await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: pick(header, 'No'), action: 'sync', status: 'fail', side, message: tmsg, dedupeKey: dailyDedupe('to', pick(header, 'No'), tmsg) });
     }
   }
-  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed, failed });
+  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed - desynced, failed, desync: desynced });
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -395,7 +427,10 @@ async function main(): Promise<void> {
     const companyId = await getCompanyId(cfg, token);
     const header = await getTransferOrder(cfg, companyId, token, orderArg);
     if (!header) { console.error(`[to] ${orderArg}: not found`); process.exit(1); }
-    await syncOne(cfg, deposcoCfg, companyId, header, { push: !postOnly, post: !pushOnly });
+    const { push } = await syncOne(cfg, deposcoCfg, companyId, header, { push: !postOnly, post: !pushOnly });
+    // Exit 3 when a push was attempted but nothing was pushable, so the console button records it
+    // as a desync (warning) instead of a green "ok". (0 / not-found = 1 / real error via throw.)
+    if (push?.kind === 'none') { console.warn(`[to] ${orderArg}: nothing pushed — flagged as desync`); process.exit(3); }
     return;
   }
 
