@@ -101,10 +101,10 @@ function runScheduledPoSync() {
 }
 
 // Scheduled TO sync (transfer orders). Push is enabled for the scheduled run (TO_PUSH_ENABLED
-// defaults true here); BC-side posting stays gated by TO_POST_ENABLED (default off).
-// DEFAULT OFF: the TransferOrders OData web service is currently unpublished in PILOT (prod-
-// refresh casualty) so the list 404s — set TO_SCHEDULE_MS=300000 once that's re-published.
-const TO_SCHEDULE_MS = parseInt(process.env.TO_SCHEDULE_MS ?? '0', 10);
+// defaults true here); BC-side posting stays gated by TO_POST_ENABLED (default off). Now reads
+// headers from our own bmiTransferHeaders page (not the fragile TransferOrders OData feed), so
+// it's back ON by default.
+const TO_SCHEDULE_MS = parseInt(process.env.TO_SCHEDULE_MS ?? '300000', 10);
 let toBusy = false;
 function runScheduledToSync() {
   if (toBusy) { console.log('[schedule] TO sync skipped — previous run still running'); return; }

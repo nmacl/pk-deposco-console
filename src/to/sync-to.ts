@@ -46,15 +46,38 @@ const toDate = (iso: string): string => (iso && iso !== '0001-01-01' ? iso.slice
 const toDateTime = (iso: string): string => { const d = toDate(iso); return d ? `${d}T00:00:00Z` : ''; };
 
 // ── BC reads ─────────────────────────────────────────────────────────────────
-async function listRecentTransferOrders(odata: string, token: string): Promise<BcRow[]> {
-  const filter = encodeURIComponent(`startswith(No,'${odataStr(PREFIX)}')`);
-  const url = `${odata}/TransferOrders?$filter=${filter}&$orderby=Posting_Date desc&$top=${PER_TICK}`;
-  return (await bcGet<{ value: BcRow[] }>(url, token)).value ?? [];
+// Transfer HEADERS come from our own bmiTransferHeaders API page (over the standard Transfer
+// Header table) — NOT the OData `TransferOrders` web service, which prod refreshes wipe (404'd
+// 2026-07-27). We adapt the camelCase API fields back to the OData-style keys the rest of the
+// worker already reads via pick(header, 'Transfer_from_Code') etc., so nothing downstream changes.
+interface BmiTransferHeader {
+  no: string; status: string; directTransfer: boolean; fromCode: string; toCode: string;
+  postingDate: string; receiptDate: string; shipmentDate: string;
+  toName: string; toAddress: string; toAddress2: string; toCity: string; toCounty: string;
+  toPostCode: string; toContact: string; toCountry: string;
+}
+function adaptTransferHeader(h: BmiTransferHeader): BcRow {
+  return {
+    No: h.no, Status: h.status, Direct_Transfer: String(h.directTransfer),
+    Transfer_from_Code: h.fromCode, Transfer_to_Code: h.toCode,
+    Posting_Date: h.postingDate, Receipt_Date: h.receiptDate, Shipment_Date: h.shipmentDate,
+    Transfer_to_Name: h.toName, Transfer_to_Address: h.toAddress, Transfer_to_Address_2: h.toAddress2,
+    Transfer_to_City: h.toCity, Transfer_to_County: h.toCounty, Transfer_to_Post_Code: h.toPostCode,
+    Transfer_to_Contact: h.toContact, Trsf_to_Country_Region_Code: h.toCountry,
+  };
 }
 
-async function getTransferOrder(odata: string, token: string, toNumber: string): Promise<BcRow | null> {
-  const url = `${odata}/TransferOrders?$filter=${encodeURIComponent(`No eq '${odataStr(toNumber)}'`)}`;
-  return (await bcGet<{ value: BcRow[] }>(url, token)).value?.[0] ?? null;
+async function listRecentTransferOrders(cfg: SyncBcConfig, companyId: string, token: string): Promise<BcRow[]> {
+  const filter = encodeURIComponent(`startswith(no,'${odataStr(PREFIX)}')`);
+  const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders?$filter=${filter}&$orderby=postingDate desc&$top=${PER_TICK}`;
+  const rows = (await authReq<{ value: BmiTransferHeader[] }>('get', url, token)).value ?? [];
+  return rows.map(adaptTransferHeader);
+}
+
+async function getTransferOrder(cfg: SyncBcConfig, companyId: string, token: string, toNumber: string): Promise<BcRow | null> {
+  const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders?$filter=${encodeURIComponent(`no eq '${odataStr(toNumber)}'`)}`;
+  const h = (await authReq<{ value: BmiTransferHeader[] }>('get', url, token)).value?.[0];
+  return h ? adaptTransferHeader(h) : null;
 }
 
 // OData transfer lines — carries @odata.etag + posted quantities, needed for the write-back PATCH.
@@ -294,7 +317,6 @@ async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: 
 
 
 async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
-  const odata = bcOdataBase(cfg);
   const token = await getBcToken(cfg);
   const companyId = await getCompanyId(cfg, token);
   // Run row first so a list failure (e.g. the TransferOrders OData web service missing after a
@@ -302,7 +324,7 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
   const runId = await startRun('to', process.env.SYNC_TRIGGER || 'manual');
   let orders: BcRow[];
   try {
-    orders = await listRecentTransferOrders(odata, token);
+    orders = await listRecentTransferOrders(cfg, companyId, token);
   } catch (err) {
     const e = err as AxiosError;
     const msg = `${e.response?.status ?? (e as Error).message} — TransferOrders OData feed (web service may be unpublished)`;
@@ -346,7 +368,7 @@ async function main(): Promise<void> {
     const postOnly = process.argv.includes('--post-only');
     const token = await getBcToken(cfg);
     const companyId = await getCompanyId(cfg, token);
-    const header = await getTransferOrder(bcOdataBase(cfg), token, orderArg);
+    const header = await getTransferOrder(cfg, companyId, token, orderArg);
     if (!header) { console.error(`[to] ${orderArg}: not found`); process.exit(1); }
     await syncOne(cfg, deposcoCfg, companyId, header, { push: !postOnly, post: !pushOnly });
     return;
