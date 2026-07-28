@@ -229,6 +229,18 @@ async function initCursors(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, company
     lastBcEntryNo: BACKFILL ? 0 : await maxBcAdjustmentEntryNo(cfg, companyId, bToken),
   };
   console.log(`[init] no state — cursors set to Deposco id=${state.lastDeposcoAdjId}, BC entryNo=${state.lastBcEntryNo}${BACKFILL ? ' (BACKFILL: processing from 0)' : ' (no backfill)'}`);
+  // A fresh cursor (no stored value) that lands on a non-zero max means we're SKIPPING every
+  // adjustment ≤ that id — the real "missed adjustments" risk (first run, or DB cursor lost).
+  // Flag it as a desync so ops can verify nothing was dropped. Deduped by the seeded value so a
+  // repeat init to the same id logs once, not every tick.
+  if (!BACKFILL && !DRY_RUN && state.lastDeposcoAdjId > 0) {
+    await logEvent({
+      worker: 'inv_pull', direction: 'deposco->bc', entityType: 'inventory_adj', action: 'cursor-init',
+      status: 'desync', side: 'deposco',
+      message: `cursor freshly initialized to ${state.lastDeposcoAdjId} (no stored cursor) — adjustments ≤ ${state.lastDeposcoAdjId} were NOT applied by this run; if this wasn't a deliberate reset, some may have been missed`,
+      dedupeKey: `inv-cursor-init:${state.lastDeposcoAdjId}`,
+    });
+  }
   return state;
 }
 

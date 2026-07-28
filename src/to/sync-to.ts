@@ -30,7 +30,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIX = process.env.TO_PREFIX ?? 'TRFO';
@@ -329,7 +329,7 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
     const e = err as AxiosError;
     const msg = `${e.response?.status ?? (e as Error).message} — TransferOrders OData feed (web service may be unpublished)`;
     console.error(`[tick] list FAILED: ${msg}`);
-    await logEvent({ runId, worker: 'to', action: 'list', status: 'fail', side: 'bc', message: `list failed: ${msg}` });
+    await logEvent({ runId, worker: 'to', action: 'list', status: 'fail', side: 'bc', message: `list failed: ${msg}`, dedupeKey: dailyDedupe('to-list', PREFIX, msg) });
     await finishRun(runId, 'error', { posted: 0, failed: 1 });
     return;
   }
@@ -347,7 +347,8 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
       const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
       console.error(`[to] ${pick(header, 'No')} FAILED HTTP ${e.response?.status}: ${body.slice(0, 400)}`);
       failed++;
-      await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: pick(header, 'No'), action: 'sync', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
+      const tmsg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
+      await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: pick(header, 'No'), action: 'sync', status: 'fail', side, message: tmsg, dedupeKey: dailyDedupe('to', pick(header, 'No'), tmsg) });
     }
   }
   await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed, failed });

@@ -35,7 +35,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -128,6 +128,9 @@ interface DeposcoCustomerOrderPayload {
     shipVia?: string;
     shipVendor?: string;
     freightTermsType?: string;
+    // Third-party freight billing (only when LAX_Shipping_Payment_Type = 'Third Party').
+    freightBillToAccount?: string;
+    freightBillToContact?: { postalCode?: string; country?: string };
     shipToContact: DeposcoShipToContact;
     channels: unknown[];
     coLines: { data: DeposcoCoLine[] };
@@ -154,6 +157,16 @@ function headerShipping(header: BcRow): ShipInfo | null {
 function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOrderPayload {
   const soNumber = pick(header, 'No');
   const ship = headerShipping(header);
+  // Third-party freight billing: when the SO bills freight to a third party, add the account #
+  // + a freight bill-to with the ship-to zip/country. freightTermsType is already passed through
+  // from LAX_Shipping_Payment_Type by headerShipping. Ship-via is left untouched.
+  const thirdParty = /third\s*party/i.test(pick(header, 'LAX_Shipping_Payment_Type'));
+  const freight = thirdParty
+    ? {
+        freightBillToAccount: pick(header, 'LAX_Third_Party_Ship_Acct_No'),
+        freightBillToContact: { postalCode: pick(header, 'Ship_to_Post_Code'), country: pick(header, 'Ship_to_Country_Region_Code') },
+      }
+    : {};
   const data: DeposcoCoLine[] = rawLines.map((l) => {
     const num = pick(l, 'WebshopVariantCode', 'No');
     const qty = numOf(l, 'Quantity');
@@ -173,6 +186,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
       orderSource: ORDER_SOURCE,
       placedDate: toDateTime(pick(header, 'Order_Date', 'Document_Date')),
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
+      ...freight,
       shipToContact: shipToContact(header),
       channels: [],
       coLines: { data },
@@ -426,7 +440,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
         const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
         console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
         fail++;
-        await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
+        const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
+        await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', soNumber, msg) });
       }
       if (PULL_ENABLED) {
         try {

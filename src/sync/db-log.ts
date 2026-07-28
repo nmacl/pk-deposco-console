@@ -96,6 +96,19 @@ export async function writeCursor(worker: string, key: string, value: string): P
 /** True when a DB is configured (so callers can prefer the DB cursor over the file). */
 export function hasDb(): boolean { return !!process.env.DATABASE_URL; }
 
+/** Small stable hash for building dedupe_keys from message content (anti-spam). */
+export function hashKey(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) h = (((h << 5) + h) + s.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+/** Dedupe key that collapses a recurring failure to one row per day per distinct message —
+ *  verbose enough to see it, not spammy enough to bury the failures list. */
+export function dailyDedupe(worker: string, entityId: string, message: string): string {
+  return `${worker}:${entityId}:${new Date().toISOString().slice(0, 10)}:${hashKey(message)}`;
+}
+
 /** Must be called at worker exit so a --once process can terminate (open pool keeps it alive). */
 export async function closeDb(): Promise<void> {
   if (pool) { try { await pool.end(); } catch { /* ignore */ } pool = null; }

@@ -21,7 +21,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, type PostResult } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -483,7 +483,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
       console.error(`[push] ${po.number} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
       failed++;
-      await logEvent({ runId, worker: 'po', direction: 'bc->deposco', entityType: 'order', entityId: po.number, action: 'push', status: 'fail', side, message: `HTTP ${e.response?.status}: ${body.slice(0, 180)}` });
+      const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
+      await logEvent({ runId, worker: 'po', direction: 'bc->deposco', entityType: 'order', entityId: po.number, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('po', po.number, msg) });
     }
     try {
       const fresh = await getPoByNumber(base, await getBcToken(bcCfg), companyId, po.number);
@@ -493,7 +494,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
       console.error(`[pull] ${po.number} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
       failed++;
-      await logEvent({ runId, worker: 'po', direction: 'deposco->bc', entityType: 'order', entityId: po.number, action: 'pull', status: 'fail', side: 'bc', message: `receipt pull: ${body.slice(0, 170)}` });
+      const pmsg = `receipt pull: ${body.slice(0, 170)}`;
+      await logEvent({ runId, worker: 'po', direction: 'deposco->bc', entityType: 'order', entityId: po.number, action: 'pull', status: 'fail', side: 'bc', message: pmsg, dedupeKey: dailyDedupe('po-pull', po.number, pmsg) });
     }
   }
 
