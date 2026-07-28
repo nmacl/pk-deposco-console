@@ -87,12 +87,32 @@ async function getTransferLines(odata: string, token: string, toNumber: string):
 }
 
 // Flattened lines from our sibling extension (webshopVariantCode in one GET) — for the Deposco push.
-interface BmiToLine { lineNo: number; itemNo: string; webshopVariantCode: string; quantity: number; }
+interface BmiToLine { lineNo: number; itemNo: string; variantCode: string; webshopVariantCode: string; quantity: number; }
 async function getBmiTransferLines(cfg: SyncBcConfig, companyId: string, toNumber: string): Promise<BmiToLine[]> {
   const token = await getBcToken(cfg);
   const filter = encodeURIComponent(`documentNo eq '${odataStr(toNumber)}'`);
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferOrderLines?$filter=${filter}`;
-  return (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+  const lines = (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+  // UPG's PK_BC18_TAB populates WebshopVariantCode on purchase/sales lines but NOT on transfer
+  // lines (field 50201 comes back blank — e.g. TRFO001523). The mapping still exists at the
+  // Item Variant level, so when a line has a BC variantCode but no webshop code, resolve it from
+  // bmiItemVariants (itemNo + variantCode). Keeps TO pushes working regardless of UPG's gap.
+  const needs = lines.filter((l) => !l.webshopVariantCode && l.itemNo && l.variantCode);
+  if (needs.length) {
+    const byItem = new Map<string, Map<string, string>>();
+    for (const itemNo of new Set(needs.map((l) => l.itemNo))) {
+      const vurl = `${bmiApiBase(cfg)}/companies(${companyId})/bmiItemVariants?$filter=${encodeURIComponent(`itemNo eq '${odataStr(itemNo)}'`)}`;
+      const vs = (await authReq<{ value: { code: string; webshopVariantCode: string }[] }>('get', vurl, token)).value ?? [];
+      byItem.set(itemNo, new Map(vs.filter((v) => v.webshopVariantCode).map((v) => [String(v.code).toUpperCase(), v.webshopVariantCode])));
+    }
+    let filled = 0;
+    for (const l of needs) {
+      const code = byItem.get(l.itemNo)?.get(String(l.variantCode).toUpperCase());
+      if (code) { l.webshopVariantCode = code; filled++; }
+    }
+    if (filled) console.log(`[to] ${toNumber}: resolved ${filled}/${needs.length} webshopVariantCode(s) from Item Variant (transfer-line field was blank)`);
+  }
+  return lines;
 }
 
 // ── Direction ──────────────────────────────────────────────────────────────
