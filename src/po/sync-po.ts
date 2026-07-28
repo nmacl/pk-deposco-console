@@ -41,7 +41,7 @@ const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline'
 // lines (PK / dropship / decoration / on-demand) are skipped — Deposco doesn't fulfill
 // them. Mirrors co/sync-co.ts SO_WMS_LOCATIONS. Fail-closed: a line whose location can't
 // be resolved to a WMS code is dropped (and logged), same as the CO worker.
-const WMS_LOCATIONS = new Set((process.env.PO_WMS_LOCATIONS ?? 'WMS').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+const WMS_LOCATIONS = new Set((process.env.PO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
 // ────────────────────────────────────────────────────────────────────────────
 // BC helpers — config + bcApiBase/bcOdataBase/bmiApiBase/getCompanyId now live in ../sync/*.
@@ -477,6 +477,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     processed++;
     try {
       await pushPo(bcCfg, deposcoCfg, companyId, po);
+      await logEvent({ runId, worker: 'po', direction: 'bc->deposco', entityType: 'order', entityId: po.number, action: 'push', status: 'ok', message: 'pushed/upserted to Deposco', dedupeKey: dailyDedupe('po', po.number, 'ok') });
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);

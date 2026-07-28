@@ -8,7 +8,7 @@ import axios, { type AxiosError } from 'axios';
 import { ipv4Agent } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { createMissingItem, parseMissingItemNumbers } from './items.js';
-import { authReq } from './bc-client.js';
+import { authReq, deposcoThrottle } from './bc-client.js';
 import type { SyncBcConfig } from './config.js';
 
 export type PostResult = 'ok' | 'skip';
@@ -119,6 +119,7 @@ export async function postDeposcoOrder(
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const token = await getDeposcoToken(deposcoCfg);
+      await deposcoThrottle();
       const resp = await axios.post(`${deposcoCfg.apiBase}${endpoint}`, payload, {
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
         httpsAgent: ipv4Agent, timeout: 30_000,
@@ -130,13 +131,16 @@ export async function postDeposcoOrder(
       const status = axErr.response?.status;
       const errs = axErr.response?.data?.errors;
       const msg = errs?.[0]?.errorMessage ?? '';
+      // Verbose-always (global): surface method + endpoint + status + body, so a CO/PO push
+      // failure never collapses to a bare "Request failed with status code 400".
+      const verbose = new Error(`POST ${endpoint} [${logKey}] → HTTP ${status ?? axErr.code ?? '?'}: ${(typeof axErr.response?.data === 'string' ? axErr.response.data : JSON.stringify(axErr.response?.data ?? axErr.message)).slice(0, 600)}`);
       if (status === 400 && /cannot be updated while in the status of/i.test(msg)) {
         console.log(`[push] ${logKey}: Deposco order in progress, update skipped`);
         return 'skip';
       }
       if (status === 404) {
         const all = parseMissingItemNumbers(errs);
-        if (all.length === 0) throw err; // 404 but not an item-missing error
+        if (all.length === 0) throw verbose; // 404 but not an item-missing error
         const todo = all.filter((n) => !attempted.has(n));
         if (todo.length === 0) {
           console.error(`[push] ${logKey}: missing item(s) ${all.join(', ')} could not be created — giving up`);
@@ -146,7 +150,7 @@ export async function postDeposcoOrder(
         for (const n of todo) { attempted.add(n); await createMissingItem(bcCfg, deposcoCfg, n); }
         continue;
       }
-      throw err;
+      throw verbose;
     }
   }
   console.error(`[push] ${logKey}: exceeded lazy-create retries for ${label}`);

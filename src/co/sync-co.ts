@@ -51,7 +51,7 @@ const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 // Only push SO lines whose BC Location_Code is a WMS-tracked warehouse (default WMS only).
 // Non-WMS lines (PK / DROPSHIP / decoration / on-demand like ODENTIRE, ODTAGSWAG) are
 // skipped — Deposco doesn't fulfill them.
-const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WMS').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
 // ────────────────────────────────────────────────────────────────────────────
 // BC fetch (custom OData pages — Sales_Order / Sales_Order_Line)
@@ -433,7 +433,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       try {
         const r = await pushSo(bcCfg, deposcoCfg, header);
         if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'ok', message: 'pushed to Deposco' }); }
-        else skip++;
+        else { skip++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'skip', message: 'already in Deposco / no WMS lines', dedupeKey: dailyDedupe('co-skip', soNumber, 'skip') }); }
       } catch (err) {
         const e = err as AxiosError;
         const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);

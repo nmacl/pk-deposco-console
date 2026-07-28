@@ -261,20 +261,27 @@ const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   <button data-f="issues" class="on">Issues (fail / desync)</button>
   <button data-f="fail">Failures only</button>
   <button data-f="all">All events</button>
-  <button id="refresh" style="margin-left:auto;">Refresh now</button></div>
+  <span style="margin-left:auto;"></span>
+  <button id="prev">← Newer</button>
+  <span id="pageind" class="sub"></span>
+  <button id="next">Older →</button>
+  <button id="refresh">Refresh</button></div>
 <div class="runs" id="runs"></div>
 <table><thead><tr><th>Time</th><th>Worker</th><th>Entity</th><th>Status</th><th>Message</th></tr></thead><tbody id="rows"></tbody></table>
 <script>
-var filter='issues', timer=null;
+var filter='issues', timer=null, page=0;
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
 function fmt(ts){ return ts? new Date(ts).toLocaleString():''; }
 function badge(s){ return '<span class="badge s-'+esc(s)+'">'+esc(s)+'</span>'; }
 function load(){
-  fetch('/logs/data?filter='+filter).then(function(r){return r.json();}).then(function(d){
+  fetch('/logs/data?filter='+filter+'&page='+page).then(function(r){return r.json();}).then(function(d){
     var st=document.getElementById('status');
     if(!d.configured){ st.textContent='⚠ logging not configured (no DATABASE_URL on this deploy)'; return; }
     if(d.error){ st.textContent='DB error: '+d.error; return; }
     st.textContent='updated '+new Date().toLocaleTimeString()+' · '+d.events.length+' event(s) shown';
+    document.getElementById('pageind').textContent='page '+((d.page||0)+1);
+    document.getElementById('prev').disabled=(d.page||0)<=0;
+    document.getElementById('next').disabled=!d.hasMore;
     document.getElementById('runs').innerHTML=d.runs.map(function(r){ var c=r.counts||{}; return '<div class="run"><b>'+esc(r.worker)+'</b> '+esc(r.trigger)+' · '+esc(r.status||'…')+' <span class="dim">'+fmt(r.finished_at||r.started_at)+'</span><br>'+(c.posted||0)+' posted · '+(c.failed||0)+' fail · '+(c.floored||0)+' floor · '+(c.skipped||0)+' skip</div>'; }).join('');
     document.getElementById('rows').innerHTML=d.events.map(function(e){
       var detail=e.detail? JSON.stringify(e.detail,null,1):'';
@@ -284,7 +291,9 @@ function load(){
   }).catch(function(e){ document.getElementById('status').textContent='fetch error: '+e.message; });
 }
 document.getElementById('rows').addEventListener('click',function(e){ var tr=e.target.closest('tr.ev'); if(!tr)return; var det=tr.nextElementSibling.querySelector('.detail'); if(det) det.style.display=det.style.display==='block'?'none':'block'; });
-Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(b){ b.onclick=function(){ filter=b.getAttribute('data-f'); Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(x){x.className=x===b?'on':'';}); load(); }; });
+Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(b){ b.onclick=function(){ filter=b.getAttribute('data-f'); page=0; Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),function(x){x.className=x===b?'on':'';}); load(); }; });
+document.getElementById('prev').onclick=function(){ if(page>0){ page--; load(); } };
+document.getElementById('next').onclick=function(){ page++; load(); };
 document.getElementById('refresh').onclick=load;
 function schedule(){ if(timer)clearInterval(timer); if(document.getElementById('auto').checked) timer=setInterval(load,10000); }
 document.getElementById('auto').onchange=schedule;
@@ -313,13 +322,19 @@ const server = createServer((req, res) => {
     const p = db();
     if (!p) { res.end(JSON.stringify({ configured: false })); return; }
     const filter = url.searchParams.get('filter') || 'issues';
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '150', 10) || 150, 500);
+    const PAGE_SIZE = 100;
+    const page = Math.max(0, parseInt(url.searchParams.get('page') || '0', 10) || 0);
     // fixed allowlist → no injection from the filter param
     const where = filter === 'fail' ? "where status = 'fail'"
       : filter === 'issues' ? "where status in ('fail','desync','floor')" : '';
-    p.query(`select id,ts,worker,direction,entity_type,entity_id,action,status,side,message,detail from sync_events ${where} order by id desc limit $1`, [limit])
-      .then((ev) => p.query('select id,worker,trigger,started_at,finished_at,status,counts from sync_runs order by id desc limit 15')
-        .then((runs) => res.end(JSON.stringify({ configured: true, events: ev.rows, runs: runs.rows }))))
+    // fetch PAGE_SIZE+1 to know if there's a next page without a count query
+    p.query(`select id,ts,worker,direction,entity_type,entity_id,action,status,side,message,detail from sync_events ${where} order by id desc limit $1 offset $2`, [PAGE_SIZE + 1, page * PAGE_SIZE])
+      .then((ev) => {
+        const hasMore = ev.rows.length > PAGE_SIZE;
+        const events = ev.rows.slice(0, PAGE_SIZE);
+        return p.query('select id,worker,trigger,started_at,finished_at,status,counts from sync_runs order by id desc limit 15')
+          .then((runs) => res.end(JSON.stringify({ configured: true, events, runs: runs.rows, page, hasMore })));
+      })
       .catch((e) => res.end(JSON.stringify({ configured: true, error: e.message })));
     return;
   }
@@ -414,28 +429,16 @@ const server = createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`[web] PK ↔ Deposco sync console → http://localhost:${PORT}`);
   console.log(`[web] basic auth: ${AUTH_ON ? 'ON' : 'OFF (set WEB_USER + WEB_PASS to enable)'}`);
-  if (INV_SCHEDULE_MS > 0) {
-    console.log(`[schedule] auto inventory pull every ${INV_SCHEDULE_MS / 1000}s (set INV_SCHEDULE_MS=0 to disable)`);
-    setInterval(runScheduledInvPull, INV_SCHEDULE_MS);
-  } else {
-    console.log('[schedule] auto inventory pull DISABLED (INV_SCHEDULE_MS=0)');
-  }
-  if (ORDER_SCHEDULE_MS > 0) {
-    console.log(`[schedule] auto order push (Released SOs) every ${ORDER_SCHEDULE_MS / 1000}s (set ORDER_SCHEDULE_MS=0 to disable)`);
-    setInterval(runScheduledOrderPush, ORDER_SCHEDULE_MS);
-  } else {
-    console.log('[schedule] auto order push DISABLED (ORDER_SCHEDULE_MS=0)');
-  }
-  if (PO_SCHEDULE_MS > 0) {
-    console.log(`[schedule] auto PO sync every ${PO_SCHEDULE_MS / 1000}s (set PO_SCHEDULE_MS=0 to disable)`);
-    setInterval(runScheduledPoSync, PO_SCHEDULE_MS);
-  } else {
-    console.log('[schedule] auto PO sync DISABLED (PO_SCHEDULE_MS=0)');
-  }
-  if (TO_SCHEDULE_MS > 0) {
-    console.log(`[schedule] auto TO sync every ${TO_SCHEDULE_MS / 1000}s (set TO_SCHEDULE_MS=0 to disable)`);
-    setInterval(runScheduledToSync, TO_SCHEDULE_MS);
-  } else {
-    console.log('[schedule] auto TO sync DISABLED (TO_SCHEDULE_MS=0)');
-  }
+  // Stagger the four workers so they don't all hit Deposco at once (each is its own process
+  // with its own ~2.8/s throttle; overlapping them would blow past Deposco's 4/s). First run at
+  // the offset, then every interval — offsets keep them spread across the 5-min cycle.
+  const startScheduler = (name, fn, intervalMs, offsetMs) => {
+    if (intervalMs <= 0) { console.log(`[schedule] ${name} DISABLED`); return; }
+    console.log(`[schedule] ${name} every ${intervalMs / 1000}s (first run +${offsetMs / 1000}s)`);
+    setTimeout(() => { fn(); setInterval(fn, intervalMs); }, offsetMs);
+  };
+  startScheduler('inventory pull', runScheduledInvPull, INV_SCHEDULE_MS, 5_000);
+  startScheduler('order push (Released SOs)', runScheduledOrderPush, ORDER_SCHEDULE_MS, 50_000);
+  startScheduler('PO sync', runScheduledPoSync, PO_SCHEDULE_MS, 95_000);
+  startScheduler('TO sync', runScheduledToSync, TO_SCHEDULE_MS, 140_000);
 });

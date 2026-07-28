@@ -40,7 +40,7 @@ const POST_ENABLED = (process.env.TO_POST_ENABLED ?? 'false').toLowerCase() === 
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
 const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
-const WMS_LOCATIONS = new Set((process.env.TO_WMS_LOCATIONS ?? 'WMS').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
+const WMS_LOCATIONS = new Set((process.env.TO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
 const toDate = (iso: string): string => (iso && iso !== '0001-01-01' ? iso.slice(0, 10) : '');
 const toDateTime = (iso: string): string => { const d = toDate(iso); return d ? `${d}T00:00:00Z` : ''; };
@@ -302,17 +302,18 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
 }
 
 // ── Single-order sync (the web-UI button backend) + batch tick ──────────────
-async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<void> {
+async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<TransferPlan> {
   const no = pick(header, 'No');
   const from = pick(header, 'Transfer_from_Code').toUpperCase();
   const to = pick(header, 'Transfer_to_Code').toUpperCase();
   const plan = classify(header);
-  if (plan === 'skip') { console.log(`[to] ${no}: ${from}→${to} not WMS-relevant — skip`); return; }
+  if (plan === 'skip') { console.log(`[to] ${no}: ${from}→${to} not WMS-relevant — skip`); return plan; }
   const direct = pick(header, 'Direct_Transfer') === 'true';
   console.log(`[to] ${no}: ${from}→${to} → ${plan}${direct ? ' (direct)' : ''}`);
 
   if (opts.push) await pushTransfer(cfg, deposcoCfg, companyId, header, plan);
   if (opts.post) await pull(cfg, deposcoCfg, companyId, header, plan, direct);
+  return plan;
 }
 
 
@@ -339,8 +340,11 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
   let processed = 0, failed = 0;
   for (const header of orders) {
     processed++;
+    const no = pick(header, 'No');
     try {
-      await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      const plan = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      if (plan === 'skip') await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });
+      else await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'ok', message: `synced (${plan})`, dedupeKey: dailyDedupe('to', no, `ok:${plan}`) });
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);

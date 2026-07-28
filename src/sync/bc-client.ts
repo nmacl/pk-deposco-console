@@ -43,38 +43,80 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  * boilerplate repeated across the workers. Works for BC and Deposco (both bearer + ipv4).
  * Content-Type is set automatically when a body is present; pass If-Match etc. via headers.
  */
+// ── Deposco rate limiter (Deposco allows ~4 req/sec) ────────────────────────────
+// Space Deposco calls ≥ DEPOSCO_MIN_INTERVAL_MS apart (default 350ms ≈ 2.8/s, comfortable margin
+// under 4/s even if two worker processes briefly overlap).
+// A chained promise serializes acquisition so even concurrent callers stay spaced. Per-process
+// (each scheduled worker is its own process) — combined with staggered scheduler starts + the
+// 429 backoff below, this keeps us under Deposco's limit.
+const DEPOSCO_MIN_INTERVAL_MS = parseInt(process.env.DEPOSCO_MIN_INTERVAL_MS ?? '350', 10);
+let deposcoChain: Promise<void> = Promise.resolve();
+let lastDeposcoAt = 0;
+export function deposcoThrottle(): Promise<void> {
+  const p = deposcoChain.then(async () => {
+    const wait = lastDeposcoAt + DEPOSCO_MIN_INTERVAL_MS - Date.now();
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    lastDeposcoAt = Date.now();
+  });
+  deposcoChain = p.catch(() => {});
+  return p;
+}
+const isDeposco = (url: string): boolean => url.includes('deposco.com');
+
 export async function authReq<T>(
   method: 'get' | 'post' | 'patch',
   url: string,
   token: string,
   opts: { data?: unknown; params?: Record<string, unknown>; headers?: Record<string, string>; timeout?: number } = {},
 ): Promise<T> {
-  try {
-    const resp = await axios.request<T>({
-      method,
-      url,
-      data: opts.data,
-      params: opts.params,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        ...(opts.data !== undefined ? { 'Content-Type': 'application/json' } : {}),
-        ...opts.headers,
-      },
-      httpsAgent: ipv4Agent,
-      timeout: opts.timeout ?? 30_000,
-    });
-    return resp.data;
-  } catch (err) {
-    // Verbose-always: surface method + path + status + response body on EVERY failure,
-    // so a 400 never collapses to a bare "Request failed with status code 400".
-    const ax = err as AxiosError;
-    const status = ax.response?.status ?? ax.code ?? '?';
-    const body = ax.response?.data;
-    const q = opts.params ? '?' + Object.entries(opts.params).map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&') : '';
-    const path = (url.split('.com')[1] ?? url) + q;
-    const detail = (typeof body === 'string' ? body : JSON.stringify(body ?? ax.message)).slice(0, 600);
-    throw new Error(`${method.toUpperCase()} ${path} → HTTP ${status}: ${detail}`);
+  const MAX_ATTEMPTS = 4;
+  let ax: AxiosError | undefined;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      if (isDeposco(url)) await deposcoThrottle();
+      const resp = await axios.request<T>({
+        method,
+        url,
+        data: opts.data,
+        params: opts.params,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          ...(opts.data !== undefined ? { 'Content-Type': 'application/json' } : {}),
+          ...opts.headers,
+        },
+        httpsAgent: ipv4Agent,
+        timeout: opts.timeout ?? 30_000,
+      });
+      return resp.data;
+    } catch (err) {
+      ax = err as AxiosError;
+      const status = ax.response?.status;
+      // Retry: 429 (rate limit) for ANY method — a 429 means it was rejected, never processed,
+      // so re-sending is safe. 5xx / network errors only for GET (POST/PATCH could double-apply).
+      const isRateLimit = status === 429;
+      const isTransient = status !== undefined && status >= 500;
+      const isNetwork = !ax.response;
+      const retryable = isRateLimit || ((isTransient || isNetwork) && method === 'get');
+      if (retryable && attempt < MAX_ATTEMPTS) {
+        const retryAfter = Number(ax.response?.headers?.['retry-after']);
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(1500 * 2 ** (attempt - 1), 20_000) + Math.floor(Math.random() * 500);
+        console.log(`[http] ${method.toUpperCase()} ${(url.split('.com')[1] ?? url).slice(0, 60)} → HTTP ${status ?? ax.code} — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${waitMs}ms`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        continue;
+      }
+      break;
+    }
   }
+  // Verbose-always: surface method + path + status + response body, so a failure never
+  // collapses to a bare "Request failed with status code 400".
+  const status = ax?.response?.status ?? ax?.code ?? '?';
+  const body = ax?.response?.data;
+  const q = opts.params ? '?' + Object.entries(opts.params).map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&') : '';
+  const path = (url.split('.com')[1] ?? url) + q;
+  const detail = (typeof body === 'string' ? body : JSON.stringify(body ?? ax?.message)).slice(0, 600);
+  throw new Error(`${method.toUpperCase()} ${path} → HTTP ${status}: ${detail}`);
 }
 
 /** GET with a 4-attempt backoff. Used for all read-side BC calls. */
