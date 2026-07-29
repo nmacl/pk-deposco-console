@@ -68,21 +68,31 @@ interface BcPurchaseOrderLine {
   itemVariantId: string;
 }
 
-async function listOpenWspPosAbove(
+async function listReleasedWspPosAbove(
   base: string,
   token: string,
   companyId: string,
   threshold: string,
+  odata: string,
 ): Promise<BcPurchaseOrder[]> {
-  // No status filter — BC v2.0 only exposes Draft/In Review/Open on this instance,
-  // and push/receive work against all three.
+  // The v2.0 purchaseOrders API is where we get the id needed for line ops, but its status
+  // enum (Draft/In Review/Open) does NOT expose the classic Open/Released — that lives on the
+  // ODataV4 Purchase_Order.Status field. So: list candidates from v2.0, then keep only those
+  // whose ODataV4 Status = 'Released' (matches the sales-order rule — Open = still editing).
   const filter = encodeURIComponent(
     `startswith(number,'WSP') and number gt '${threshold}'`,
   );
   const select = encodeURIComponent('id,number,orderDate,vendorNumber,vendorName');
   const body = await authReq<{ value: BcPurchaseOrder[] }>('get',
     `${base}/companies(${companyId})/purchaseOrders?$filter=${filter}&$select=${select}`, token);
-  return body.value;
+
+  const relFilter = encodeURIComponent(
+    `startswith(No,'WSP') and No gt '${threshold}' and Status eq 'Released'`,
+  );
+  const rel = await authReq<{ value: Array<{ No: string }> }>('get',
+    `${odata}/Purchase_Order?$filter=${relFilter}&$select=No`, token);
+  const released = new Set((rel.value ?? []).map((r) => r.No));
+  return body.value.filter((po) => released.has(po.number));
 }
 
 async function getPoByNumber(
@@ -465,8 +475,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   const bcToken = await getBcToken(bcCfg);
   const companyId = await getCompanyId(bcCfg, bcToken);
 
-  const pos = await listOpenWspPosAbove(base, bcToken, companyId, PO_THRESHOLD);
-  console.log(`[tick] ${pos.length} candidate PO(s) > ${PO_THRESHOLD}: ${pos.map((p) => p.number).join(', ') || '(none)'}`);
+  const pos = await listReleasedWspPosAbove(base, bcToken, companyId, PO_THRESHOLD, bcOdataBase(bcCfg));
+  console.log(`[tick] ${pos.length} Released candidate PO(s) > ${PO_THRESHOLD}: ${pos.map((p) => p.number).join(', ') || '(none)'}`);
 
   // PO push is an upsert (runs every tick), so log FAILURES only — logging every re-push would
   // flood sync_events. The run row carries the processed/failed counts.
