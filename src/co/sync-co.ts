@@ -157,13 +157,13 @@ function headerShipping(header: BcRow): ShipInfo | null {
 // Third-party freight: Deposco bills the customer's own carrier account through an "eHub" ship-via
 // profile, so the BC E-Ship Agent Service code must be translated to Deposco's eHub name (only when
 // LAX_Shipping_Payment_Type = 'Third Party'). Keys are normalized (upper, single-spaced) so BC's
-// mixed FedEx SNAKE_CASE and UPS spaced codes both match. Values are the exact Deposco ship-via
-// strings from the mapping doc — preserved verbatim (incl. the 'ehub'/'FedEx' casing on Std Overnight).
+// mixed FedEx SNAKE_CASE and UPS spaced codes both match. Values must match Deposco's eHub
+// profile names verbatim (case-sensitive), so keep them exactly as in the mapping doc.
 const THIRD_PARTY_SHIP_VIA: Record<string, string> = {
   'INTERNATIONAL_ECONOMY': 'eHub Fedex Intl Economy',
   'INTERNATIONAL_PRIORITY': 'eHub Fedex Intl Priority',
   'PRIORITY_OVERNIGHT': 'eHub Fedex Overnight Priority',
-  'STANDARD_OVERNIGHT': 'ehub FedEx Standard Overnight',
+  'STANDARD_OVERNIGHT': 'eHub FedEx Standard Overnight',
   'FEDEX_2_DAY_AM': 'eHub Fedex 2day Am',
   'FEDEX_2_DAY': 'eHub Fedex 2day',
   'FEDEX_EXPRESS_SAVER': 'eHub Fedex Express Saver',
