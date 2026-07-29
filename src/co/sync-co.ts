@@ -154,12 +154,43 @@ function headerShipping(header: BcRow): ShipInfo | null {
   };
 }
 
+// Third-party freight: Deposco bills the customer's own carrier account through an "eHub" ship-via
+// profile, so the BC E-Ship Agent Service code must be translated to Deposco's eHub name (only when
+// LAX_Shipping_Payment_Type = 'Third Party'). Keys are normalized (upper, single-spaced) so BC's
+// mixed FedEx SNAKE_CASE and UPS spaced codes both match. Values are the exact Deposco ship-via
+// strings from the mapping doc — preserved verbatim (incl. the 'ehub'/'FedEx' casing on Std Overnight).
+const THIRD_PARTY_SHIP_VIA: Record<string, string> = {
+  'INTERNATIONAL_ECONOMY': 'eHub Fedex Intl Economy',
+  'INTERNATIONAL_PRIORITY': 'eHub Fedex Intl Priority',
+  'PRIORITY_OVERNIGHT': 'eHub Fedex Overnight Priority',
+  'STANDARD_OVERNIGHT': 'ehub FedEx Standard Overnight',
+  'FEDEX_2_DAY_AM': 'eHub Fedex 2day Am',
+  'FEDEX_2_DAY': 'eHub Fedex 2day',
+  'FEDEX_EXPRESS_SAVER': 'eHub Fedex Express Saver',
+  'GROUND_HOME_DELIVERY': 'eHub Fedex Ground Home',
+  '3 DAY SELECT': 'eHub Ups 3day Select',
+  '2ND DAY AIR': 'eHub Ups 2nd Day',
+  '2ND DAY AIR A.M.': 'eHub Ups 2nd Day Am',
+  'NEXT DAY AIR SAVER': 'eHub Ups Next Day Saver',
+  'NEXT DAY AIR': 'eHub Ups Next Day',
+  'EXPEDITED': 'eHub Ups Expedited',
+  'EXPRESS': 'eHub Ups Express',
+  'EXPRESS PLUS': 'eHub Ups Express Plus',
+  'GROUND': 'eHub Ups Ground',
+  'FEDEX_GROUND': 'eHub Fedex Ground',
+};
+const normSvc = (s: string): string => s.trim().toUpperCase().replace(/\s+/g, ' ');
+function thirdPartyShipVia(service: string): string | null {
+  return service ? (THIRD_PARTY_SHIP_VIA[normSvc(service)] ?? null) : null;
+}
+
 function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOrderPayload {
   const soNumber = pick(header, 'No');
   const ship = headerShipping(header);
   // Third-party freight billing: when the SO bills freight to a third party, add the account #
-  // + a freight bill-to with the ship-to zip/country. freightTermsType is already passed through
-  // from LAX_Shipping_Payment_Type by headerShipping. Ship-via is left untouched.
+  // + a freight bill-to with the ship-to zip/country (freightTermsType is already passed through
+  // from LAX_Shipping_Payment_Type by headerShipping). ALSO translate the E-Ship Agent Service
+  // code into Deposco's eHub ship-via profile — an unmapped code falls back to the raw code + warns.
   const thirdParty = /third\s*party/i.test(pick(header, 'LAX_Shipping_Payment_Type'));
   const freight = thirdParty
     ? {
@@ -167,6 +198,12 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
         freightBillToContact: { postalCode: pick(header, 'Ship_to_Post_Code'), country: pick(header, 'Ship_to_Country_Region_Code') },
       }
     : {};
+  if (ship && thirdParty) {
+    const svc = pick(header, 'LAX_E_Ship_Agent_Service');
+    const mapped = thirdPartyShipVia(svc);
+    if (mapped) ship.shipVia = mapped;
+    else console.warn(`[co] ${soNumber}: third-party freight but E-Ship service '${svc}' has no eHub mapping — using raw ship-via '${ship.shipVia}'`);
+  }
   const data: DeposcoCoLine[] = rawLines.map((l) => {
     const num = pick(l, 'WebshopVariantCode', 'No');
     const qty = numOf(l, 'Quantity');
