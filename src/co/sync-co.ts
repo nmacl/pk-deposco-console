@@ -258,6 +258,14 @@ async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: stri
 async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow): Promise<PostResult> {
   const odata = bcOdataBase(bcCfg);
   const soNumber = pick(header, 'No');
+  // Only RELEASED orders push to the WMS — Open = still being edited. The scheduled tick already
+  // pre-filters Released, but the manual --order button (web UI) fetches any order by number, so
+  // guard here too — this is the single choke point both paths flow through.
+  const status = pick(header, 'Status');
+  if (status !== 'Released') {
+    console.log(`[push] ${soNumber}: status '${status || '(unknown)'}' — not Released, skipping (only Released orders push)`);
+    return 'skip';
+  }
   const bcToken = await getBcToken(bcCfg);
   const lines = await getSoLines(odata, bcToken, soNumber);
   if (lines.length === 0) {
