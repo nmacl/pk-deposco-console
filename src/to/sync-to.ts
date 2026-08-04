@@ -14,7 +14,7 @@
  *
  * Modes:
  *   node dist/to/sync-to.js                          continuous loop (auto batch)
- *   node dist/to/sync-to.js --once                   one tick
+ *   node dist/to/sync-to.js --once                   one tick (Released transfers only)
  *   node dist/to/sync-to.js --order TRFO001397       sync one TO (push + post) — the
  *                                                    single-order handler the web-UI button calls
  * Gates: TO_PUSH_ENABLED (push to Deposco), TO_POST_ENABLED (post shipment/receipt in BC).
@@ -68,7 +68,8 @@ function adaptTransferHeader(h: BmiTransferHeader): BcRow {
 }
 
 async function listRecentTransferOrders(cfg: SyncBcConfig, companyId: string, token: string): Promise<BcRow[]> {
-  const filter = encodeURIComponent(`startswith(no,'${odataStr(PREFIX)}')`);
+  // Open transfer orders can still be edited. Only Released transfers are ready for WMS export.
+  const filter = encodeURIComponent(`startswith(no,'${odataStr(PREFIX)}') and status eq 'Released'`);
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders?$filter=${filter}&$orderby=postingDate desc&$top=${PER_TICK}`;
   const rows = (await authReq<{ value: BmiTransferHeader[] }>('get', url, token)).value ?? [];
   return rows.map(adaptTransferHeader);
@@ -227,10 +228,18 @@ async function customerOrderExists(deposcoCfg: DeposcoConfig, externalOrderNumbe
 type PushOutcome =
   | { kind: 'pushed'; lines: number }
   | { kind: 'exists' }                                             // CO already in Deposco, nothing new sent
+  | { kind: 'notReleased'; status: string }
   | { kind: 'none'; attempted: number; noVariant: number; zeroQty: number }; // 0 pushable lines
 
 async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan): Promise<PushOutcome> {
   const no = pick(header, 'No');
+  // The batch query filters Released orders, but manual --order runs fetch by number. Keep the
+  // status gate at the push boundary so an Open transfer cannot be sent to Deposco either way.
+  const status = pick(header, 'Status');
+  if (status !== 'Released') {
+    console.log(`[push] ${no}: status '${status || '(unknown)'}' - not Released, skipping (only Released transfers push)`);
+    return { kind: 'notReleased', status };
+  }
   const asWhat = plan === 'receive' ? 'purchaseOrder' : plan === 'ship' ? 'customerOrder' : 'purchaseOrder + customerOrder';
   console.log(`[push] ${no}: reading BC transfer lines (bmiTransferOrderLines) → Deposco as ${asWhat}`);
   const raw = await getBmiTransferLines(cfg, companyId, no);
@@ -384,6 +393,8 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
       const { plan, push } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
       if (plan === 'skip') {
         await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });
+      } else if (push?.kind === 'notReleased') {
+        await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'push', status: 'skip', message: `status ${push.status || '(unknown)'}; only Released transfers push`, dedupeKey: dailyDedupe('to-status', no, push.status || 'unknown') });
       } else if (push?.kind === 'none') {
         // Classified as ship/receive but NOTHING was pushable — a real data problem (lines with no
         // WebshopVariantCode or 0 qty). Log as desync (surfaces under /logs "Issues"), not ok.
