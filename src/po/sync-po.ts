@@ -107,6 +107,13 @@ async function getPoByNumber(
   return body.value[0] ?? null;
 }
 
+async function isReleasedPurchaseOrder(odata: string, token: string, poNumber: string): Promise<boolean> {
+  const filter = encodeURIComponent(`No eq '${poNumber}' and Status eq 'Released'`);
+  const body = await authReq<{ value: Array<{ No: string }> }>('get',
+    `${odata}/Purchase_Order?$filter=${filter}&$select=No`, token);
+  return (body.value ?? []).length > 0;
+}
+
 async function getLines(
   base: string,
   token: string,
@@ -258,6 +265,14 @@ async function pushPo(
   companyId: string,
   po: BcPurchaseOrder,
 ): Promise<void> {
+  // The scheduled list is Released-only, but the manual --order path fetches a PO directly from
+  // the v2.0 API, whose status does not distinguish Open from Released. Recheck against OData at
+  // the push boundary so Open POs cannot reach Deposco through the console.
+  const released = await isReleasedPurchaseOrder(bcOdataBase(bcCfg), await getBcToken(bcCfg), po.number);
+  if (!released) {
+    console.log(`[push] ${po.number}: not Released, skipping (only Released purchase orders push)`);
+    return;
+  }
   // Branch on whether Deposco already has this PO: create vs update.
   // Create gets orderStatus='New'; update omits orderStatus (Deposco rejects downgrades).
   // Both paths POST to the same upsert endpoint.
