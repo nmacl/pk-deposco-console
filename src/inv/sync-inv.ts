@@ -14,6 +14,12 @@
  * reason. PULL's BC posts get documentNo 'DEP<id>'; PUSH drops ILEs whose documentNo starts 'DEP'.
  * 'Status Change' adjustments (Available↔Blocked) are skipped+logged (no BC qty equivalent yet).
  *
+ * DIRECTION POLICY: inventory flows Deposco -> BC ONLY. Deposco is the system of record for
+ * on-hand at a WMS location, so BC-side counts are not exported back. The BC -> Deposco push is
+ * retained but OFF unless INV_PUSH_ENABLED=true is set explicitly — no CLI mode implies it.
+ * Note its cursor (inv/bc_entry) is stale by ~33k entries against BC Production, so re-derive it
+ * (delete the sync_cursors row so initCursors reseeds) before ever switching the push on.
+ *
  * SAFETY: on first run (no state file) the cursors initialize to the CURRENT max on each side
  * and nothing is posted — no accidental backfill of all history. Set INV_BACKFILL=true to
  * process everything from cursor 0 on a fresh state.
@@ -26,6 +32,7 @@
  *   node dist/inv/sync-inv.js --adj 111       pull one Deposco adjustment by id (forces pull)
  *
  * Env: INV_SYNC_INTERVAL_MS(60000), INV_PULL_ENABLED(false), INV_PUSH_ENABLED(false),
+ *      INV_PUSH_ENABLED is the ONLY way to enable BC->Deposco; --once does not imply it.
  *      INV_PUSH_REASON(BCSYNC), INV_STATE_FILE(.inv-state.json), INV_BACKFILL(false),
  *      INV_LOCATION_MAP("HIVE:WESTERLY" — Deposco facility ⇄ BC location; identity if unset),
  *      INV_DEFAULT_FACILITY(HIVE), BC_* / DEPOSCO_*.
@@ -278,7 +285,18 @@ async function main(): Promise<void> {
   const once = process.argv.includes('--once');
   console.log(`[inv-sync] starting — interval=${INTERVAL_MS}ms pull=${PULL_ENABLED}&${doPull} push=${PUSH_ENABLED}&${doPush} reason=${PUSH_REASON}${DRY_RUN ? ' DRY-RUN' : ''}${once ? ' (single tick)' : ''}`);
 
-  const opts = { pull: doPull && (PULL_ENABLED || DRY_RUN || once), push: doPush && (PUSH_ENABLED || DRY_RUN || once) };
+  // Inventory is ONE-WAY by policy: Deposco -> BC only. The pull is the supported direction, so
+  // --once/--dry-run may run it without INV_PULL_ENABLED (that's how the scheduled job works).
+  // The PUSH must NEVER be implied by the mode — it previously inherited `|| once`, so a bare
+  // `--once` would try to export BC ledger adjustments to Deposco despite INV_PUSH_ENABLED=false.
+  // It now requires the flag explicitly, in --once and loop mode alike.
+  const opts = {
+    pull: doPull && (PULL_ENABLED || DRY_RUN || once),
+    push: doPush && PUSH_ENABLED,
+  };
+  if (doPush && !PUSH_ENABLED && (once || DRY_RUN)) {
+    console.log('[inv] push skipped — BC->Deposco is off by policy (set INV_PUSH_ENABLED=true to override)');
+  }
   if (once) { await tick(cfg, deposcoCfg, companyId, state, opts); await closeDb(); return; }
   for (;;) {
     const t0 = Date.now();
