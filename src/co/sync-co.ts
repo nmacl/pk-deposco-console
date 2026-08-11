@@ -34,7 +34,7 @@ import { type AxiosError } from 'axios';
 import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
-import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
+import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, rateLimitHits, retryCount, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
@@ -338,12 +338,15 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow)
   const existing = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
   if (existing !== null) {
     console.log(`[push] ${soNumber}: already in Deposco (CO id ${existing}) — skipping create (no upsert yet)`);
+    confirmedInDeposco.add(soNumber);
     return 'skip';
   }
   const payload = buildCustomerOrder(header, lines);
   const via = payload.customerOrder.shipVia;
   if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
-  return postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  const res = await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  if (res === 'ok') confirmedInDeposco.add(soNumber);
+  return res;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -407,12 +410,28 @@ async function setExternalDocumentNo(odata: string, token: string, soNumber: str
 
 interface ShipLine { lineId: string; label: string; quantity: number }
 
-async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, runId: number | null = null): Promise<void> {
+// Orders the PUSH confirmed exist in Deposco during this run. If a pull then reports "not
+// found" for one of these, the lookup is contradicting itself within a single tick — that is the
+// exact /beta signature and it cannot be a legitimate "hasn't shipped yet".
+const confirmedInDeposco = new Set<string>();
+
+type PullOutcome = 'notFound' | 'noShipments' | 'acted';
+
+async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, runId: number | null = null): Promise<PullOutcome> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const orderId = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
   if (orderId === null) {
+    // Previously this returned silently with NO db row, so a broken lookup was indistinguishable
+    // from "hasn't shipped yet" — that's exactly how the /beta bug hid for hours. Now it leaves a
+    // trace, and tick() alarms when EVERY order reports this (see the invariant check there).
     console.log(`[pull] ${soNumber}: not in Deposco yet, skipping shipment pull`);
-    return;
+    await logEvent({
+      runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber,
+      action: 'pull', status: 'skip', side: 'deposco',
+      message: 'lookup found no Deposco customerOrder for this BC order — shipment pull skipped',
+      dedupeKey: dailyDedupe('co-pull-notfound', soNumber, 'notfound'),
+    });
+    return 'notFound';
   }
 
   // Aggregate Deposco shipped qty by BC Line_No (externalLineNumber == Line_No).
@@ -435,14 +454,14 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
   const so = await getSalesOrderByNumber(base, bcToken, companyId, soNumber);
   if (!so) {
     console.log(`[pull] ${soNumber}: not found via BC v2.0 salesOrders, skipping`);
-    return;
+    return 'noShipments';
   }
   const bcLines = await getSalesLines(base, bcToken, companyId, so.id);
   const bcByLineNo = new Map(bcLines.map((l) => [l.sequence, l]));
   console.log(`[pull] ${soNumber}: Deposco CO ${orderId} | bc_lines=${bcLines.length} deposco_lines=${coLines.length}`);
   if (bcLines.length === 0) {
     console.warn(`[pull] ${soNumber}: ⚠ BC SO has 0 lines — nothing to ship against. Skipping.`);
-    return;
+    return 'noShipments';
   }
 
   // Per-line plan: union of (Deposco shipped) and (BC lines), delta = deposco − bc.
@@ -474,7 +493,7 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     // write failing (or Deposco may have labelled it only afterwards). Without this, any
     // transient tracking failure would be permanent — the next tick sees delta=0 and stops.
     await writeTrackingBack(bcCfg, deposcoCfg, soNumber, null, orderId, runId);
-    return;
+    return 'noShipments';
   }
 
   // Post ship-only (invoiceQuantity=0), mirroring the PO receive-only flow.
@@ -510,6 +529,7 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
   // Stamp Deposco tracking onto the shipment we just posted. Keyed on `ref`, which BC carried
   // onto the posted shipment's External Document No. — exact even when one SO has several.
   await writeTrackingBack(bcCfg, deposcoCfg, soNumber, ref, orderId, runId);
+  return 'acted';
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -660,6 +680,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   // already-synced orders (that would flood sync_events since most Released orders already exist).
   const runId = await startRun('co', process.env.SYNC_TRIGGER || 'manual');
   let ok = 0, skip = 0, fail = 0;
+  // Pull-side tallies feed the invariant check at the end of the tick.
+  let pulled = 0, pullNotFound = 0, pullContradictions = 0;
 
   for (const prefix of PREFIXES) {
     let sos: BcRow[];
@@ -689,7 +711,13 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       }
       if (PULL_ENABLED) {
         try {
-          await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
+          const outcome = await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
+          pulled++;
+          if (outcome === 'notFound') {
+            pullNotFound++;
+            // absent AND the push just confirmed it exists => impossible, so it's a lookup fault
+            if (confirmedInDeposco.has(soNumber)) pullContradictions++;
+          }
         } catch (err) {
           const e = err as AxiosError;
           console.error(`[pull] ${soNumber} FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
@@ -698,7 +726,26 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     }
   }
 
-  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail });
+  // INVARIANT: we push these orders to Deposco, so the pull should find them. If EVERY pull says
+  // "no customerOrder for this BC order", the lookup itself is broken — not the warehouse being
+  // idle. That is precisely the /beta failure on 2026-08-11, which hid for hours because each
+  // individual skip looked like a legitimate "hasn't shipped yet". Alarm on the aggregate.
+  // Only orders the push CONFIRMED are in Deposco count here. An order skipped for "no WMS lines"
+  // is legitimately absent and must not trigger this (9 of 12 pulls in a real tick were exactly
+  // that — PKSO/WSOD/HDSO orders with no WESTERLY lines, never pushed).
+  if (pullContradictions > 0) {
+    const m = `${pullContradictions} order(s) were confirmed present in Deposco by the push, then the shipment pull could not find them — the lookup is contradicting itself, check the API base/environment`;
+    console.error(`[tick] ⚠ ${m}`);
+    await logEvent({
+      runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: '(all)',
+      action: 'pull', status: 'desync', side: 'deposco', message: m,
+      detail: { pulled, pullNotFound, pullContradictions, hint: 'check DEPOSCO_CO_LOOKUP_BASE / DEPOSCO_API_BASE' },
+      dedupeKey: dailyDedupe('co-pull-contradiction', 'all', String(pullContradictions)),
+    });
+  }
+  const rl = rateLimitHits(), rt = retryCount();
+  if (rl > 0) console.warn(`[tick] Deposco rate-limited ${rl}x this run (retries absorbed them) — raise DEPOSCO_MIN_INTERVAL_MS if this persists`);
+  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail, pulled, pullNotFound, pullContradictions, rateLimited: rl, retries: rt });
   console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} failed`);
 }
 
