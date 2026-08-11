@@ -121,6 +121,43 @@ function firstEmail(raw: string, logKey: string): string {
   return first;
 }
 
+// Deposco's Freight Bill To block is a FLAT contact, same shape as shipToContact — its UI shows
+// Name / Line1 / City / State Province / Postal Code / Country against these fields.
+interface DeposcoFreightBillToContact {
+  attention: string; firstName: string; lastName: string;
+  line1: string; line2: string; city: string; stateProvince: string; postalCode: string; country: string;
+  phone: string;
+}
+
+/**
+ * Who gets billed for third-party freight. BC's "Third Party Name/Address/City/State/ZIP/Country"
+ * block on the sales order IS the Bill-to address — verified on DISO211289, where every value
+ * matches (Bill_to_Name "American Diversity Bus Solut", Bill_to_Post_Code "56334", …).
+ *
+ * This previously sent only { postalCode, country } sourced from SHIP_TO, which put the wrong
+ * party's address on the freight bill: DISO211289 showed Freight Bill To Postal Code 17543
+ * (Lititz PA, the recipient) instead of 56334 (Glenwood MN, the payer). Name was never sent at all.
+ *
+ * Phone comes from Sell_to_Phone_No — Bill-to carries no phone, and Bill_to_Contact_No equals
+ * Sell_to_Contact_No on these orders, so it is the same party.
+ */
+function freightBillToContact(h: BcRow): DeposcoFreightBillToContact {
+  const name = pick(h, 'Bill_to_Name').trim();
+  const parts = name.split(/\s+/);
+  return {
+    attention: capName(pick(h, 'Bill_to_Contact') || name),
+    firstName: capName(parts[0] || name || 'N/A'),
+    lastName: capName(parts.slice(1).join(' ') || parts[0] || 'N/A'),
+    line1: pick(h, 'Bill_to_Address'),
+    line2: pick(h, 'Bill_to_Address_2'),
+    city: pick(h, 'Bill_to_City'),
+    stateProvince: pick(h, 'Bill_to_County'),
+    postalCode: pick(h, 'Bill_to_Post_Code'),
+    country: pick(h, 'Bill_to_Country_Region_Code') || 'US',
+    phone: pick(h, 'Bill_to_Phone_No', 'Sell_to_Phone_No'),
+  };
+}
+
 // customerOrder.shipToContact is FLAT — address fields live inside the contact.
 interface DeposcoShipToContact {
   attention: string; firstName: string; lastName: string;
@@ -177,7 +214,7 @@ interface DeposcoCustomerOrderPayload {
     freightTermsType?: string;
     // Third-party freight billing (only when LAX_Shipping_Payment_Type = 'Third Party').
     freightBillToAccount?: string;
-    freightBillToContact?: { postalCode?: string; country?: string };
+    freightBillToContact?: DeposcoFreightBillToContact;
     shipToContact: DeposcoShipToContact;
     channels: unknown[];
     coLines: { data: DeposcoCoLine[] };
@@ -242,7 +279,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
   const freight = thirdParty
     ? {
         freightBillToAccount: pick(header, 'LAX_Third_Party_Ship_Acct_No'),
-        freightBillToContact: { postalCode: pick(header, 'Ship_to_Post_Code'), country: pick(header, 'Ship_to_Country_Region_Code') },
+        freightBillToContact: freightBillToContact(header),
       }
     : {};
   if (ship && thirdParty) {
