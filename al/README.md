@@ -19,7 +19,12 @@ plus the inventory-adjustment write path (item-journal post).
 | `PKItemVariantAPI.Page` (60205) | API page | `bmiItemVariants` — reads WebshopVariantCode (field 50001) via FieldRef. |
 | `PKPurchaseOrderLineAPI.Page` / `PKSalesOrderLineAPI.Page` | API pages | PO / SO line reads (WebshopVariantCode by field no.). |
 | `PKTransferOrderHeaderAPI.Page` (60206) / `PKTransferOrderLineAPI.Page` | API pages | `bmiTransferHeaders` / lines — decouples TO sync from the fragile OData feed. |
-| `PKOptionalField.Codeunit` (60221) | Codeunit | `AsCode(RecRef, FieldNo)` — read another extension's field by number, no dependency. |
+| `PKOptionalField.Codeunit` (60221) | Codeunit | `AsCode(RecRef, FieldNo)` — read another extension's field by number, no dependency. `TrySetText` is the write counterpart. |
+| `PKSalesShipmentExt.TableExt` (60230) | TableExt | Deposco tracking payload on `Sales Shipment Header` (fields 60200-60211): tracking no./URL, carrier, ship via, container LPN, synced-at. |
+| `PKPostedSalesShipmentPageExt.PageExt` (60231) | PageExt | Surfaces those fields in a **Deposco** group on the Posted Sales Shipment card. |
+| `PKShipTracking.Table` (60211) | Table | Buffer/audit table for the tracking write-back. `InherentPermissions = RIMDX` (same reason as 60210). |
+| `PKShipTrackingMgt.Codeunit` (60222) | Codeunit | Applies a buffer row onto the posted shipment. Holds `Permissions = tabledata "Sales Shipment Header" = RM` — a page modifying it directly runs under the CALLER's rights and 403s on the S2S license. Also mirrors the carrier into UPG's `PackageCarrier` (50130) and handles `clearTracking`. |
+| `PKPostedSalesShipmentAPI.Page` (60207) | API page | `bmiShipmentTrackings` — POST tracking, applied-on-insert. Match by `shipmentNo` or `externalDocumentNo` (the `SHIP-{soNo}-{epoch}` ref sync-co.ts stamps before posting). |
 | `PKDeposcoReadAPI.PermissionSet` | PermissionSet | Grants all pages/codeunits/tabledata. |
 
 ## Build (headless, macOS)

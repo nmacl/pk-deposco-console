@@ -21,9 +21,9 @@ create table if not exists sync_events (
   ts          timestamptz not null default now(),
   worker      text not null,
   direction   text,                                -- deposco->bc | bc->deposco
-  entity_type text,                                -- order | inventory_adj
+  entity_type text,                                -- order | inventory_adj | shipment
   entity_id   text,                                -- WSOD139248 | Deposco adj id
-  action      text,                                -- pull | push | post | floor
+  action      text,                                -- pull | push | post | floor | tracking
   status      text not null,                       -- ok | skip | floor | desync | fail
   side        text,                                -- bc | deposco | null
   message     text,

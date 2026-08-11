@@ -13,15 +13,24 @@ import { bcGet, bcOdataBase, odataStr } from './bc-client.js';
 import type { SyncBcConfig } from './config.js';
 
 const DEFAULT_BU = process.env.DEPOSCO_COMPANY || 'HIVE';
+// Deposco-side integration ("socket") the item's channel listing attaches to. Was hardcoded
+// 'Hive Pilot' (a PILOT-env socket). Now env-driven, same contract as scripts/seed-items.mjs:
+// unset/empty => no `channels` at all (item master only, no BC back-reference).
+const DEFAULT_INTEGRATION = process.env.DEPOSCO_INTEGRATION_NAME ?? '';
 
 export interface BcVariantFull { Item_No: string; Code: string; Description_2?: string; Size?: string; Block?: boolean; WebshopVariantCode?: string; UPC_GTN_No?: string; }
 export interface BcCardFull { No: string; Description?: string; Brand?: string; Style?: string; Unit_Price?: number; Unit_Cost?: number; Blocked?: boolean; Sales_Blocked?: boolean; }
 
 /**
  * Mirror of item/transform.ts (can't import it — the item bulk path isn't deployed here).
- * newPackFlag:false, Hive Pilot channel, WebshopVariantCode as the item number.
+ * newPackFlag:false, DEPOSCO_INTEGRATION_NAME channel, WebshopVariantCode as the item number.
  */
-export function buildDeposcoItem(card: BcCardFull, v: BcVariantFull, bu: string = DEFAULT_BU): Record<string, unknown> {
+export function buildDeposcoItem(
+  card: BcCardFull,
+  v: BcVariantFull,
+  bu: string = DEFAULT_BU,
+  integration: string = DEFAULT_INTEGRATION,
+): Record<string, unknown> {
   const number = (v.WebshopVariantCode ?? '').trim() || `${v.Item_No}-${v.Code}`;
   const description = card.Description ?? '';
   const shortDescription = [card.Brand, card.Style, v.Description_2, v.Size].map((p) => (p ?? '').trim()).filter((p) => p.length > 0).join(' ');
@@ -47,11 +56,11 @@ export function buildDeposcoItem(card: BcCardFull, v: BcVariantFull, bu: string 
       dimensions: { length: { measurement: 0, units: 'in' }, width: { measurement: 0, units: 'in' }, height: { measurement: 0, units: 'in' } },
     }],
     ...(upc ? { upcs: { data: [{ value: upc }] } } : {}),
-    channels: [{
-      integration: { businessKey: { name: 'Hive Pilot' } },
+    ...(integration ? { channels: [{
+      integration: { businessKey: { name: integration } },
       listingStatus: 'Linked', saleable: salesEnabled, packQuantity: 1,
       ref1: v.Item_No, ref2: v.Code, ref3: 'EA', ref4: number,
-    }],
+    }] } : {}),
   };
 }
 

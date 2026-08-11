@@ -25,6 +25,7 @@
  *   SO_PREFIXES          (default "PKSO,WSOD,HDSO,DISO")   — BC SO number prefixes to sync
  *   SO_PER_PREFIX        (default 25)                      — most-recent N per prefix per tick
  *   SO_PULL_ENABLED      (default false)                   — enable the shipment pull (ship-only)
+ *   SO_TRACKING_ENABLED  (default true)                    — write Deposco tracking onto the posted shipment
  *   BC_*                 BC auth + environment + company
  *   DEPOSCO_*            Deposco auth + env + company
  */
@@ -33,8 +34,8 @@ import { type AxiosError } from 'axios';
 import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
-import { bcApiBase, bcOdataBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment } from '../sync/orders.js';
+import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
@@ -44,6 +45,9 @@ const INTERVAL_MS = parseInt(process.env.SO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIXES = (process.env.SO_PREFIXES ?? 'PKSO,WSOD,HDSO,DISO').split(',').map((p) => p.trim()).filter(Boolean);
 const PER_PREFIX = parseInt(process.env.SO_PER_PREFIX ?? '25', 10);
 const PULL_ENABLED = (process.env.SO_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
+// Tracking write-back onto the posted sales shipment. Needs the AL extension (>= v2.4.0.0,
+// page bmiShipmentTrackings) published to the target BC environment.
+const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
 // Deposco trading partner all COs attach to (hardcoded for now; per-customer mapping later).
@@ -348,7 +352,7 @@ async function setExternalDocumentNo(odata: string, token: string, soNumber: str
 
 interface ShipLine { lineId: string; label: string; quantity: number }
 
-async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string): Promise<void> {
+async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, runId: number | null = null): Promise<void> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const orderId = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
   if (orderId === null) {
@@ -411,6 +415,10 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
   console.log(`  summary: to_ship=${toShip.length} in_sync=${inSync} bc_ahead=${bcAhead} no_deposco=${noDeposco} orphan=${orphan} unparseable=${unparseable}`);
   if (toShip.length === 0) {
     console.log(`[pull] ${soNumber}: nothing to post`);
+    // Still try tracking: a shipment may have posted on an earlier tick with the tracking
+    // write failing (or Deposco may have labelled it only afterwards). Without this, any
+    // transient tracking failure would be permanent — the next tick sees delta=0 and stops.
+    await writeTrackingBack(bcCfg, deposcoCfg, soNumber, null, orderId, runId);
     return;
   }
 
@@ -443,6 +451,142 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     console.log(`  ${line.label}: shipped=${a.shippedQuantity} invoiced=${inv}${inv > 0 ? ' ⚠ INVOICED' : ''} (posted +${line.quantity})`);
   }
   console.log(`[pull] ${soNumber}: ✓ shipment posted (ship-only, ref=${ref})`);
+
+  // Stamp Deposco tracking onto the shipment we just posted. Keyed on `ref`, which BC carried
+  // onto the posted shipment's External Document No. — exact even when one SO has several.
+  await writeTrackingBack(bcCfg, deposcoCfg, soNumber, ref, orderId, runId);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Tracking write-back: Deposco outbound shipment → BC posted sales shipment (SLSS…)
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Posted sales shipments are NOT writable over OData ("Control 'Package Tracking No.' is
+// read-only"), and a page over the table modifies under the caller's rights, which the S2S
+// license forbids. So this POSTs to our AL extension's bmiShipmentTrackings, whose codeunit
+// holds the elevated permission. See al/src/PKShipTrackingMgt.Codeunit.al.
+//
+// Never fatal: tracking is an annotation. A failure here must not make the caller think the
+// shipment post failed — it already succeeded.
+async function writeTrackingBack(
+  bcCfg: BcConfig,
+  deposcoCfg: DeposcoConfig,
+  soNumber: string,
+  externalDocumentNo: string | null,
+  customerOrderId: number,
+  runId: number | null = null,
+): Promise<void> {
+  const logTrack = (status: 'ok' | 'skip' | 'fail', message: string, detail?: unknown, side: 'bc' | 'deposco' = 'bc') =>
+    logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'shipment',
+               entityId: soNumber, action: 'tracking', status, side, message, detail,
+               dedupeKey: dailyDedupe('co-track', `${soNumber}:${externalDocumentNo ?? 'backfill'}`, message) });
+
+  if (!TRACKING_ENABLED) {
+    console.log(`[track] ${soNumber}: disabled (SO_TRACKING_ENABLED=false)`);
+    await logTrack('skip', 'tracking write-back disabled (SO_TRACKING_ENABLED=false)');
+    return;
+  }
+  try {
+    const dToken = await getDeposcoToken(deposcoCfg);
+    const co = await authReq<{ customerOrder?: { fulfillmentOrders?: Array<{ id: number }> } }>(
+      'get', `${deposcoCfg.apiBase}/orders/customerOrders/${customerOrderId}`, dToken);
+
+    const all: DeposcoTracking[] = [];
+    for (const fo of co.customerOrder?.fulfillmentOrders ?? []) {
+      all.push(...await fetchTrackingForSalesOrder(deposcoCfg, dToken, fo.id));
+    }
+    if (all.length === 0) {
+      console.log(`[track] ${soNumber}: no tracking numbers in Deposco yet`);
+      await logTrack('skip', 'no tracking number on any Deposco outbound shipment yet', undefined, 'deposco');
+      return;
+    }
+
+    // Deposco emits shipments that have a tracking number but shipped ZERO units — a label
+    // created and then not used. Those must never become the primary tracking number (BC's
+    // Track Package would point at an empty label), so drop them when any real one exists.
+    const real = all.filter((t) => t.shippedUnits > 0);
+    const empty = all.length - real.length;
+    if (empty > 0) console.log(`[track] ${soNumber}: ignoring ${empty} zero-quantity label(s): ${all.filter((t) => t.shippedUnits === 0).map((t) => t.trackingNumber).join(', ')}`);
+    const used = real.length > 0 ? real : all;   // all-empty => keep them rather than lose the info
+
+    const bcToken = await getBcToken(bcCfg);
+    const companyId = await getCompanyId(bcCfg, bcToken);
+
+    // Backfill mode (no fresh ref): target posted shipments of this SO that still have no
+    // tracking. Ambiguous when several qualify — bail rather than guess, since the wrong
+    // tracking number on a real shipment is worse than none.
+    let targetShipmentNo: string | null = null;
+    if (!externalDocumentNo) {
+      const untracked = await bcGet<{ value: Array<{ No: string }> }>(
+        `${bcOdataBase(bcCfg)}/Posted_Sales_Shipment_Excel?$filter=${encodeURIComponent(
+          `Order_No eq '${odataStr(soNumber)}' and Package_Tracking_No eq ''`)}&$select=No`, bcToken);
+      const rows = untracked.value ?? [];
+      if (rows.length === 0) { console.log(`[track] ${soNumber}: nothing to backfill`); return; }
+      if (rows.length > 1) {
+        const m = `${rows.length} posted shipments lack tracking — ambiguous, skipping backfill`;
+        console.warn(`[track] ${soNumber}: ⚠ ${m}`);
+        await logTrack('skip', m, { candidates: rows.map((r) => r.No) });
+        return;
+      }
+      targetShipmentNo = rows[0].No;
+      console.log(`[track] ${soNumber}: backfilling ${targetShipmentNo}`);
+    }
+
+    // One BC posted shipment can cover several Deposco parcels (SO12404 ships one line on 5
+    // labels). Full list goes to our Text[250] field; the AL puts the FIRST number in BC's
+    // standard field. Cap the join at whole tracking numbers — the buffer field is Text[250]
+    // and an overflow would make BC reject the POST, losing the tracking entirely rather than
+    // just the tail of a long list.
+    const joinCapped = (vals: string[], max = 250): { text: string; dropped: number } => {
+      const kept: string[] = [];
+      for (const v of vals) {
+        if ([...kept, v].join(',').length > max) break;
+        kept.push(v);
+      }
+      return { text: kept.join(','), dropped: vals.length - kept.length };
+    };
+    const tn = joinCapped(used.map((t) => t.trackingNumber));
+    const dsn = joinCapped(used.map((t) => t.shipmentNo), 20);   // Code[20] on the buffer
+    if (tn.dropped > 0) console.warn(`[track] ${soNumber}: ⚠ ${tn.dropped} tracking number(s) dropped — list exceeds 250 chars`);
+    const primary = used[0];
+    const payload = {
+      ...(targetShipmentNo ? { shipmentNo: targetShipmentNo } : { externalDocumentNo }),
+      deposcoShipmentNo: dsn.text,
+      deposcoSalesOrderNo: primary.salesOrderNo,
+      trackingNo: tn.text,
+      trackingUrl: primary.trackingUrl,
+      carrier: primary.carrier,
+      shipVia: primary.shipVia,
+      shipMethod: primary.shipMethod,
+      containerLpn: primary.containerLpn,
+      totalPackages: used.reduce((s, t) => s + t.totalPackages, 0),
+      totalWeight: used.reduce((s, t) => s + t.totalWeight, 0),
+      ...(primary.actualShipDate ? { actualShipDate: primary.actualShipDate } : {}),
+    };
+    const res = await authReq<{ applied?: boolean; appliedTo?: string; errorMessage?: string }>(
+      'post', `${bmiApiBase(bcCfg)}/companies(${companyId})/bmiShipmentTrackings`, bcToken,
+      { data: payload, headers: { 'Content-Type': 'application/json' } });
+
+    if (res.applied) {
+      console.log(`[track] ${soNumber}: ✓ ${res.appliedTo} ← ${payload.carrier} ${payload.trackingNo}`);
+      await logTrack('ok', `${res.appliedTo}: ${payload.carrier} ${payload.trackingNo}`,
+                     { shipment: res.appliedTo, carrier: payload.carrier, trackingNo: payload.trackingNo,
+                       trackingUrl: payload.trackingUrl, deposcoShipmentNo: payload.deposcoShipmentNo,
+                       parcels: used.length, emptyLabels: empty, droppedTracking: tn.dropped });
+    } else {
+      const m = `not applied: ${res.errorMessage ?? 'unknown'}`;
+      console.warn(`[track] ${soNumber}: ⚠ ${m}`);
+      await logTrack('fail', m, { payload });
+    }
+  } catch (err) {
+    const e = err as AxiosError;
+    const body = JSON.stringify(e.response?.data ?? (err as Error).message).slice(0, 300);
+    console.error(`[track] ${soNumber}: FAILED (shipment itself DID post) HTTP ${e.response?.status}: ${body}`);
+    // Which side failed: reading Deposco, or writing BC's bmiShipmentTrackings.
+    const side = /deposco\.com/i.test(String(e.config?.url ?? '')) ? 'deposco' : 'bc';
+    await logTrack('fail', `HTTP ${e.response?.status ?? e.code ?? '?'}: ${body.slice(0, 180)}`,
+                   { url: e.config?.url, externalDocumentNo }, side);
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -490,7 +634,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       }
       if (PULL_ENABLED) {
         try {
-          await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber);
+          await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
         } catch (err) {
           const e = err as AxiosError;
           console.error(`[pull] ${soNumber} FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
