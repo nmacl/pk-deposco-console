@@ -92,13 +92,36 @@ async function getSoLines(odata: string, token: string, soNumber: string): Promi
 const toDate = (v: string): string => (v && v !== '0001-01-01' ? v.slice(0, 10) : '');
 const toDateTime = (v: string): string => { const d = toDate(v); return d ? `${d}T00:00:00Z` : ''; };
 
+// BC's Sell_to_E_Mail is free text and users stack SEVERAL addresses in it, semicolon-separated.
+// Deposco's shipToContact.email is ONE address capped at 50 chars ("size must be between 0 and
+// 50") — DISO210942 held 72 chars across two valid addresses and the whole push 400'd.
+//
+// Always take the part before the first separator, regardless of total length: two short
+// addresses would fit under 50 but still aren't a valid single address. If that first one is
+// somehow still over the limit, send nothing — 0 is explicitly allowed, and losing a
+// notification address beats losing the order.
+const DEPOSCO_EMAIL_MAX = 50;
+function firstEmail(raw: string, logKey: string): string {
+  const v = raw.trim();
+  const parts = v.split(/[;,]/).map((x) => x.trim()).filter(Boolean);
+  const first = parts[0] ?? '';
+  if (parts.length > 1) {
+    console.warn(`[push] ${logKey}: Sell_to_E_Mail holds ${parts.length} addresses (${v.length} chars) — sending only the first, '${first}'`);
+  }
+  if (first.length > DEPOSCO_EMAIL_MAX) {
+    console.warn(`[push] ${logKey}: first address is ${first.length} chars, over the ${DEPOSCO_EMAIL_MAX} limit — sending no email`);
+    return '';
+  }
+  return first;
+}
+
 // customerOrder.shipToContact is FLAT — address fields live inside the contact.
 interface DeposcoShipToContact {
   attention: string; firstName: string; lastName: string;
   line1: string; line2: string; city: string; stateProvince: string; postalCode: string; country: string;
   phone: string; email: string;
 }
-function shipToContact(h: BcRow): DeposcoShipToContact {
+function shipToContact(h: BcRow, logKey = ''): DeposcoShipToContact {
   const name = pick(h, 'Ship_to_Name').trim();
   const parts = name.split(/\s+/);
   return {
@@ -112,7 +135,7 @@ function shipToContact(h: BcRow): DeposcoShipToContact {
     postalCode: pick(h, 'Ship_to_Post_Code'),
     country: pick(h, 'Ship_to_Country_Region_Code', 'Ship_to_Country_Code') || 'US',
     phone: pick(h, 'Ship_to_Phone_No', 'Sell_to_Phone_No'),
-    email: pick(h, 'Sell_to_E_Mail'),
+    email: firstEmail(pick(h, 'Sell_to_E_Mail'), logKey),
   };
 }
 
@@ -242,7 +265,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
       placedDate: toDateTime(pick(header, 'Order_Date', 'Document_Date')),
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       ...freight,
-      shipToContact: shipToContact(header),
+      shipToContact: shipToContact(header, soNumber),
       channels: [],
       coLines: { data },
     },
