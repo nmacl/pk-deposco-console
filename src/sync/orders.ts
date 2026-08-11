@@ -21,14 +21,36 @@ export type PostResult = 'ok' | 'skip';
 
 /** Look up a Deposco order id. endpoint = '/orders/purchaseOrders' (params {number}) or
  *  '/orders/customerOrders' (params {externalOrderNumber}). */
+interface DsOrderRef { self?: { id?: number }; number?: string; status?: string; orderStatus?: string }
+
+const isCancelled = (r: DsOrderRef): boolean =>
+  /cancel/i.test(String(r.status ?? r.orderStatus ?? ''));
+
 export async function lookupDeposcoOrderId(
   cfg: DeposcoConfig,
   token: string,
   endpoint: string,
   params: Record<string, unknown>,
 ): Promise<number | null> {
-  const body = await authReq<{ data?: Array<{ self?: { id: number } }> }>('get', `${cfg.apiBase}${endpoint}`, token, { params });
-  return body.data?.[0]?.self?.id ?? null;
+  const body = await authReq<{ data?: DsOrderRef[] }>('get', `${cfg.apiBase}${endpoint}`, token, { params });
+  const rows = body.data ?? [];
+  if (rows.length === 0) return null;
+
+  // Deposco returns copies NEWEST FIRST, and taking data[0] blindly resolved the wrong record
+  // once the duplicate cleanup ran: DISO211239 had 18 copies where the newest 17 were Canceled
+  // and only the OLDEST (CO1, Complete, 9 units shipped) was real. The pull read the cancelled
+  // one, saw shippedTotal=0, concluded "nothing to post", and BC never got its shipment.
+  //
+  // Prefer a LIVE order — and when several are live, the OLDEST, which is the canonical copy the
+  // cleanup convention keeps. Fall back to the newest cancelled one rather than null so the
+  // push's existence check still reports "exists" and cannot start recreating in a loop; a
+  // cancelled order legitimately has nothing to ship, so the pull correctly does nothing.
+  const live = rows.filter((r) => !isCancelled(r));
+  const chosen = live.length > 0 ? live[live.length - 1] : rows[0];
+  if (rows.length > 1) {
+    console.log(`[lookup] ${endpoint} ${JSON.stringify(params)}: ${rows.length} copies (${rows.length - live.length} cancelled) — using id=${chosen.self?.id} ${JSON.stringify(chosen.status ?? chosen.orderStatus ?? null)}`);
+  }
+  return chosen.self?.id ?? null;
 }
 
 export interface DeposcoReceipt {
