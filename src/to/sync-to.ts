@@ -43,6 +43,10 @@ const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline'
 // Ship-side transfers inherit the source SO's ProgramID as orderSource (see sourceOrderShipping).
 // The receive-side payload is a purchaseOrder and keeps ORDER_SOURCE — POs carry no ProgramID.
 const ORDER_SOURCE_FROM_PROGRAM = (process.env.SO_ORDER_SOURCE_FROM_PROGRAM ?? 'true').toLowerCase() === 'true';
+// Deposco caps shipToContact.firstName/lastName at 30 chars. 18/30 Released transfers ship to
+// "East Providence Decoration (In-House)", whose split yields a 32-char lastName -> HTTP 400.
+const DEPOSCO_NAME_MAX = 30;
+const capName = (v: string): string => (v.length <= DEPOSCO_NAME_MAX ? v : v.slice(0, DEPOSCO_NAME_MAX).trim());
 const WMS_LOCATIONS = new Set((process.env.TO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
 const toDate = (iso: string): string => (iso && iso !== '0001-01-01' ? iso.slice(0, 10) : '');
@@ -200,8 +204,9 @@ function buildTransferAsCustomerOrder(header: BcRow, lines: BmiToLine[], ship: S
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       shipToContact: {
         attention: pick(header, 'Transfer_to_Contact', 'Transfer_to_Name'),
-        firstName: parts[0] || name || 'N/A',
-        lastName: parts.slice(1).join(' ') || parts[0] || 'N/A',
+        // Deposco caps these at 30; a long destination name overflows the split (see NAME_MAX).
+        firstName: capName(parts[0] || name || 'N/A'),
+        lastName: capName(parts.slice(1).join(' ') || parts[0] || 'N/A'),
         line1: pick(header, 'Transfer_to_Address'),
         line2: pick(header, 'Transfer_to_Address_2'),
         city: pick(header, 'Transfer_to_City'),

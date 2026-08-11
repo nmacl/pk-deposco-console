@@ -101,6 +101,12 @@ const toDateTime = (v: string): string => { const d = toDate(v); return d ? `${d
 // somehow still over the limit, send nothing — 0 is explicitly allowed, and losing a
 // notification address beats losing the order.
 const DEPOSCO_EMAIL_MAX = 50;
+// Deposco caps shipToContact.firstName/lastName at 30 ("size must be between 0 and 30").
+// The name split below puts EVERYTHING after the first word into lastName, so any long
+// company name overflows — TRFO001656 ("East Providence Decoration (In-House)") produced a
+// 32-char lastName and the whole push 400'd.
+const DEPOSCO_NAME_MAX = 30;
+const capName = (v: string): string => (v.length <= DEPOSCO_NAME_MAX ? v : v.slice(0, DEPOSCO_NAME_MAX).trim());
 function firstEmail(raw: string, logKey: string): string {
   const v = raw.trim();
   const parts = v.split(/[;,]/).map((x) => x.trim()).filter(Boolean);
@@ -126,8 +132,8 @@ function shipToContact(h: BcRow, logKey = ''): DeposcoShipToContact {
   const parts = name.split(/\s+/);
   return {
     attention: pick(h, 'Ship_to_Contact', 'Ship_to_Name'),
-    firstName: parts[0] || name || 'N/A',
-    lastName: parts.slice(1).join(' ') || parts[0] || 'N/A',
+    firstName: capName(parts[0] || name || 'N/A'),
+    lastName: capName(parts.slice(1).join(' ') || parts[0] || 'N/A'),
     line1: pick(h, 'Ship_to_Address'),
     line2: pick(h, 'Ship_to_Address_2'),
     city: pick(h, 'Ship_to_City'),

@@ -226,6 +226,42 @@ export async function fetchTrackingForSalesOrder(
   return out;
 }
 
+/**
+ * Deposco reports field-length violations in a machine-readable form:
+ *   "customerOrder.shipToContact.lastName size must be between 0 and 30"
+ * We've hit this twice on launch day (email 50, lastName 30) and each time it 400'd the WHOLE
+ * order over one cosmetic field. Rather than discover every limit by losing orders, parse the
+ * path + limit, truncate that one string in the payload, and retry.
+ *
+ * Returns a description of what it trimmed, or null if the message wasn't a size violation or
+ * the path didn't resolve to an over-long string (in which case the caller must not retry).
+ */
+function trimOversizeField(payload: unknown, msg: string): { path: string; limit: number; from: number } | null {
+  const m = msg.match(/([A-Za-z0-9_.]+)\s+size must be between\s+\d+\s+and\s+(\d+)/i);
+  if (!m) return null;
+  const limit = parseInt(m[2], 10);
+  if (!Number.isFinite(limit) || limit < 0) return null;
+
+  // Walk the dotted path, tolerating the wrapper ("customerOrder.x" vs a bare "x" payload).
+  const walk = (root: unknown, segs: string[]): { obj: Record<string, unknown>; key: string } | null => {
+    let cur: unknown = root;
+    for (let i = 0; i < segs.length - 1; i++) {
+      if (cur == null || typeof cur !== 'object') return null;
+      cur = (cur as Record<string, unknown>)[segs[i]];
+    }
+    if (cur == null || typeof cur !== 'object') return null;
+    return { obj: cur as Record<string, unknown>, key: segs[segs.length - 1] };
+  };
+
+  const segs = m[1].split('.');
+  const target = walk(payload, segs) ?? (segs.length > 1 ? walk(payload, segs.slice(1)) : null);
+  if (!target) return null;
+  const val = target.obj[target.key];
+  if (typeof val !== 'string' || val.length <= limit) return null;
+  target.obj[target.key] = val.slice(0, limit).trim();
+  return { path: m[1], limit, from: val.length };
+}
+
 const MAX_ROUNDS = 6;
 // Known-good orderSource to fall back to if Deposco rejects a programme code.
 const ORDER_SOURCE_FALLBACK = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
@@ -241,6 +277,7 @@ export async function postDeposcoOrder(
 ): Promise<PostResult> {
   const attempted = new Set<string>();
   let sourceRetried = false;
+  let sizeTrims = 0;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const token = await getDeposcoToken(deposcoCfg);
@@ -284,6 +321,22 @@ export async function postDeposcoOrder(
           });
           target.orderSource = ORDER_SOURCE_FALLBACK;
           sourceRetried = true;
+          continue;
+        }
+      }
+      // Field too long -> trim that ONE field and retry, rather than losing the order over it.
+      if (status === 400 && /size must be between/i.test(msg) && sizeTrims < 6) {
+        const trimmed = trimOversizeField(payload, msg);
+        if (trimmed) {
+          sizeTrims++;
+          const warn = `field ${trimmed.path} was ${trimmed.from} chars, over Deposco's ${trimmed.limit} — truncated and retried`;
+          console.warn(`[push] ${logKey}: ⚠ ${warn}`);
+          await logEvent({
+            runId: opts.runId ?? null, worker: opts.worker ?? 'push', direction: 'bc->deposco',
+            entityType: 'order', entityId: logKey, action: 'push', status: 'desync', side: 'deposco',
+            message: warn, detail: { field: trimmed.path, limit: trimmed.limit, originalLength: trimmed.from, endpoint },
+            dedupeKey: dailyDedupe('field-size', logKey, trimmed.path),
+          });
           continue;
         }
       }
