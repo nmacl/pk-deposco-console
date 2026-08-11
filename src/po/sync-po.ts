@@ -506,7 +506,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
-      const side = /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      // 429 bodies are empty, so the text match alone mislabelled rate limits as a BC fault.
+      const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
       console.error(`[push] ${po.number} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
       failed++;
       const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;

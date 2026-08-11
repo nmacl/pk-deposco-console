@@ -69,9 +69,15 @@ export async function authReq<T>(
   token: string,
   opts: { data?: unknown; params?: Record<string, unknown>; headers?: Record<string, string>; timeout?: number } = {},
 ): Promise<T> {
+  // Rate limits get a bigger budget than other faults. A 429 means the request was REJECTED, not
+  // processed, so re-sending is always safe — and on 2026-08-11 three attempts over ~10s ran out
+  // during a burst and DROPPED two POs and a transfer outright (status=fail, order never pushed).
+  // Deposco's limit is ~4/s while the throttle is per-process across four workers, so bursts are
+  // expected; patience is cheaper than a lost order.
   const MAX_ATTEMPTS = 4;
+  const MAX_ATTEMPTS_RATE_LIMIT = parseInt(process.env.DEPOSCO_RATE_LIMIT_ATTEMPTS ?? '8', 10);
   let ax: AxiosError | undefined;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; attempt <= Math.max(MAX_ATTEMPTS, MAX_ATTEMPTS_RATE_LIMIT); attempt++) {
     try {
       if (isDeposco(url)) await deposcoThrottle();
       const resp = await axios.request<T>({
@@ -97,12 +103,13 @@ export async function authReq<T>(
       const isTransient = status !== undefined && status >= 500;
       const isNetwork = !ax.response;
       const retryable = isRateLimit || ((isTransient || isNetwork) && method === 'get');
-      if (retryable && attempt < MAX_ATTEMPTS) {
+      const budget = isRateLimit ? MAX_ATTEMPTS_RATE_LIMIT : MAX_ATTEMPTS;
+      if (retryable && attempt < budget) {
         const retryAfter = Number(ax.response?.headers?.['retry-after']);
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
           ? retryAfter * 1000
           : Math.min(1500 * 2 ** (attempt - 1), 20_000) + Math.floor(Math.random() * 500);
-        console.log(`[http] ${method.toUpperCase()} ${(url.split('.com')[1] ?? url).slice(0, 60)} → HTTP ${status ?? ax.code} — retry ${attempt}/${MAX_ATTEMPTS - 1} in ${waitMs}ms`);
+        console.log(`[http] ${method.toUpperCase()} ${(url.split('.com')[1] ?? url).slice(0, 60)} → HTTP ${status ?? ax.code} — retry ${attempt}/${budget - 1} in ${waitMs}ms`);
         await new Promise((r) => setTimeout(r, waitMs));
         continue;
       }
@@ -116,7 +123,9 @@ export async function authReq<T>(
   const q = opts.params ? '?' + Object.entries(opts.params).map(([k, v]) => `${k}=${encodeURIComponent(String(v))}`).join('&') : '';
   const path = (url.split('.com')[1] ?? url) + q;
   const detail = (typeof body === 'string' ? body : JSON.stringify(body ?? ax?.message)).slice(0, 600);
-  throw new Error(`${method.toUpperCase()} ${path} → HTTP ${status}: ${detail}`);
+  // 429 bodies are empty, which made failures read as a generic error with no cause. Say it.
+  const note = status === 429 ? ` (Deposco rate limit — exhausted ${MAX_ATTEMPTS_RATE_LIMIT} attempts; raise DEPOSCO_MIN_INTERVAL_MS)` : '';
+  throw new Error(`${method.toUpperCase()} ${path} → HTTP ${status}${note}: ${detail}`);
 }
 
 /** GET with a 4-attempt backoff. Used for all read-side BC calls. */

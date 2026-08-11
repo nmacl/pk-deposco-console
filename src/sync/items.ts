@@ -6,10 +6,10 @@
  * looks X up in BC (Item_Variants by WebshopVariantCode → Item_Card_Excel), builds the
  * Deposco item payload, and POSTs /items so the retry succeeds.
  */
-import axios, { type AxiosError } from 'axios';
-import { getBcToken, ipv4Agent } from '../auth.js';
+import { type AxiosError } from 'axios';
+import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
-import { bcGet, bcOdataBase, odataStr } from './bc-client.js';
+import { bcGet, bcOdataBase, odataStr, authReq } from './bc-client.js';
 import type { SyncBcConfig } from './config.js';
 
 const DEFAULT_BU = process.env.DEPOSCO_COMPANY || 'HIVE';
@@ -98,10 +98,10 @@ export async function createMissingItem(bcCfg: SyncBcConfig, deposcoCfg: Deposco
     if (!card) { console.warn(`[lazy] ${number}: no BC item card for Item_No ${v.Item_No} — cannot create`); return false; }
     const item = buildDeposcoItem(card, v, bu);
     const dToken = await getDeposcoToken(deposcoCfg);
-    await axios.post(`${deposcoCfg.apiBase}/items`, item, {
-      headers: { Authorization: `Bearer ${dToken}`, 'Content-Type': 'application/json' },
-      httpsAgent: ipv4Agent, timeout: 30_000,
-    });
+    // Via authReq, NOT raw axios: this runs in a LOOP (one call per missing item on a 404 retry),
+    // and a raw call skips the Deposco throttle and the 429 retry entirely. Unthrottled bursts
+    // here were pushing PO/TO pushes past Deposco's ~4/s and dropping orders outright.
+    await authReq('post', `${deposcoCfg.apiBase}/items`, dToken, { data: item, timeout: 30_000 });
     console.log(`[lazy] created item ${number} (BC ${v.Item_No}/${v.Code})`);
     return true;
   } catch (err) {

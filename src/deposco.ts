@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { ipv4Agent } from './auth.js';
+import { authReq } from './sync/bc-client.js';
 import type { DeposcoItem } from './types.js';
 
 export interface DeposcoConfig {
@@ -58,15 +59,8 @@ export async function postItem(
   payload: DeposcoItem,
 ): Promise<unknown> {
   const token = await getDeposcoToken(cfg);
-  const resp = await axios.post(`${cfg.apiBase}/items`, payload, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    timeout: 30_000,
-    httpsAgent: ipv4Agent,
-  });
-  return resp.data;
+  // authReq applies the shared Deposco throttle and retries 429 — a raw axios call does neither.
+  return authReq<unknown>('post', `${cfg.apiBase}/items`, token, { data: payload, timeout: 30_000 });
 }
 
 export async function getItemByNumber(
@@ -74,11 +68,5 @@ export async function getItemByNumber(
   number: string,
 ): Promise<unknown> {
   const token = await getDeposcoToken(cfg);
-  const resp = await axios.get(`${cfg.apiBase}/items`, {
-    params: { number },
-    headers: { Authorization: `Bearer ${token}` },
-    timeout: 15_000,
-    httpsAgent: ipv4Agent,
-  });
-  return resp.data;
+  return authReq<unknown>('get', `${cfg.apiBase}/items`, token, { params: { number }, timeout: 15_000 });
 }
