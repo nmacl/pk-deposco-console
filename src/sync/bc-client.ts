@@ -50,16 +50,6 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 // (each scheduled worker is its own process) — combined with staggered scheduler starts + the
 // 429 backoff below, this keeps us under Deposco's limit.
 const DEPOSCO_MIN_INTERVAL_MS = parseInt(process.env.DEPOSCO_MIN_INTERVAL_MS ?? '350', 10);
-
-// Rate-limit pressure counter. The throttle is PER-PROCESS and four workers run staggered 45s
-// apart, so a run that overtakes its slot (the CO tick can push ~100 orders) overlaps the next
-// worker and the combined rate exceeds Deposco's ~4/s. Retries absorb it silently, which means
-// sustained pressure was previously invisible — workers now report this in their run counts so
-// DEPOSCO_MIN_INTERVAL_MS can be tuned from data instead of guesswork.
-let deposco429 = 0;
-let httpRetries = 0;
-export const rateLimitHits = (): number => deposco429;
-export const retryCount = (): number => httpRetries;
 let deposcoChain: Promise<void> = Promise.resolve();
 let lastDeposcoAt = 0;
 export function deposcoThrottle(): Promise<void> {
@@ -108,8 +98,6 @@ export async function authReq<T>(
       const isNetwork = !ax.response;
       const retryable = isRateLimit || ((isTransient || isNetwork) && method === 'get');
       if (retryable && attempt < MAX_ATTEMPTS) {
-        httpRetries++;
-        if (isRateLimit && isDeposco(url)) deposco429++;
         const retryAfter = Number(ax.response?.headers?.['retry-after']);
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
           ? retryAfter * 1000
