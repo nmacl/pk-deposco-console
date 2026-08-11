@@ -256,7 +256,7 @@ async function postPoChunk(
   payload: DeposcoPurchaseOrderPayload,
   label: string,
 ): Promise<PostResult> {
-  return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/purchaseOrders', payload, po.number, label);
+  return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/purchaseOrders', payload, po.number, label, { worker: 'po' });
 }
 
 async function pushPo(

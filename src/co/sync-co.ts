@@ -49,7 +49,13 @@ const PULL_ENABLED = (process.env.SO_PULL_ENABLED ?? 'false').toLowerCase() === 
 // page bmiShipmentTrackings) published to the target BC environment.
 const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
+// Deposco orderSource. For customer orders this carries the BC sales order's ProgramID
+// (THDMET / DI / WBB / CORP / …) so Deposco can see which programme an order belongs to.
+// ORDER_SOURCE is the fallback used when ProgramID is blank, and the known-good value the
+// poster retries with if Deposco turns out to validate orderSource against a fixed set.
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
+// Set SO_ORDER_SOURCE_FROM_PROGRAM=false to go back to the flat ORDER_SOURCE for every order.
+const ORDER_SOURCE_FROM_PROGRAM = (process.env.SO_ORDER_SOURCE_FROM_PROGRAM ?? 'true').toLowerCase() === 'true';
 // Deposco trading partner all COs attach to (hardcoded for now; per-customer mapping later).
 const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 // Only push SO lines whose BC Location_Code is a WMS-tracked warehouse (default WMS only).
@@ -108,6 +114,14 @@ function shipToContact(h: BcRow): DeposcoShipToContact {
     phone: pick(h, 'Ship_to_Phone_No', 'Sell_to_Phone_No'),
     email: pick(h, 'Sell_to_E_Mail'),
   };
+}
+
+// BC Sales_Order.ProgramID -> Deposco orderSource. 100% populated across the Released orders
+// the tick sees, but fall back rather than pushing an empty string if one ever is blank.
+function coOrderSource(header: BcRow): string {
+  if (!ORDER_SOURCE_FROM_PROGRAM) return ORDER_SOURCE;
+  const prog = pick(header, 'ProgramID', 'ProgramId').trim();
+  return prog || ORDER_SOURCE;
 }
 
 interface DeposcoCoLine {
@@ -224,7 +238,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
       tradingPartner: { businessKey: { code: TRADING_PARTNER, 'businessUnit.code': BU } },
       primarySalesChannel: { businessKey: { code: BU } },
       externalOrderNumber: soNumber,
-      orderSource: ORDER_SOURCE,
+      orderSource: coOrderSource(header),
       placedDate: toDateTime(pick(header, 'Order_Date', 'Document_Date')),
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       ...freight,
@@ -256,7 +270,7 @@ const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externa
   lookupDeposcoOrderId({ ...deposcoCfg, apiBase: deposcoCfg.apiBase.replace('/latest', '/beta') }, token, '/orders/customerOrders', { externalOrderNumber });
 
 async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, payload: DeposcoCustomerOrderPayload, label: string): Promise<PostResult> {
-  return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label);
+  return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label, { worker: 'co' });
 }
 
 async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow): Promise<PostResult> {

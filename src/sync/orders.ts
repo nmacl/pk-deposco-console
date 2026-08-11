@@ -9,6 +9,7 @@ import { ipv4Agent } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { createMissingItem, parseMissingItemNumbers } from './items.js';
 import { authReq, deposcoThrottle } from './bc-client.js';
+import { logEvent, dailyDedupe } from './db-log.js';
 import type { SyncBcConfig } from './config.js';
 
 export type PostResult = 'ok' | 'skip';
@@ -226,6 +227,8 @@ export async function fetchTrackingForSalesOrder(
 }
 
 const MAX_ROUNDS = 6;
+// Known-good orderSource to fall back to if Deposco rejects a programme code.
+const ORDER_SOURCE_FALLBACK = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
 
 export async function postDeposcoOrder(
   bcCfg: SyncBcConfig,
@@ -234,8 +237,10 @@ export async function postDeposcoOrder(
   payload: unknown,
   logKey: string,       // order number, for logging
   label: string,
+  opts: { worker?: string; runId?: number | null } = {},
 ): Promise<PostResult> {
   const attempted = new Set<string>();
+  let sourceRetried = false;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const token = await getDeposcoToken(deposcoCfg);
@@ -257,6 +262,30 @@ export async function postDeposcoOrder(
       if (status === 400 && /cannot be updated while in the status of/i.test(msg)) {
         console.log(`[push] ${logKey}: Deposco order in progress, update skipped`);
         return 'skip';
+      }
+      // orderSource is now the BC ProgramID (THDMET / DI / WBB / …). It is UNCONFIRMED whether
+      // Deposco validates orderSource against a fixed set — if it does, a programme code would
+      // 400 and kill the push entirely. Retry ONCE with the known-good value rather than lose
+      // the order, and log loudly so the mapping can be fixed properly.
+      if (status === 400 && /order\s*source/i.test(msg) && !sourceRetried) {
+        const p = payload as { orderSource?: string; customerOrder?: { orderSource?: string } };
+        const target = p.customerOrder ?? p;
+        const rejected = target.orderSource;
+        if (rejected && rejected !== ORDER_SOURCE_FALLBACK) {
+          const warn = `Deposco rejected orderSource '${rejected}' — retried with '${ORDER_SOURCE_FALLBACK}'. orderSource looks like a validated set; the ProgramID needs Deposco-side config.`;
+          console.error(`[push] ${logKey}: ⚠ ${warn} (${msg.slice(0, 140)})`);
+          // Surface it in the DB too — the push SUCCEEDS after the retry, so without this row
+          // the degraded orderSource would be invisible to anyone reading sync_events.
+          await logEvent({
+            runId: opts.runId ?? null, worker: opts.worker ?? 'push', direction: 'bc->deposco',
+            entityType: 'order', entityId: logKey, action: 'push', status: 'desync', side: 'deposco',
+            message: warn, detail: { rejectedOrderSource: rejected, fallback: ORDER_SOURCE_FALLBACK, deposcoMessage: msg.slice(0, 300), endpoint },
+            dedupeKey: dailyDedupe('order-source', logKey, rejected),
+          });
+          target.orderSource = ORDER_SOURCE_FALLBACK;
+          sourceRetried = true;
+          continue;
+        }
       }
       if (status === 404) {
         const all = parseMissingItemNumbers(errs);

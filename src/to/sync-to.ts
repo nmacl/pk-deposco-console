@@ -40,6 +40,9 @@ const POST_ENABLED = (process.env.TO_POST_ENABLED ?? 'false').toLowerCase() === 
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
 const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
+// Ship-side transfers inherit the source SO's ProgramID as orderSource (see sourceOrderShipping).
+// The receive-side payload is a purchaseOrder and keeps ORDER_SOURCE — POs carry no ProgramID.
+const ORDER_SOURCE_FROM_PROGRAM = (process.env.SO_ORDER_SOURCE_FROM_PROGRAM ?? 'true').toLowerCase() === 'true';
 const WMS_LOCATIONS = new Set((process.env.TO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
 const toDate = (iso: string): string => (iso && iso !== '0001-01-01' ? iso.slice(0, 10) : '');
@@ -162,7 +165,9 @@ function buildTransferAsPurchaseOrder(header: BcRow, lines: BmiToLine[]): unknow
 // A transfer carries no carrier of its own — it fulfills a source sales order (PKSourceNo ==
 // Transfer_to_Contact == line SourceNo). Pull the ship-via from that SO, else Deposco parks
 // the customerOrder in "in review" ("no ship via with the transfer order").
-interface ShipInfo { shipVia: string; shipVendor: string; freightTermsType: string }
+// programId rides along because it comes off the SAME source-SO fetch — a transfer has no
+// ProgramID of its own, so the ship-side CO inherits the source order's programme code.
+interface ShipInfo { shipVia: string; shipVendor: string; freightTermsType: string; programId: string }
 async function sourceOrderShipping(odata: string, token: string, sourceNo: string): Promise<ShipInfo | null> {
   if (!sourceNo) return null;
   const so = (await bcGet<{ value: BcRow[] }>(`${odata}/Sales_Order?$filter=${encodeURIComponent(`No eq '${odataStr(sourceNo)}'`)}`, token)).value?.[0];
@@ -173,6 +178,7 @@ async function sourceOrderShipping(odata: string, token: string, sourceNo: strin
     shipVendor: agent,
     shipVia: [agent, service].filter(Boolean).join(' '),
     freightTermsType: pick(so, 'LAX_Shipping_Payment_Type') || 'Prepaid',
+    programId: pick(so, 'ProgramID', 'ProgramId').trim(),
   };
 }
 
@@ -188,7 +194,8 @@ function buildTransferAsCustomerOrder(header: BcRow, lines: BmiToLine[], ship: S
       tradingPartner: { businessKey: { code: TRADING_PARTNER, 'businessUnit.code': BU } },
       primarySalesChannel: { businessKey: { code: BU } },
       externalOrderNumber: no,
-      orderSource: ORDER_SOURCE,
+      // Programme code from the source sales order; ORDER_SOURCE when there's no source SO.
+      orderSource: (ORDER_SOURCE_FROM_PROGRAM && ship?.programId) || ORDER_SOURCE,
       placedDate: toDateTime(pick(header, 'Posting_Date', 'Order_Date')),
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       shipToContact: {
@@ -254,7 +261,7 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
 
   let posted = 0;
   if (plan === 'receive' || plan === 'both') {
-    await postDeposcoOrder(cfg, deposcoCfg, '/orders/purchaseOrders', buildTransferAsPurchaseOrder(header, lines), no, `${lines.length} line(s) as PO (receive)`);
+    await postDeposcoOrder(cfg, deposcoCfg, '/orders/purchaseOrders', buildTransferAsPurchaseOrder(header, lines), no, `${lines.length} line(s) as PO (receive)`, { worker: 'to' });
     posted++;
   }
   if (plan === 'ship' || plan === 'both') {
@@ -265,7 +272,7 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
       const sourceNo = pick(header, 'PKSourceNo', 'Transfer_to_Contact');
       const ship = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
       if (!ship) console.warn(`[push] ${no}: no source SO shipping found (source=${sourceNo || 'none'}) — CO may land in review`);
-      await postDeposcoOrder(cfg, deposcoCfg, '/orders/customerOrders', buildTransferAsCustomerOrder(header, lines, ship), no, `${lines.length} line(s) as CO (ship)${ship ? `, via ${ship.shipVia}` : ''}`);
+      await postDeposcoOrder(cfg, deposcoCfg, '/orders/customerOrders', buildTransferAsCustomerOrder(header, lines, ship), no, `${lines.length} line(s) as CO (ship)${ship ? `, via ${ship.shipVia}${ship.programId ? `, program ${ship.programId}` : ''}` : ''}`, { worker: 'to' });
       posted++;
     }
   }
