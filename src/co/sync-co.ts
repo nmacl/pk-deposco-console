@@ -293,10 +293,22 @@ type PostResult = 'ok' | 'skip';
 
 // Find an existing Deposco CO for this BC SO — filters on `externalOrderNumber` (the BC SO
 // number we stamp on push; Deposco's own `number` is CO2835 and won't match ours).
-// NOTE: this ONE lookup hits the `beta` API version instead of `latest` (per ops request) —
-// swap the apiBase for just this call; every other Deposco call still uses the default base.
-const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externalOrderNumber: string) =>
-  lookupDeposcoOrderId({ ...deposcoCfg, apiBase: deposcoCfg.apiBase.replace('/latest', '/beta') }, token, '/orders/customerOrders', { externalOrderNumber });
+// This used to hit the `beta` API version instead of `latest` (per an old ops request). That
+// broke BADLY: /beta is stale — it returned 50 orders whose newest was 2024-05-20 and ZERO of
+// today's, so this lookup answered "not found" for every current order. Consequences seen live
+// on 2026-08-11:
+//   1. pushSo's existence check never matched, so the tick CREATED a duplicate customerOrder
+//      every 5 minutes — 25 of 49 order numbers were duplicated in Deposco production, many ×11.
+//   2. pullShipmentsForSo also uses this, so every shipment pull short-circuited on
+//      "not in Deposco yet" — no shipment ever came back, and therefore no tracking either.
+// /latest resolves the same filter correctly (verified: TRFO001660 -> 1 row on latest, 0 on beta).
+// DEPOSCO_CO_LOOKUP_BASE can force a different base if ops ever needs it again, but the default
+// must stay on the environment we actually write to.
+const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externalOrderNumber: string) => {
+  const override = process.env.DEPOSCO_CO_LOOKUP_BASE;
+  const apiBase = override ? deposcoCfg.apiBase.replace('/latest', `/${override.replace(/^\//, '')}`) : deposcoCfg.apiBase;
+  return lookupDeposcoOrderId({ ...deposcoCfg, apiBase }, token, '/orders/customerOrders', { externalOrderNumber });
+};
 
 async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, payload: DeposcoCustomerOrderPayload, label: string): Promise<PostResult> {
   return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label, { worker: 'co' });
