@@ -39,7 +39,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, type DeposcoTracking } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
@@ -875,6 +875,71 @@ async function writeTrackingBack(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Shipment-driven pull: ask Deposco WHAT SHIPPED, instead of asking about every order
+// ────────────────────────────────────────────────────────────────────────────
+//
+// The pull used to run inside the per-order loop: for all ~1,278 open sales orders, ask Deposco
+// whether that one had shipped. ~3,800 calls a lap against an account-wide 4/sec ceiling, almost
+// all of them answered "no" — that is what was producing the 429s, and 429s were dropping pushes.
+//
+// Deposco can just list its shipments (see fetchOutboundShipments): 3 calls returns every
+// shipment it has, each linked to the fulfillment salesOrder, which carries the BC order number.
+// So we let Deposco name the orders that need posting and touch only those. Same executor
+// (pullShipmentsForSo) — only the SELECTION changed, so the delta/idempotency behaviour is
+// unchanged and this stays safe to re-run.
+//
+// It also closes two holes the BC-driven sweep had by construction:
+//   - an order reopened to Status=Open was invisible to a Released-only scan even though Deposco
+//     had shipped it (~68 orders currently sit Open with WESTERLY lines);
+//   - tracking added by Deposco AFTER the shipment posted never came back, because nothing in BC
+//     changed to bring the order back into scope.
+//
+// Cursor: highest shipment NUMBER processed (sequential, same numeric discipline as everywhere
+// else). RECHECK re-reads the newest few regardless, so a tracking number or extra quantity added
+// to an already-seen shipment is still picked up.
+const SHIPMENT_RECHECK = parseInt(process.env.SO_SHIPMENT_RECHECK ?? '20', 10);
+
+async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, runId: number | null): Promise<void> {
+  const dToken = await getDeposcoToken(deposcoCfg);
+  const shipments = await fetchOutboundShipments(deposcoCfg, dToken);
+  if (shipments.length === 0) { console.log('[ship] Deposco reported no outbound shipments'); return; }
+
+  const cursorRaw = await readCursor('co', 'shipments');
+  const cursor = Number(cursorRaw ?? 0) || 0;
+  const highest = Math.max(...shipments.map((s) => s.number));
+  // New since last tick, plus a rolling recheck window for late tracking/quantity updates.
+  const recheckFloor = highest - SHIPMENT_RECHECK;
+  const due = shipments.filter((s) => s.number > cursor || s.number > recheckFloor);
+  console.log(`[ship] ${shipments.length} shipment(s) in Deposco, highest #${highest}, cursor #${cursor} → ${due.length} to check`);
+  if (due.length === 0) return;
+
+  const byOrder = await resolveCustomerOrderNumbers(deposcoCfg, dToken, due.flatMap((s) => s.salesOrderIds));
+  const orderNos = [...new Set([...byOrder.values()])].sort();
+  if (orderNos.length === 0) { console.warn('[ship] no BC order numbers resolved from those shipments'); return; }
+  console.log(`[ship] ${orderNos.length} BC order(s) with shipment activity: ${orderNos.join(', ')}`);
+
+  let posted = 0, failed = 0;
+  for (const soNumber of orderNos) {
+    try {
+      await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
+      posted++;
+    } catch (err) {
+      const e = err as AxiosError;
+      const body = JSON.stringify(e.response?.data ?? (err as Error).message);
+      const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      console.error(`[ship] ${soNumber} pull FAILED HTTP ${e.response?.status}: ${body.slice(0, 400)}`);
+      failed++;
+      const msg = `shipment-driven pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
+      await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-ship-pull', soNumber, msg) });
+    }
+  }
+  // Only advance past shipments whose orders all got a clean pass; a failure leaves the cursor so
+  // the shipment is reconsidered next tick (the recheck window covers it either way).
+  if (failed === 0) await writeCursor('co', 'shipments', String(highest));
+  console.log(`[ship] done — ${posted} order(s) pulled, ${failed} failed, cursor ${failed === 0 ? `→ #${highest}` : `held at #${cursor}`}`);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Tick + main loop
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -922,24 +987,9 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
         const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
         await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', soNumber, msg) });
       }
-      if (PULL_ENABLED) {
-        try {
-          await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
-        } catch (err) {
-          // This used to console.error only, which made shipment-pull failures invisible in
-          // /logs — DISO211236 re-staged and re-failed every tick for a day with nothing to see
-          // but a churning External Document No. BC's real complaint (e.g. insufficient
-          // inventory at the ship-from location) is in the response body, so keep the whole
-          // body in `detail` and only truncate the summary line.
-          const e = err as AxiosError;
-          const body = JSON.stringify(e.response?.data ?? e.message);
-          const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
-          console.error(`[pull] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
-          pullFail++;
-          const msg = `shipment pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
-          await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-pull', soNumber, msg) });
-        }
-      }
+      // NOTE: no pull here any more. Asking Deposco about every order in the rotation was the
+      // bulk of the Deposco traffic and nearly all of it returned "nothing shipped". The pull now
+      // runs once per tick, driven by Deposco's own shipment list — see pullFromShipments below.
     }
 
     // Advance the rotation unconditionally, INCLUDING past failures. With a high-water mark that
@@ -949,6 +999,20 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     if (CURSOR_ENABLED) {
       await writeCursor('co', prefix, batch.nextCursor);
       console.log(`[tick] ${prefix}: rotation → ${batch.wrapped ? 'end of set, next lap starts from the beginning' : `resumes above ${batch.nextCursor}`}`);
+    }
+  }
+
+  // One shipment-driven pull for the whole tick, after the pushes.
+  if (PULL_ENABLED) {
+    try {
+      await pullFromShipments(bcCfg, deposcoCfg, runId);
+    } catch (err) {
+      const e = err as AxiosError;
+      const body = JSON.stringify(e.response?.data ?? (err as Error).message);
+      console.error(`[ship] shipment sweep FAILED HTTP ${e.response?.status}: ${body.slice(0, 400)}`);
+      pullFail++;
+      const msg = `shipment sweep: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
+      await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: '(sweep)', action: 'pull', status: 'fail', side: 'deposco', message: msg, dedupeKey: dailyDedupe('co-ship-sweep', 'sweep', msg) });
     }
   }
 
@@ -971,6 +1035,23 @@ async function main(): Promise<void> {
     const token = await getBcToken(bcCfg);
     const header = (await bcGet<{ value: BcRow[] }>(`${odata}/Sales_Order?$filter=${encodeURIComponent(`No eq '${odataStr(orderArg)}'`)}`, token)).value?.[0];
     if (!header) { console.error(`[so-sync] ${orderArg}: not found in BC Sales_Order`); process.exit(1); }
+
+    // --print-payload: build the customerOrder exactly as a push would and print it, WITHOUT
+    // posting. For handing Deposco support a real request when they ask "what did you send us" —
+    // this repo logs outcomes, not request bodies, so before this the only honest way to answer
+    // was to re-post the order. Same builder as the live path, so it cannot drift from what the
+    // worker actually sends. It prints the current code's output for that order, which is not
+    // necessarily byte-identical to what was sent historically if the payload has changed since.
+    if (process.argv.includes('--print-payload')) {
+      const lines = await getSoLines(odata, token, orderArg);
+      const payload = buildCustomerOrder(header, lines);
+      console.log(`POST ${deposcoCfg.apiBase}/orders/customerOrders`);
+      console.log('Content-Type: application/json');
+      console.log('Authorization: Bearer <redacted>\n');
+      console.log(JSON.stringify(payload, null, 2));
+      return;
+    }
+
     console.log(`[so] ${orderArg}: ${postOnly ? '' : 'push'}${!pushOnly && !postOnly ? '+' : ''}${pushOnly ? '' : 'ship'}`);
     if (!postOnly) await pushSo(bcCfg, deposcoCfg, header);
     if (!pushOnly) await pullShipmentsForSo(bcCfg, deposcoCfg, orderArg);

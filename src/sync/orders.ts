@@ -245,6 +245,76 @@ export async function auditPushedCustomerOrder(
   return { orderId: id, checked: rows.length, truncated: nestedTruncated(coLines), unlinked, created };
 }
 
+/**
+ * Every outbound shipment Deposco has, newest first.
+ *
+ * This inverts the shipment pull. Driving it from BC meant walking ~1,278 open orders and asking
+ * Deposco "did this ship?" about each — ~3,800 calls a lap against an ACCOUNT-WIDE 4/sec ceiling,
+ * nearly all of them answered "no". Deposco will just tell us instead: the whole shipment history
+ * is 109 records over 3 pages (2026-08-12), each carrying `orderHeaders` -> the fulfillment
+ * salesOrder, plus its tracking number. Three calls replaces the entire sweep.
+ *
+ * Unlike the nested collections (coLines etc., capped at 10 with no reachable page 2), this is a
+ * TOP-LEVEL list and paginates properly via links[].rel='next' with a real searchId cursor — so
+ * following `next` genuinely walks the whole set.
+ *
+ * `number` is sequential (1..125 so far), which makes it a safe numeric high-water mark — the
+ * same discipline BC selection uses. NOTE the query params are ignored, exactly like
+ * `?salesOrderNumber=` on shipments and `?upc=` on items: actualShipDateFrom / shipDateFrom /
+ * updatedDateFrom / status were all tried and every one returned the identical first page. So
+ * filtering MUST happen client-side on what comes back, never by asking the API to filter.
+ */
+export interface OutboundShipmentRef {
+  number: number;
+  salesOrderIds: number[];
+  trackingNumber: string;
+  status: string;
+  updatedDate: string;
+}
+
+export async function fetchOutboundShipments(cfg: DeposcoConfig, token: string, maxPages = 20): Promise<OutboundShipmentRef[]> {
+  interface Row { number?: string | number; trackingNumber?: string; status?: string; updatedDate?: string; orderHeaders?: { data?: Array<{ id?: number }> } }
+  interface Page { data?: Row[]; links?: Array<{ rel?: string; href?: string }>; complete?: boolean }
+  const out: OutboundShipmentRef[] = [];
+  let url = `${cfg.apiBase}/shipments/outboundShipments`;
+  for (let page = 0; page < maxPages; page++) {
+    const body = await authReq<Page>('get', url, token);
+    for (const r of body.data ?? []) {
+      const n = Number(r.number);
+      if (!Number.isFinite(n)) continue;
+      out.push({
+        number: n,
+        salesOrderIds: (r.orderHeaders?.data ?? []).map((o) => o.id).filter((i): i is number => typeof i === 'number'),
+        trackingNumber: (r.trackingNumber ?? '').trim(),
+        status: r.status ?? '',
+        updatedDate: r.updatedDate ?? '',
+      });
+    }
+    if (body.complete) break;
+    const next = body.links?.find((l) => l.rel === 'next')?.href;
+    if (!next) break;
+    url = next;
+  }
+  return out;
+}
+
+/** Fulfillment salesOrder id -> the BC order number it fulfills (`customerOrderNumber` sits right
+ *  on the salesOrder, so this is one hop, no customerOrder lookup needed). */
+export async function resolveCustomerOrderNumbers(cfg: DeposcoConfig, token: string, salesOrderIds: number[]): Promise<Map<number, string>> {
+  const out = new Map<number, string>();
+  for (const id of new Set(salesOrderIds)) {
+    try {
+      const r = await authReq<{ salesOrder?: { customerOrderNumber?: string }; customerOrderNumber?: string }>(
+        'get', `${cfg.apiBase}/orders/salesOrders/${id}`, token);
+      const num = (r.salesOrder ?? r).customerOrderNumber;
+      if (num) out.set(id, num);
+    } catch (err) {
+      console.warn(`[shipments] salesOrder ${id}: could not resolve customerOrderNumber — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return out;
+}
+
 export interface DeposcoTrackingLine {
   bcLineNo: number;        // customerLineNumber == BC Sales_Order_Line.Line_No
   itemNumber: string;
