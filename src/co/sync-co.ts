@@ -4,7 +4,8 @@
  * as customerOrders — the Deposco entity is a customerOrder, not a salesOrder.)
  *
  * Every SO_SYNC_INTERVAL_MS:
- *   1. For each SO prefix (PKSO/WSOD/HDSO/DISO), list the most recent N BC sales orders.
+ *   1. For each SO prefix (PKSO/WSOD/HDSO/DISO), list the orders CHANGED since that prefix's
+ *      cursor (SystemModifiedAt high-water mark in sync_cursors), oldest first.
  *   2. For each SO:
  *      - Push BC → Deposco: POST /orders/customerOrders (wrapped { customerOrder: {...} }
  *        payload — unlike salesOrders/purchaseOrders). On a 404 missing-item, lazy-create
@@ -12,9 +13,10 @@
  *      - Pull Deposco → BC (shipment confirmation): IMPLEMENTED, gated behind
  *        SO_PULL_ENABLED (default false). Reads coLines[].shippedQuantity off the CO
  *        detail (no /shipments endpoint exists), deltas vs BC cumulative shippedQuantity
- *        per line, and posts SHIP-ONLY via Microsoft.NAV.shipAndInvoice (invoiceQuantity=0,
- *        the PO receive-only mirror). Tracking-number write-back is a later add. NOTE:
- *        External Document No. handling (setExternalDocumentNo) needs verifying live.
+ *        per line, and posts SHIP-ONLY via our own bmiSalesOrders/postShipment action
+ *        (AL page 60209 → codeunit 60223, extension >= 2.8.0.0). Qty. to Invoice is left
+ *        untouched, and the customer's External Document No. is never written at all — the
+ *        posted shipment is identified by diffing the order's shipments around the post.
  *
  * Modeled on the proven build-co.mjs (push) + po/sync.ts (worker loop + lazy item create).
  * Item-create machinery is duplicated from po/sync.ts on purpose: two standalone monoliths
@@ -23,7 +25,9 @@
  * Env:
  *   SO_SYNC_INTERVAL_MS  (default 60000)                   — sleep between ticks
  *   SO_PREFIXES          (default "PKSO,WSOD,HDSO,DISO")   — BC SO number prefixes to sync
- *   SO_PER_PREFIX        (default 25)                      — most-recent N per prefix per tick
+ *   SO_PER_PREFIX        (default 25)                      — max orders per prefix per tick
+ *   SO_CURSOR_ENABLED    (default true)                    — use the SystemModifiedAt cursor;
+ *                                                            false = old newest-N window
  *   SO_PULL_ENABLED      (default false)                   — enable the shipment pull (ship-only)
  *   SO_TRACKING_ENABLED  (default true)                    — write Deposco tracking onto the posted shipment
  *   BC_*                 BC auth + environment + company
@@ -474,24 +478,19 @@ async function auditPush(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: s
 // Deposco has NO /shipments endpoint — shipment state is inline on the CO detail:
 // GET /orders/customerOrders/{id} → coLines[].shippedQuantity (cumulative), keyed by
 // externalLineNumber (== BC Sales_Order_Line.Line_No, which the push now stamps). We
-// delta that against BC's cumulative shippedQuantity per line and post a ship-only via
-// Microsoft.NAV.shipAndInvoice (invoiceQuantity=0) — the direct mirror of the PO
-// receive-only pull. Tracking-number write-back is a later add (the fulfillmentOrders
-// shape only materializes once a CO actually ships; nothing in PILOT has shipped yet).
+// delta that against BC's cumulative shippedQuantity per line and post a ship-only through our
+// own AL action (bmiSalesOrders/postShipment) — the direct mirror of the PO receive-only pull.
+// It used to go through Microsoft.NAV.shipAndInvoice with Qty. to Invoice zeroed per line; see
+// postShipmentOnly for why that failed on any order carrying a line we don't ship.
 
 interface BcSalesOrder { id: string; number: string; status: string; }
 interface BcSalesOrderLine {
   id: string;
   sequence: number; // == Sales_Order_Line.Line_No == Deposco externalLineNumber
   lineObjectNumber: string;
-  lineType?: string;        // 'Item' | 'Account' | 'Comment' | …
   quantity: number;
   shippedQuantity: number; // cumulative posted shipments (read-only)
   invoicedQuantity?: number;
-  // STAGED (writable) quantities — what the next post will act on, as opposed to the
-  // cumulative posted totals above. Read so we can skip lines already staged at zero.
-  shipQuantity?: number;
-  invoiceQuantity?: number;
 }
 
 async function getSalesOrderByNumber(base: string, token: string, companyId: string, soNumber: string): Promise<BcSalesOrder | null> {
@@ -512,24 +511,53 @@ async function patchSalesLine(base: string, token: string, companyId: string, li
     { data: body, headers: { 'If-Match': '*' } });
 }
 
-async function postShipAndInvoice(base: string, token: string, companyId: string, soId: string): Promise<void> {
-  await authReq('post',
-    `${base}/companies(${companyId})/salesOrders(${soId})/Microsoft.NAV.shipAndInvoice`, token, { data: {} });
+// SHIP-ONLY post, via our own AL action (page 60209 "PK Sales Order API" → codeunit 60223,
+// extension v2.8.0.0+). BC's api/v2.0 salesOrders exposes only Microsoft.NAV.shipAndInvoice —
+// there is no ship-only counterpart (confirmed against this environment's $metadata) — so this
+// used to call shipAndInvoice and suppress the invoice half by zeroing Qty. to Invoice on every
+// line it shipped. That silently broke on any order carrying a line we did NOT ship: BC stages
+// EVERY line at full Quantity on release, so an untouched charge line stayed queued to invoice,
+// posting it hit the general ledger, and PK_BC_customization's Gen. Jnl.-Post Line subscriber
+// tried to INSERT a "SalesPerson Commission" row that the S2S identity may not write:
+//   HTTP 400 "(TableData 50026 SalesPerson Commission Insert: PK_BC_customization)"
+// Posting is one transaction, so the shipment rolled back with it — DISO211236 re-failed every
+// tick for a day. Ship-only cannot reach that path: a G/L Account line only touches the ledger
+// when INVOICED. Qty. to Invoice is now left alone entirely; BC re-derives it after posting.
+async function postShipmentOnly(cfg: BcConfig, token: string, companyId: string, soNumber: string): Promise<void> {
+  const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
+  // Resolve the SystemId off our own page rather than assuming salesOrders.id is the same GUID.
+  const row = (await authReq<{ value: Array<{ systemId: string }> }>('get',
+    `${bmi}/bmiSalesOrders?$filter=${encodeURIComponent(`no eq '${odataStr(soNumber)}'`)}`, token)).value?.[0];
+  if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.8.0.0 installed?`);
+  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.postShipment`, token, { data: {} });
 }
 
-// External Document No. is the sales analog of the PO's mandatory Vendor_Invoice_No. If
-// Sales & Receivables Setup has "Ext. Doc. No. Mandatory" on, shipAndInvoice rejects a
-// blank one — the same trap the PO side hit. Set a unique ref via OData before posting.
-// VERIFY the field/key names against this instance before flipping SO_PULL_ENABLED on.
-async function setExternalDocumentNo(odata: string, token: string, soNumber: string, ref: string): Promise<void> {
-  const body = await authReq<{ value: Array<{ '@odata.etag': string }> }>('get',
-    `${odata}/Sales_Order?$filter=No eq '${odataStr(soNumber)}'`, token);
-  const so = body.value[0];
-  if (!so) throw new Error(`SO ${soNumber} not found via ODataV4`);
-  await authReq('patch',
-    `${odata}/Sales_Order(Document_Type='Order',No='${odataStr(soNumber)}')`, token,
-    { data: { External_Document_No: ref }, headers: { 'If-Match': so['@odata.etag'] } });
+// The posted shipment this run created, identified by diffing the order's shipments around the
+// post rather than by pre-stamping a synthetic ref (see the External Document No. note below).
+// Returns the
+// numbers of every posted shipment currently on the order.
+async function shipmentNosForOrder(cfg: BcConfig, token: string, companyId: string, soNumber: string): Promise<Set<string>> {
+  const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
+  const rows = (await authReq<{ value: Array<{ no: string }> }>('get',
+    `${bmi}/bmiSalesShipments?$filter=${encodeURIComponent(`orderNo eq '${odataStr(soNumber)}'`)}&$select=no`, token)).value ?? [];
+  return new Set(rows.map((r) => r.no));
 }
+
+// NOTE — External Document No. is DELIBERATELY not written by this worker any more.
+//
+// On this instance that field is captioned CUSTOMER PURCHASE ORDER NO. and the business uses it:
+// it holds the customer's own PO, prints on their documents, and is what they reconcile against.
+// This worker used to overwrite it with `SHIP-{soNo}-{epoch}` before every post, for two reasons:
+//   1. "Ext. Doc. No. Mandatory" in Sales & Receivables Setup can reject a blank one, and
+//   2. the tracking write-back needed something to match the posted shipment on.
+// The stamp destroyed the customer's value on EVERY tick, and worst on orders whose post then
+// failed — DISO211236 was re-stamped every 5 minutes for a day, DISO211300 still carries one.
+//
+// Reason 2 is gone: the posted shipment is now identified by diffing shipmentNosForOrder around
+// the post, which is exact even when one order ships several times. Reason 1 has not bitten in
+// testing (WSOD304108 posted SLSS846339 fine), but if a "must have a value" error ever appears,
+// the ref belongs in a field of OUR OWN — a tableextension on Sales Header, the way the tracking
+// fields live on our Sales Shipment Header extension — never in the customer's PO field.
 
 interface ShipLine { lineId: string; label: string; quantity: number }
 
@@ -611,56 +639,29 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     return;
   }
 
-  // Post ship-only (invoiceQuantity=0), mirroring the PO receive-only flow.
-  const ref = `SHIP-${soNumber}-${Date.now()}`;
-  bcToken = await getBcToken(bcCfg);
-  await setExternalDocumentNo(bcOdataBase(bcCfg), bcToken, soNumber, ref);
-  console.log(`[pull] ${soNumber}: external doc ref = ${ref}`);
+  // NOTHING is written to the sales order header here. External Document No. is captioned
+  // CUSTOMER PURCHASE ORDER NO. on this instance and is in active use by the business — see
+  // the note above pullShipmentsForSo. We no longer need a ref there at all: the posted shipment
+  // is identified by diffing shipmentNosForOrder around the post.
+  //
+  // Stage what ships, and only that. Qty. to Invoice is deliberately NOT touched: the post below
+  // is ship-only at the BC end, so there is no invoice half left to suppress. (BC derives
+  // Qty. to Invoice from Qty. to Ship on its own — the PATCH response shows invoiceQty following
+  // shipQty — which is precisely why the old shipAndInvoice path invoiced lines nobody asked it to.)
   for (const line of toShip) {
     bcToken = await getBcToken(bcCfg);
-    await patchSalesLine(base, bcToken, companyId, line.lineId, { shipQuantity: line.quantity });
-    bcToken = await getBcToken(bcCfg);
-    const r = await patchSalesLine(base, bcToken, companyId, line.lineId, { invoiceQuantity: 0 });
-    console.log(`  PATCHed ${soNumber} ${line.label}: pending shipQty=${r['shipQuantity']} invoiceQty=${r['invoiceQuantity']}`);
+    const r = await patchSalesLine(base, bcToken, companyId, line.lineId, { shipQuantity: line.quantity });
+    console.log(`  PATCHed ${soNumber} ${line.label}: pending shipQty=${r['shipQuantity']} invoiceQty=${r['invoiceQuantity']} (invoice qty left as-is)`);
   }
 
-  // Zeroing only the toShip lines does NOT make this a ship-only post: shipAndInvoice posts the
-  // WHOLE document, and BC stages every line at the full Quantity when an order is released. So
-  // any line we don't touch stays queued to INVOICE — including charge lines Deposco never
-  // fulfils. DISO211236 died on exactly that: its untouched `L14000 Account/44105 @DROPSHIP` was
-  // still Qty. to Invoice 1, so the post tried to raise a real invoice, which fired the
-  // salesperson-commission logic in PK_BC_customization and came back
-  //   HTTP 400 "the current permissions prevented the action.
-  //             (TableData 50026 SalesPerson Commission Insert: PK_BC_customization)"
-  // — the S2S identity cannot insert commission rows, and since it is one transaction the
-  // shipment rolled back with it. Orders whose lines are all WMS items (DISO211250, DISO211281)
-  // had nothing left to invoice and posted fine, which is why this looked intermittent.
-  //
-  // Zeroing is transient, not destructive: BC recalculates Qty. to Invoice back to the full
-  // quantity once the shipment posts (verified on DISO211236 L14000 and DISO211250 L1000, both
-  // back to invQty = quantity, invoiced = 0), so finance's invoicing flow is untouched and no
-  // charge line is left stranded. Nothing financial is posted here either way.
-  // The zeroing is only for the duration of the post — the staged values are captured here and
-  // put back afterwards (see `restoreStaged` below). BC re-derives Qty. to Invoice for lines it
-  // actually shipped, but a line we zeroed does NOT ship, so its recalc is 0 - 0 = 0 and it would
-  // stay flat forever. That matters for freight/decoration charge lines: left at zero they'd drop
-  // out of whatever invoices them later. So: zero → post → restore.
-  const shipping = new Set(toShip.map((l) => l.lineId));
-  const restoreStaged: Array<{ id: string; label: string; shipQuantity: number; invoiceQuantity: number }> = [];
-  for (const l of bcLines) {
-    if (shipping.has(l.id)) continue;
-    const stagedShip = l.shipQuantity ?? 0;
-    const stagedInvoice = l.invoiceQuantity ?? 0;
-    if (stagedShip === 0 && stagedInvoice === 0) continue;
-    bcToken = await getBcToken(bcCfg);
-    await patchSalesLine(base, bcToken, companyId, l.id, { shipQuantity: 0, invoiceQuantity: 0 });
-    restoreStaged.push({ id: l.id, label: `line${l.sequence}/${l.lineType ?? '?'}/${l.lineObjectNumber}`, shipQuantity: stagedShip, invoiceQuantity: stagedInvoice });
-    console.log(`  zeroed ${soNumber} line${l.sequence}/${l.lineType ?? '?'}/${l.lineObjectNumber}: was shipQty=${stagedShip} invoiceQty=${stagedInvoice} — will restore after the post`);
-  }
-
-  console.log(`[pull] ${soNumber}: POST shipAndInvoice...`);
+  // Snapshot the order's posted shipments so the one this run creates can be identified by
+  // difference — replaces matching on the synthetic External Document No. ref we no longer stamp.
   bcToken = await getBcToken(bcCfg);
-  await postShipAndInvoice(base, bcToken, companyId, so.id);
+  const shipmentsBefore = await shipmentNosForOrder(bcCfg, bcToken, companyId, soNumber);
+
+  console.log(`[pull] ${soNumber}: POST bmiSalesOrders/postShipment (ship-only)...`);
+  bcToken = await getBcToken(bcCfg);
+  await postShipmentOnly(bcCfg, bcToken, companyId, soNumber);
 
   // Verify BC advanced; warn loudly if we accidentally invoiced (would be a bug).
   bcToken = await getBcToken(bcCfg);
@@ -673,37 +674,21 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     const inv = a.invoicedQuantity ?? 0;
     console.log(`  ${line.label}: shipped=${a.shippedQuantity} invoiced=${inv}${inv > 0 ? ' ⚠ INVOICED' : ''} (posted +${line.quantity})`);
   }
-  // The loop above only inspects the lines we shipped, so an invoice raised on a line we did NOT
-  // ship — the exact failure mode the zeroing above prevents — would go unnoticed. Check the
-  // whole document, and log it as a desync so it surfaces in /logs rather than only on stdout.
-  const strayInvoiced = after.filter((a) => !shipping.has(a.id) && (a.invoicedQuantity ?? 0) > 0);
-  if (strayInvoiced.length > 0) {
-    const detail = strayInvoiced.map((a) => `line${a.sequence}/${a.lineType ?? '?'}/${a.lineObjectNumber}=${a.invoicedQuantity}`).join(', ');
-    const msg = `⚠ invoiced ${strayInvoiced.length} line(s) we did not ship: ${detail} — expected ship-only`;
-    console.warn(`[pull] ${soNumber}: ${msg}`);
-    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'desync', side: 'bc', message: msg, dedupeKey: dailyDedupe('co-invoiced', soNumber, msg) });
+  // Identify the shipment this run created: whatever is on the order now that wasn't before.
+  // Exact even when an order ships several times, and needs no ref stamped on the customer's PO
+  // field. If it comes back ambiguous (or empty, e.g. another process posted concurrently), fall
+  // through to the tracking backfill path rather than annotating the wrong document.
+  bcToken = await getBcToken(bcCfg);
+  const shipmentsAfter = await shipmentNosForOrder(bcCfg, bcToken, companyId, soNumber);
+  const created = [...shipmentsAfter].filter((n) => !shipmentsBefore.has(n));
+  const postedShipmentNo = created.length === 1 ? created[0] : null;
+  if (created.length !== 1) {
+    console.warn(`[pull] ${soNumber}: ⚠ expected exactly 1 new posted shipment, saw ${created.length} [${created.join(',') || 'none'}] — tracking falls back to backfill`);
   }
-  // Put the staged quantities back on the lines we zeroed, so a freight/charge line is left
-  // exactly as we found it and stays billable. NEVER fatal: the shipment has already posted, so a
-  // failure here must not make the caller think the post failed — it logs a desync naming the
-  // lines instead, which is recoverable by hand ("Auto Fill Qty. to Invoice") and visible in /logs.
-  for (const r of restoreStaged) {
-    try {
-      bcToken = await getBcToken(bcCfg);
-      await patchSalesLine(base, bcToken, companyId, r.id, { shipQuantity: r.shipQuantity, invoiceQuantity: r.invoiceQuantity });
-      console.log(`  restored ${soNumber} ${r.label}: shipQty=${r.shipQuantity} invoiceQty=${r.invoiceQuantity}`);
-    } catch (err) {
-      const e = err as AxiosError;
-      const msg = `left ${r.label} staged at zero — restore failed HTTP ${e.response?.status ?? '?'} (needs Qty. to Invoice refilled before it can be billed)`;
-      console.error(`[pull] ${soNumber}: ⚠ ${msg}`);
-      await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'desync', side: 'bc', message: msg, dedupeKey: dailyDedupe('co-restore', soNumber, msg) });
-    }
-  }
-  console.log(`[pull] ${soNumber}: ✓ shipment posted (ship-only, ref=${ref})`);
+  console.log(`[pull] ${soNumber}: ✓ shipment posted (ship-only${postedShipmentNo ? `, ${postedShipmentNo}` : ''})`);
 
-  // Stamp Deposco tracking onto the shipment we just posted. Keyed on `ref`, which BC carried
-  // onto the posted shipment's External Document No. — exact even when one SO has several.
-  await writeTrackingBack(bcCfg, deposcoCfg, soNumber, ref, orderId, runId);
+  // Stamp Deposco tracking onto the shipment we just posted, matched on its number.
+  await writeTrackingBack(bcCfg, deposcoCfg, soNumber, postedShipmentNo, orderId, runId);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -721,14 +706,17 @@ async function writeTrackingBack(
   bcCfg: BcConfig,
   deposcoCfg: DeposcoConfig,
   soNumber: string,
-  externalDocumentNo: string | null,
+  /** Posted shipment (SLSS…) this run created, or null to backfill an untracked one. Was the
+   *  synthetic `SHIP-{soNo}-{epoch}` External Document No. ref until that stamp was removed for
+   *  clobbering the customer's PO number — the caller now diffs the order's shipments instead. */
+  postedShipmentNo: string | null,
   customerOrderId: number,
   runId: number | null = null,
 ): Promise<void> {
   const logTrack = (status: 'ok' | 'skip' | 'fail', message: string, detail?: unknown, side: 'bc' | 'deposco' = 'bc') =>
     logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'shipment',
                entityId: soNumber, action: 'tracking', status, side, message, detail,
-               dedupeKey: dailyDedupe('co-track', `${soNumber}:${externalDocumentNo ?? 'backfill'}`, message) });
+               dedupeKey: dailyDedupe('co-track', `${soNumber}:${postedShipmentNo ?? 'backfill'}`, message) });
 
   if (!TRACKING_ENABLED) {
     console.log(`[track] ${soNumber}: disabled (SO_TRACKING_ENABLED=false)`);
@@ -761,11 +749,11 @@ async function writeTrackingBack(
     const bcToken = await getBcToken(bcCfg);
     const companyId = await getCompanyId(bcCfg, bcToken);
 
-    // Backfill mode (no fresh ref): target posted shipments of this SO that still have no
-    // tracking. Ambiguous when several qualify — bail rather than guess, since the wrong
-    // tracking number on a real shipment is worse than none.
-    let targetShipmentNo: string | null = null;
-    if (!externalDocumentNo) {
+    // Backfill mode (caller didn't identify a shipment): target posted shipments of this SO that
+    // still have no tracking. Ambiguous when several qualify — bail rather than guess, since the
+    // wrong tracking number on a real shipment is worse than none.
+    let targetShipmentNo: string | null = postedShipmentNo;
+    if (!postedShipmentNo) {
       const untracked = await bcGet<{ value: Array<{ No: string }> }>(
         `${bcOdataBase(bcCfg)}/Posted_Sales_Shipment_Excel?$filter=${encodeURIComponent(
           `Order_No eq '${odataStr(soNumber)}' and Package_Tracking_No eq ''`)}&$select=No`, bcToken);
@@ -798,8 +786,11 @@ async function writeTrackingBack(
     const dsn = joinCapped(used.map((t) => t.shipmentNo), 20);   // Code[20] on the buffer
     if (tn.dropped > 0) console.warn(`[track] ${soNumber}: ⚠ ${tn.dropped} tracking number(s) dropped — list exceeds 250 chars`);
     const primary = used[0];
+    // Always keyed on the posted shipment number now — either the one the caller just created or
+    // the single untracked one found above. The externalDocumentNo match the AL page also
+    // supports is no longer used from here, since nothing stamps a ref to match on.
     const payload = {
-      ...(targetShipmentNo ? { shipmentNo: targetShipmentNo } : { externalDocumentNo }),
+      shipmentNo: targetShipmentNo,
       deposcoShipmentNo: dsn.text,
       deposcoSalesOrderNo: primary.salesOrderNo,
       trackingNo: tn.text,
@@ -834,7 +825,7 @@ async function writeTrackingBack(
     // Which side failed: reading Deposco, or writing BC's bmiShipmentTrackings.
     const side = /deposco\.com/i.test(String(e.config?.url ?? '')) ? 'deposco' : 'bc';
     await logTrack('fail', `HTTP ${e.response?.status ?? e.code ?? '?'}: ${body.slice(0, 180)}`,
-                   { url: e.config?.url, externalDocumentNo }, side);
+                   { url: e.config?.url, postedShipmentNo }, side);
   }
 }
 

@@ -307,11 +307,12 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
 // Direct = all-or-nothing (BC requires the full line qty); non-direct = post the delta.
 
 // Resolve the TO's SystemId on the bmi page and POST the bound ship/receive action.
-async function bmiPost(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', token: string): Promise<void> {
+// Returns the posted BC document no. (or null if the order wasn't on the page).
+async function bmiPost(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', token: string): Promise<string | null> {
   const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
   const order = (await authReq<{ value: Array<{ systemId: string }> }>('get',
     `${bmi}/bmiTransferOrders?$filter=${encodeURIComponent(`no eq '${odataStr(no)}'`)}`, token)).value?.[0];
-  if (!order) { console.warn(`[pull] ${no}: not on bmiTransferOrders page — cannot ${action}`); return; }
+  if (!order) { console.warn(`[pull] ${no}: not on bmiTransferOrders page — cannot ${action}`); return null; }
   // Posting a transfer in BC writes item ledger + reservation entries; on a many-line order it
   // routinely runs past the 30s default and came back ECONNABORTED, so the post was never
   // confirmed even when BC completed it. Give it room.
@@ -324,10 +325,16 @@ async function bmiPost(cfg: SyncBcConfig, companyId: string, no: string, action:
     { data: {}, timeout: POST_TIMEOUT_MS });
   const posted = typeof doc === 'object' && doc && 'value' in (doc as Record<string, unknown>) ? (doc as { value: unknown }).value : doc;
   console.log(`[pull] ${no}: ✅ ${action} → BC doc ${JSON.stringify(posted)}`);
+  return posted == null ? '' : String(posted);
 }
 
+// A leg that actually posted — carried up to the tick so success lands in sync_events, not just
+// stdout (a fully-posted transfer used to vanish from BC with zero trace in /logs).
+interface PostedLeg { action: 'postShipment' | 'postReceipt'; staged: number; doc: string | null }
+
 // Post one leg: PATCH each line's qty up to the Deposco-confirmed target, then fire the action.
-async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', qtyField: 'Qty_to_Ship' | 'Qty_to_Receive', postedField: 'Quantity_Shipped' | 'Quantity_Received', confirmed: Map<number, number>, direct: boolean): Promise<void> {
+// Returns the posted leg, or null when nothing was outstanding (in sync — the common case).
+async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', qtyField: 'Qty_to_Ship' | 'Qty_to_Receive', postedField: 'Quantity_Shipped' | 'Quantity_Received', confirmed: Map<number, number>, direct: boolean): Promise<PostedLeg | null> {
   const odata = bcOdataBase(cfg);
   const token = await getBcToken(cfg);
   const lines = await getTransferLines(odata, token, no);
@@ -351,29 +358,33 @@ async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action:
     console.log(`  L${ln} ${pick(l, 'Item_No')}: deposco=${dep} bc=${posted} → ${qtyField} += ${toPost}`);
     staged += toPost;
   }
-  if (staged === 0) { console.log(`[pull] ${no}: ${action} — nothing to post (in sync)`); return; }
+  if (staged === 0) { console.log(`[pull] ${no}: ${action} — nothing to post (in sync)`); return null; }
   console.log(`[pull] ${no}: ${action} — staged ${staged} unit(s)`);
-  await bmiPost(cfg, companyId, no, action, token);
+  const doc = await bmiPost(cfg, companyId, no, action, token);
+  return { action, staged, doc };
 }
 
-async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan, direct: boolean): Promise<void> {
+async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan, direct: boolean): Promise<PostedLeg[]> {
   const no = pick(header, 'No');
   const dToken = await getDeposcoToken(deposcoCfg);
+  const legs: PostedLeg[] = [];
 
   if (plan === 'receive' || plan === 'both') {
     const poId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/purchaseOrders', { number: no });
-    if (poId === null) { console.log(`[pull] ${no}: not in Deposco (purchaseOrder) yet — skip receive`); return; }
+    if (poId === null) { console.log(`[pull] ${no}: not in Deposco (purchaseOrder) yet — skip receive`); return legs; }
     const recv = new Map<number, number>();
     const received = await fetchReceivedFromPurchaseOrder(deposcoCfg, dToken, poId);
     if (received.truncated) console.error(`[pull] ${no}: ❌ Deposco truncated the PO line list (>10 lines) — received qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
     for (const r of received.lines) recv.set(r.line, (recv.get(r.line) ?? 0) + r.quantity);
     console.log(`[pull] ${no}: RECEIVE — Deposco received ${[...recv].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}`);
     // Origin doesn't post its own shipment, so post it (→ in transit) then receive — both to the received qty.
-    await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', recv, direct);
-    await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', recv, direct);
+    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', recv, direct);
+    if (shipLeg) legs.push(shipLeg);
+    const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', recv, direct);
+    if (recvLeg) legs.push(recvLeg);
   } else if (plan === 'ship') {
     const coId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/customerOrders', { externalOrderNumber: no });
-    if (coId === null) { console.log(`[pull] ${no}: not in Deposco (customerOrder) yet — skip ship`); return; }
+    if (coId === null) { console.log(`[pull] ${no}: not in Deposco (customerOrder) yet — skip ship`); return legs; }
     const shipped = new Map<number, number>();
     const ship = await fetchShippedFromFulfillment(deposcoCfg, dToken, coId);
     if (ship.truncatedOrders.length > 0) console.error(`[pull] ${no}: ❌ Deposco truncated the line list on ${ship.truncatedOrders.join(', ')} (>10 lines) — shipped qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
@@ -382,9 +393,14 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
       if (Number.isFinite(ln)) shipped.set(ln, (shipped.get(ln) ?? 0) + Number(l.shippedQuantity ?? 0));
     }
     console.log(`[pull] ${no}: SHIP — Deposco shipped ${[...shipped].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}${direct ? ' (direct → ship+receive)' : ''}`);
-    await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', shipped, direct);
-    if (direct) await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', shipped, direct);
+    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', shipped, direct);
+    if (shipLeg) legs.push(shipLeg);
+    if (direct) {
+      const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', shipped, direct);
+      if (recvLeg) legs.push(recvLeg);
+    }
   }
+  return legs;
 }
 
 // ── Single-order sync (the web-UI button backend) + batch tick ──────────────
@@ -392,7 +408,7 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
 // causes (push = Deposco rejected us; post = BC rejected us) and lumping both into the tick's
 // generic 'sync' event is what left a bare "404" in /logs with no hint that the OData
 // TransferOrderLines page was the thing missing.
-interface SyncResult { plan: TransferPlan; push?: PushOutcome; postError?: { status?: number; body: string } }
+interface SyncResult { plan: TransferPlan; push?: PushOutcome; posted?: PostedLeg[]; postError?: { status?: number; body: string } }
 async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<SyncResult> {
   const no = pick(header, 'No');
   const from = pick(header, 'Transfer_from_Code').toUpperCase();
@@ -405,9 +421,10 @@ async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: 
   let push: PushOutcome | undefined;
   if (opts.push) push = await pushTransfer(cfg, deposcoCfg, companyId, header, plan);
   let postError: SyncResult['postError'];
+  let posted: PostedLeg[] | undefined;
   if (opts.post) {
     try {
-      await pull(cfg, deposcoCfg, companyId, header, plan, direct);
+      posted = await pull(cfg, deposcoCfg, companyId, header, plan, direct);
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message);
@@ -416,7 +433,7 @@ async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: 
       console.error(`[pull] ${no} post-back FAILED HTTP ${e.response?.status}${url}: ${body.slice(0, 500)}`);
     }
   }
-  return { plan, push, postError };
+  return { plan, push, posted, postError };
 }
 
 
@@ -445,11 +462,18 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
     processed++;
     const no = pick(header, 'No');
     try {
-      const { plan, push, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      const { plan, push, posted, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
       if (postError) {
         failed++;
         const pmsg = `post-back to BC: HTTP ${postError.status ?? '?'}: ${postError.body.slice(0, 300)}`;
         await logEvent({ runId, worker: 'to', direction: 'deposco->bc', entityType: 'order', entityId: no, action: 'post', status: 'fail', side: 'bc', message: pmsg, detail: postError.body.slice(0, 4000), dedupeKey: dailyDedupe('to-post', no, pmsg) });
+      }
+      // Successful post-backs are the payoff of the whole worker — say so in /logs, not just
+      // stdout. Keyed on the posted doc no. so each real posting logs exactly once and a later
+      // posting of the same order (new delta, new doc) logs again.
+      for (const leg of posted ?? []) {
+        const what = leg.action === 'postShipment' ? 'shipment' : 'receipt';
+        await logEvent({ runId, worker: 'to', direction: 'deposco->bc', entityType: 'order', entityId: no, action: 'post', status: 'ok', side: 'bc', message: `posted ${what}: ${leg.staged} unit(s)${leg.doc ? ` → ${leg.doc}` : ''}`, dedupeKey: dailyDedupe('to-post-ok', no, `${leg.action}:${leg.doc ?? leg.staged}`) });
       }
       if (plan === 'skip') {
         await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });

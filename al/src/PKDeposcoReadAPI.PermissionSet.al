@@ -14,12 +14,18 @@ permissionset 60200 "PK Deposco Read API"
         page "PK Transfer Order Header API" = X,
         page "PK Posted Sales Shipment API" = X,
         page "PK Sales Shipment Read API" = X,
+        page "PK Sales Order API" = X,
         codeunit "PK Inv Adjustment Mgt" = X,
         codeunit "PK Ship Tracking Mgt" = X,
         codeunit "PK Optional Field" = X,
+        codeunit "PK Sales Ship Mgt" = X,
         tabledata "Transfer Line" = R,
         tabledata "Purchase Line" = R,
-        tabledata "Sales Line" = R,
+        // Ship-only posting stages nothing itself, but Sales-Post reads/updates both the header
+        // and the lines it posts, so R alone is not enough here. The elevated writes that posting
+        // needs beyond this (shipment header/line, SKU auto-create) live on "PK Sales Ship Mgt".
+        tabledata "Sales Line" = RM,
+        tabledata "Sales Header" = RM,
         // Inventory-adjustment WRITE path: our buffer/log table + the item journal it posts through.
         tabledata "PK Inv Adjustment" = RIMD,
         tabledata "Item Journal Template" = RIM,
