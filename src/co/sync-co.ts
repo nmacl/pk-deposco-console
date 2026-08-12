@@ -35,8 +35,8 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, type DeposcoTracking } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, type DeposcoTracking } from '../sync/orders.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -45,6 +45,10 @@ const INTERVAL_MS = parseInt(process.env.SO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIXES = (process.env.SO_PREFIXES ?? 'PKSO,WSOD,HDSO,DISO').split(',').map((p) => p.trim()).filter(Boolean);
 const PER_PREFIX = parseInt(process.env.SO_PER_PREFIX ?? '25', 10);
 const PULL_ENABLED = (process.env.SO_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
+// SystemModifiedAt high-water mark per prefix (sync_cursors), replacing the newest-25 window that
+// left 1,278 of 1,408 open orders permanently unreachable. Set SO_CURSOR_ENABLED=false to fall
+// back to the old newest-N behaviour if the cursor ever misbehaves in production.
+const CURSOR_ENABLED = (process.env.SO_CURSOR_ENABLED ?? 'true').toLowerCase() === 'true';
 // Tracking write-back onto the posted sales shipment. Needs the AL extension (>= v2.4.0.0,
 // page bmiShipmentTrackings) published to the target BC environment.
 const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
@@ -68,13 +72,53 @@ const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WESTERLY').split
 // Config + bcGet/pick/numOf/odataStr/bcApiBase/bcOdataBase/getCompanyId now live in ../sync/*.
 // ────────────────────────────────────────────────────────────────────────────
 
+/**
+ * The candidate list is a CURSOR, not a newest-N window.
+ *
+ * The old query took the newest 25 by Order_Date. That starved catastrophically: 1,408 Released
+ * sales orders exist and the tick could only ever see 100 of them (25 x 4 prefixes). Worse,
+ * Order_Date is a business date, so a backdated order sorts into the middle of the list and is
+ * invisible from the moment it's created — it never enters the window no matter how long you wait.
+ *
+ * Widening the window is not an option here (unlike transfers, which self-drain): 1,278 open
+ * orders x ~4 Deposco calls is ~5,100 calls a tick against an account-wide 4/sec ceiling — 21
+ * minutes of solid traffic, which would guarantee the 429s we're already fighting.
+ *
+ * So: order by SystemModifiedAt ASC and only look at what changed since the last successful tick,
+ * advancing a high-water mark stored in sync_cursors. Steady state is ~10 orders a tick instead
+ * of 100, which fixes the starvation AND cuts Deposco load. The first run after deploy drains the
+ * backlog at SO_PER_PREFIX per tick, oldest first, so nothing is stranded.
+ *
+ * `since` empty => no cursor yet (first run): fall back to the newest-N window so a fresh install
+ * still does something sensible rather than trying to replay all of history.
+ */
+async function listChangedSos(odata: string, token: string, prefix: string, count: number, since: string | null): Promise<BcRow[]> {
+  if (!since) return listRecentSos(odata, token, prefix, count);
+  const filter = encodeURIComponent(
+    `startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false and SystemModifiedAt gt ${since}`);
+  const url = `${odata}/Sales_Order?$filter=${filter}&$orderby=SystemModifiedAt asc&$top=${count}`;
+  const rows = (await bcGet<{ value: BcRow[] }>(url, token)).value ?? [];
+  if (rows.length >= count) console.log(`[tick] ${prefix}: ${rows.length} changed (cap) — backlog still draining, cursor advances each tick`);
+  return rows;
+}
+
+/** Newest-N fallback, used only until a cursor exists. */
 async function listRecentSos(odata: string, token: string, prefix: string, count: number): Promise<BcRow[]> {
   // Only RELEASED orders sync — an Open order is still being edited; we don't push it to the
   // WMS until it's released. (BC Sales_Order Status is exactly 'Open' | 'Released'.)
-  const filter = encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released'`);
+  // Completely_Shipped orders are finished work — they can only ever be re-read as no-ops, and
+  // leaving them in crowds live orders out of the window (824 Released WSOD, 749 still open).
+  const filter = encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`);
+  // NOTE: Order_Date has the same flaw as the transfer worker's postingDate — it's a business
+  // date, so a backdated order sorts into the middle and is never seen. It is NOT changed to
+  // `No desc` yet: with ~1,278 open orders against a 25-cap, ANY fixed ordering starves most of
+  // them. The real fix is a SystemModifiedAt cursor (sync_cursors is already built) — until then
+  // this at least stops finished orders from eating the window, and says when it truncates.
   const url = `${odata}/Sales_Order?$filter=${filter}&$orderby=Order_Date desc&$top=${count}`;
   const body = await bcGet<{ value: BcRow[] }>(url, token);
-  return body.value ?? [];
+  const rows = body.value ?? [];
+  if (rows.length >= count) console.warn(`[tick] ${prefix}: ⚠ hit the ${count}-order cap — open orders exist that this tick never saw (starvation). Needs the SystemModifiedAt cursor.`);
+  return rows;
 }
 
 async function getSoLines(odata: string, token: string, soNumber: string): Promise<BcRow[]> {
@@ -341,17 +385,17 @@ type PostResult = 'ok' | 'skip';
 // /latest resolves the same filter correctly (verified: TRFO001660 -> 1 row on latest, 0 on beta).
 // DEPOSCO_CO_LOOKUP_BASE can force a different base if ops ever needs it again, but the default
 // must stay on the environment we actually write to.
-const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externalOrderNumber: string) => {
+const lookupCustomerOrderId = (deposcoCfg: DeposcoConfig, token: string, externalOrderNumber: string, opts: { liveOnly?: boolean } = {}) => {
   const override = process.env.DEPOSCO_CO_LOOKUP_BASE;
   const apiBase = override ? deposcoCfg.apiBase.replace('/latest', `/${override.replace(/^\//, '')}`) : deposcoCfg.apiBase;
-  return lookupDeposcoOrderId({ ...deposcoCfg, apiBase }, token, '/orders/customerOrders', { externalOrderNumber });
+  return lookupDeposcoOrderId({ ...deposcoCfg, apiBase }, token, '/orders/customerOrders', { externalOrderNumber }, opts);
 };
 
 async function postSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, payload: DeposcoCustomerOrderPayload, label: string): Promise<PostResult> {
   return postDeposcoOrder(bcCfg, deposcoCfg, '/orders/customerOrders', payload, soNumber, label, { worker: 'co' });
 }
 
-async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow): Promise<PostResult> {
+async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow, runId: number | null = null): Promise<PostResult> {
   const odata = bcOdataBase(bcCfg);
   const soNumber = pick(header, 'No');
   // Only RELEASED orders push to the WMS — Open = still being edited. The scheduled tick already
@@ -371,8 +415,11 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow)
   // customerOrders POST does NOT upsert — it creates a brand-new CO every time, so the
   // per-tick re-push was minting duplicate Deposco orders. Skip if one already exists.
   // (Updating an existing CO on SO edits is a follow-up — needs Deposco update-by-id.)
+  // liveOnly: an order whose copies are ALL cancelled must count as absent, otherwise cancelling
+  // a bad CO in Deposco (the only way to fix one — there's no PATCH) would permanently block the
+  // clean re-push.
   const dToken = await getDeposcoToken(deposcoCfg);
-  const existing = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
+  const existing = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber, { liveOnly: true });
   if (existing !== null) {
     console.log(`[push] ${soNumber}: already in Deposco (CO id ${existing}) — skipping create (no upsert yet)`);
     return 'skip';
@@ -380,7 +427,44 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow)
   const payload = buildCustomerOrder(header, lines);
   const via = payload.customerOrder.shipVia;
   if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
-  return postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  const result = await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  if (result === 'ok') await auditPush(bcCfg, deposcoCfg, soNumber, payload, runId);
+  return result;
+}
+
+/**
+ * A 2xx from customerOrders does NOT mean every line landed usable. The endpoint returns 202
+ * Accepted and materializes the order asynchronously, and it silently writes a line with a null
+ * item when the item doesn't exist (see auditPushedCustomerOrder). Read the
+ * order back, lazy-create whatever was missing, and record a desync so the broken order is
+ * visible in /logs instead of sitting in Review behind a green "pushed to Deposco".
+ * Never fatal: the push itself already succeeded.
+ */
+async function auditPush(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, payload: DeposcoCustomerOrderPayload, runId: number | null): Promise<void> {
+  try {
+    const intended = new Map(payload.customerOrder.coLines.data.map((l) => [l.externalLineNumber, l.itemNumber]));
+    const dToken = await getDeposcoToken(deposcoCfg);
+    const audit = await auditPushedCustomerOrder(bcCfg, deposcoCfg, dToken, soNumber, intended);
+    if (!audit) return;
+    if (audit.truncated) {
+      const m = `Deposco returned only ${audit.checked} of ${payload.customerOrder.coLines.data.length} line(s) on read-back — lines beyond the first page cannot be audited`;
+      console.warn(`[audit] ${soNumber}: ⚠ ${m}`);
+      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'audit', status: 'desync', side: 'deposco', message: m, dedupeKey: dailyDedupe('co-audit-trunc', soNumber, 'truncated') });
+    }
+    if (audit.unlinked.length === 0) {
+      // Say so explicitly: silence would be indistinguishable from the audit never running.
+      console.log(`[audit] ${soNumber}: ✓ CO ${audit.orderId} — all ${audit.checked} readable line(s) have a linked item`);
+      return;
+    }
+    const detail = audit.unlinked.map((u) => `L${u.externalLineNumber}=${u.itemNumber}(${u.quantity})`).join(' ');
+    const m = `${audit.unlinked.length} line(s) landed in Deposco with NO item linked: ${detail}. ${audit.created.length ? `Created ${audit.created.join(', ')} — ` : 'Item create failed — '}CO ${audit.orderId} cannot be repaired via API; cancel it in Deposco and re-push.`;
+    console.error(`[audit] ${soNumber}: ❌ ${m}`);
+    await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'audit', status: 'desync', side: 'deposco', message: m,
+      detail: { customerOrderId: audit.orderId, unlinked: audit.unlinked, itemsCreated: audit.created },
+      dedupeKey: dailyDedupe('co-audit', soNumber, detail) });
+  } catch (err) {
+    console.warn(`[audit] ${soNumber}: read-back audit failed (push itself succeeded): ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -400,9 +484,14 @@ interface BcSalesOrderLine {
   id: string;
   sequence: number; // == Sales_Order_Line.Line_No == Deposco externalLineNumber
   lineObjectNumber: string;
+  lineType?: string;        // 'Item' | 'Account' | 'Comment' | …
   quantity: number;
   shippedQuantity: number; // cumulative posted shipments (read-only)
   invoicedQuantity?: number;
+  // STAGED (writable) quantities — what the next post will act on, as opposed to the
+  // cumulative posted totals above. Read so we can skip lines already staged at zero.
+  shipQuantity?: number;
+  invoiceQuantity?: number;
 }
 
 async function getSalesOrderByNumber(base: string, token: string, companyId: string, soNumber: string): Promise<BcSalesOrder | null> {
@@ -453,7 +542,15 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
   }
 
   // Aggregate Deposco shipped qty by BC Line_No (externalLineNumber == Line_No).
-  const coLines = await fetchShippedFromFulfillment(deposcoCfg, dToken, orderId);
+  const { lines: coLines, truncatedOrders } = await fetchShippedFromFulfillment(deposcoCfg, dToken, orderId);
+  // Deposco caps a nested line collection at 10 rows with no reachable page 2, so on a big order
+  // some shipped lines are simply invisible to us and will NEVER post. Post what we can see, but
+  // say so — otherwise BC is quietly left short and the next tick sees delta=0 and agrees.
+  if (truncatedOrders.length > 0) {
+    const m = `Deposco truncated the line list on fulfillment order(s) ${truncatedOrders.join(', ')} — shipped lines beyond the first page are unreadable and will NOT post to BC. Post the remainder manually.`;
+    console.error(`[pull] ${soNumber}: ❌ ${m}`);
+    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'desync', side: 'deposco', message: m, dedupeKey: dailyDedupe('co-pull-trunc', soNumber, truncatedOrders.join(',')) });
+  }
   const shippedByLineNo = new Map<number, { item: string; qty: number }>();
   let unparseable = 0;
   for (const l of coLines) {
@@ -527,6 +624,40 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     console.log(`  PATCHed ${soNumber} ${line.label}: pending shipQty=${r['shipQuantity']} invoiceQty=${r['invoiceQuantity']}`);
   }
 
+  // Zeroing only the toShip lines does NOT make this a ship-only post: shipAndInvoice posts the
+  // WHOLE document, and BC stages every line at the full Quantity when an order is released. So
+  // any line we don't touch stays queued to INVOICE — including charge lines Deposco never
+  // fulfils. DISO211236 died on exactly that: its untouched `L14000 Account/44105 @DROPSHIP` was
+  // still Qty. to Invoice 1, so the post tried to raise a real invoice, which fired the
+  // salesperson-commission logic in PK_BC_customization and came back
+  //   HTTP 400 "the current permissions prevented the action.
+  //             (TableData 50026 SalesPerson Commission Insert: PK_BC_customization)"
+  // — the S2S identity cannot insert commission rows, and since it is one transaction the
+  // shipment rolled back with it. Orders whose lines are all WMS items (DISO211250, DISO211281)
+  // had nothing left to invoice and posted fine, which is why this looked intermittent.
+  //
+  // Zeroing is transient, not destructive: BC recalculates Qty. to Invoice back to the full
+  // quantity once the shipment posts (verified on DISO211236 L14000 and DISO211250 L1000, both
+  // back to invQty = quantity, invoiced = 0), so finance's invoicing flow is untouched and no
+  // charge line is left stranded. Nothing financial is posted here either way.
+  // The zeroing is only for the duration of the post — the staged values are captured here and
+  // put back afterwards (see `restoreStaged` below). BC re-derives Qty. to Invoice for lines it
+  // actually shipped, but a line we zeroed does NOT ship, so its recalc is 0 - 0 = 0 and it would
+  // stay flat forever. That matters for freight/decoration charge lines: left at zero they'd drop
+  // out of whatever invoices them later. So: zero → post → restore.
+  const shipping = new Set(toShip.map((l) => l.lineId));
+  const restoreStaged: Array<{ id: string; label: string; shipQuantity: number; invoiceQuantity: number }> = [];
+  for (const l of bcLines) {
+    if (shipping.has(l.id)) continue;
+    const stagedShip = l.shipQuantity ?? 0;
+    const stagedInvoice = l.invoiceQuantity ?? 0;
+    if (stagedShip === 0 && stagedInvoice === 0) continue;
+    bcToken = await getBcToken(bcCfg);
+    await patchSalesLine(base, bcToken, companyId, l.id, { shipQuantity: 0, invoiceQuantity: 0 });
+    restoreStaged.push({ id: l.id, label: `line${l.sequence}/${l.lineType ?? '?'}/${l.lineObjectNumber}`, shipQuantity: stagedShip, invoiceQuantity: stagedInvoice });
+    console.log(`  zeroed ${soNumber} line${l.sequence}/${l.lineType ?? '?'}/${l.lineObjectNumber}: was shipQty=${stagedShip} invoiceQty=${stagedInvoice} — will restore after the post`);
+  }
+
   console.log(`[pull] ${soNumber}: POST shipAndInvoice...`);
   bcToken = await getBcToken(bcCfg);
   await postShipAndInvoice(base, bcToken, companyId, so.id);
@@ -541,6 +672,32 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     if (!a) { console.log(`  ${line.label}: line not found in post-state`); continue; }
     const inv = a.invoicedQuantity ?? 0;
     console.log(`  ${line.label}: shipped=${a.shippedQuantity} invoiced=${inv}${inv > 0 ? ' ⚠ INVOICED' : ''} (posted +${line.quantity})`);
+  }
+  // The loop above only inspects the lines we shipped, so an invoice raised on a line we did NOT
+  // ship — the exact failure mode the zeroing above prevents — would go unnoticed. Check the
+  // whole document, and log it as a desync so it surfaces in /logs rather than only on stdout.
+  const strayInvoiced = after.filter((a) => !shipping.has(a.id) && (a.invoicedQuantity ?? 0) > 0);
+  if (strayInvoiced.length > 0) {
+    const detail = strayInvoiced.map((a) => `line${a.sequence}/${a.lineType ?? '?'}/${a.lineObjectNumber}=${a.invoicedQuantity}`).join(', ');
+    const msg = `⚠ invoiced ${strayInvoiced.length} line(s) we did not ship: ${detail} — expected ship-only`;
+    console.warn(`[pull] ${soNumber}: ${msg}`);
+    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'desync', side: 'bc', message: msg, dedupeKey: dailyDedupe('co-invoiced', soNumber, msg) });
+  }
+  // Put the staged quantities back on the lines we zeroed, so a freight/charge line is left
+  // exactly as we found it and stays billable. NEVER fatal: the shipment has already posted, so a
+  // failure here must not make the caller think the post failed — it logs a desync naming the
+  // lines instead, which is recoverable by hand ("Auto Fill Qty. to Invoice") and visible in /logs.
+  for (const r of restoreStaged) {
+    try {
+      bcToken = await getBcToken(bcCfg);
+      await patchSalesLine(base, bcToken, companyId, r.id, { shipQuantity: r.shipQuantity, invoiceQuantity: r.invoiceQuantity });
+      console.log(`  restored ${soNumber} ${r.label}: shipQty=${r.shipQuantity} invoiceQty=${r.invoiceQuantity}`);
+    } catch (err) {
+      const e = err as AxiosError;
+      const msg = `left ${r.label} staged at zero — restore failed HTTP ${e.response?.status ?? '?'} (needs Qty. to Invoice refilled before it can be billed)`;
+      console.error(`[pull] ${soNumber}: ⚠ ${msg}`);
+      await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'desync', side: 'bc', message: msg, dedupeKey: dailyDedupe('co-restore', soNumber, msg) });
+    }
   }
   console.log(`[pull] ${soNumber}: ✓ shipment posted (ship-only, ref=${ref})`);
 
@@ -701,8 +858,11 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
 
   for (const prefix of PREFIXES) {
     let sos: BcRow[];
+    // Per-prefix cursor: the prefixes advance independently, so a quiet PKSO can't drag the
+    // busy WSOD watermark backwards (or vice versa).
+    const since = CURSOR_ENABLED ? await readCursor('co', prefix) : null;
     try {
-      sos = await listRecentSos(odata, bcToken, prefix, PER_PREFIX);
+      sos = await listChangedSos(odata, bcToken, prefix, PER_PREFIX, since);
     } catch (err) {
       const e = err as AxiosError;
       console.error(`[tick] ${prefix}: list FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
@@ -710,10 +870,17 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     }
     console.log(`[tick] ${prefix}: ${sos.length} SO(s): ${sos.map((s) => pick(s, 'No')).join(', ') || '(none)'}`);
 
+    // Cursor watermark. Rows are ASC by SystemModifiedAt, so we advance only across an unbroken
+    // run of successes and STOP at the first failure — a failed order must stay in scope for the
+    // next tick. Advancing past it would recreate the exact bug we're fixing: an order silently
+    // dropped forever because nothing remembers it needs work.
+    let watermark: string | null = null;
+    let held = false;
     for (const header of sos) {
       const soNumber = pick(header, 'No');
+      let failedHere = false;
       try {
-        const r = await pushSo(bcCfg, deposcoCfg, header);
+        const r = await pushSo(bcCfg, deposcoCfg, header, runId);
         if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'ok', message: 'pushed to Deposco' }); }
         else { skip++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'skip', message: 'already in Deposco / no WMS lines', dedupeKey: dailyDedupe('co-skip', soNumber, 'skip') }); }
       } catch (err) {
@@ -723,6 +890,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
         console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
         fail++;
+        failedHere = true;
         const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
         await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', soNumber, msg) });
       }
@@ -742,8 +910,20 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
           pullFail++;
           const msg = `shipment pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
           await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-pull', soNumber, msg) });
+          failedHere = true;
         }
       }
+      // Only carry the watermark forward while nothing has failed. Once one order fails we stop
+      // advancing for this prefix, so it (and everything after it) is still in scope next tick.
+      if (failedHere) held = true;
+      else if (!held) watermark = pick(header, 'SystemModifiedAt') || watermark;
+    }
+
+    if (CURSOR_ENABLED && watermark) {
+      await writeCursor('co', prefix, watermark);
+      console.log(`[tick] ${prefix}: cursor → ${watermark}${held ? ' (held at first failure — the rest re-run next tick)' : ''}`);
+    } else if (held) {
+      console.warn(`[tick] ${prefix}: cursor NOT advanced — the first order in this batch failed; it will be retried next tick`);
     }
   }
 

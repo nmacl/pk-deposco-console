@@ -19,6 +19,22 @@ export type PostResult = 'ok' | 'skip';
 // CO's shipped-qty come from the same endpoints regardless of whether the source was a
 // real PO/SO or a transfer pushed as one. Only the BC write-back differs per doc type.
 
+/**
+ * Deposco returns nested collections as { data, links, complete, pages } and caps `data` at TEN
+ * rows. There is NO way to reach rows 11+: the `links` array comes back empty, the sub-resource
+ * path (…/{id}/coLines) 404s, and every pagination param we tried (page / offset / start / size /
+ * limit / pageSize / maxResults / count) is SILENTLY IGNORED — the same response comes back every
+ * time. Worse, page 1 is an arbitrary subset, not the first 10 by line number (SO320 returned
+ * lines 110000,100000,…,120000,30000 and withheld 10000/20000).
+ *
+ * So for any order over 10 lines we cannot see the whole thing, and anything that reads a nested
+ * collection must say so rather than treat 10-of-24 as the full picture. `complete === false`
+ * (or pages > 1) is the flag. Callers post what they CAN see and log a desync naming the order,
+ * so a partially-posted shipment is visible instead of silently permanent.
+ */
+const nestedTruncated = (c: { complete?: boolean | null; pages?: number | null } | undefined): boolean =>
+  c?.complete === false || (c?.pages ?? 1) > 1;
+
 /** Look up a Deposco order id. endpoint = '/orders/purchaseOrders' (params {number}) or
  *  '/orders/customerOrders' (params {externalOrderNumber}). */
 interface DsOrderRef { self?: { id?: number }; number?: string; status?: string; orderStatus?: string }
@@ -31,6 +47,7 @@ export async function lookupDeposcoOrderId(
   token: string,
   endpoint: string,
   params: Record<string, unknown>,
+  opts: { liveOnly?: boolean } = {},
 ): Promise<number | null> {
   const body = await authReq<{ data?: DsOrderRef[] }>('get', `${cfg.apiBase}${endpoint}`, token, { params });
   const rows = body.data ?? [];
@@ -46,6 +63,15 @@ export async function lookupDeposcoOrderId(
   // push's existence check still reports "exists" and cannot start recreating in a loop; a
   // cancelled order legitimately has nothing to ship, so the pull correctly does nothing.
   const live = rows.filter((r) => !isCancelled(r));
+  // liveOnly is for the PUSH existence check: "is there an order worth not duplicating?".
+  // Without it, an order whose every copy has been cancelled reports as still present, so the
+  // push skips forever and the order can NEVER be re-created — which is exactly the remediation
+  // path for a bad push (cancel in Deposco, let the connector send a clean one). Seen on
+  // DISO210970, whose CO landed with unlinked item lines and could not be replaced.
+  if (opts.liveOnly && live.length === 0) {
+    if (rows.length > 0) console.log(`[lookup] ${endpoint} ${JSON.stringify(params)}: ${rows.length} copy/copies, ALL cancelled — treating as absent so a fresh one can be pushed`);
+    return null;
+  }
   const chosen = live.length > 0 ? live[live.length - 1] : rows[0];
   if (rows.length > 1) {
     console.log(`[lookup] ${endpoint} ${JSON.stringify(params)}: ${rows.length} copies (${rows.length - live.length} cancelled) — using id=${chosen.self?.id} ${JSON.stringify(chosen.status ?? chosen.orderStatus ?? null)}`);
@@ -85,18 +111,25 @@ export async function fetchDeposcoReceipts(cfg: DeposcoConfig, token: string, or
  * when the line shows received qty (mirrors shipped qty living on the child SO, not the CO
  * rollup). Returns { line, quantity } pairs.
  */
-export async function fetchReceivedFromPurchaseOrder(cfg: DeposcoConfig, token: string, poId: number): Promise<Array<{ line: number; quantity: number; itemNumber: string | null }>> {
-  const d = await authReq<{
-    purchaseOrder?: { orderLines?: { data?: Array<{ lineNumber?: string; receivedPackQuantity?: number; item?: { businessKey?: { number?: string } } }> } };
-    orderLines?: { data?: Array<{ lineNumber?: string; receivedPackQuantity?: number; item?: { businessKey?: { number?: string } } }> };
-  }>('get', `${cfg.apiBase}/orders/purchaseOrders/${poId}`, token);
+export interface ReceivedResult {
+  lines: Array<{ line: number; quantity: number; itemNumber: string | null }>;
+  /** True when Deposco withheld some order lines (see nestedTruncated) — the caller must not
+   *  treat what it got as the whole order. */
+  truncated: boolean;
+}
+
+export async function fetchReceivedFromPurchaseOrder(cfg: DeposcoConfig, token: string, poId: number): Promise<ReceivedResult> {
+  interface PoLine { lineNumber?: string; receivedPackQuantity?: number; item?: { businessKey?: { number?: string } } }
+  interface PoLines { data?: PoLine[]; complete?: boolean | null; pages?: number | null }
+  const d = await authReq<{ purchaseOrder?: { orderLines?: PoLines }; orderLines?: PoLines }>(
+    'get', `${cfg.apiBase}/orders/purchaseOrders/${poId}`, token);
   const po = d.purchaseOrder ?? d;
-  const out: Array<{ line: number; quantity: number; itemNumber: string | null }> = [];
+  const lines: ReceivedResult['lines'] = [];
   for (const l of po.orderLines?.data ?? []) {
     const line = parseInt((l.lineNumber ?? '').split('-').pop() ?? '', 10);
-    if (Number.isFinite(line)) out.push({ line, quantity: l.receivedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
+    if (Number.isFinite(line)) lines.push({ line, quantity: l.receivedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
   }
-  return out;
+  return { lines, truncated: nestedTruncated(po.orderLines) };
 }
 
 export interface DeposcoCoLineShip { externalLineNumber?: string; shippedQuantity?: number; itemNumber?: string | null }
@@ -111,21 +144,105 @@ interface SalesOrderLine { customerLineNumber?: string; shippedPackQuantity?: nu
  * (== the CO externalLineNumber == BC Line_No). Returns the same shape as
  * fetchCustomerOrderShipped so it's a drop-in for the ship pull.
  */
-export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: string, customerOrderId: number): Promise<DeposcoCoLineShip[]> {
+export interface ShippedResult {
+  lines: DeposcoCoLineShip[];
+  /** Fulfillment orders whose line list Deposco truncated (see nestedTruncated). Non-empty means
+   *  some shipped lines are UNREADABLE, so posting only what we saw under-ships BC. */
+  truncatedOrders: string[];
+}
+
+export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: string, customerOrderId: number): Promise<ShippedResult> {
+  interface SoLines { data?: SalesOrderLine[]; complete?: boolean | null; pages?: number | null }
   const co = (await authReq<{ customerOrder?: { fulfillmentOrders?: Array<{ id: number }> } }>('get',
     `${cfg.apiBase}/orders/customerOrders/${customerOrderId}`, token)).customerOrder;
-  const out: DeposcoCoLineShip[] = [];
+  const lines: DeposcoCoLineShip[] = [];
+  const truncatedOrders: string[] = [];
   for (const fo of co?.fulfillmentOrders ?? []) {
     // NOTE: the salesOrder detail comes back at the response ROOT, not wrapped in `salesOrder`
     // (unlike customerOrders/purchaseOrders) — handle both.
-    const resp = await authReq<{ salesOrder?: { orderLines?: { data?: SalesOrderLine[] } }; orderLines?: { data?: SalesOrderLine[] } }>('get',
+    const resp = await authReq<{ salesOrder?: { number?: string; orderLines?: SoLines }; number?: string; orderLines?: SoLines }>('get',
       `${cfg.apiBase}/orders/salesOrders/${fo.id}`, token);
     const so = resp.salesOrder ?? resp;
     for (const l of so?.orderLines?.data ?? []) {
-      out.push({ externalLineNumber: l.customerLineNumber, shippedQuantity: l.shippedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
+      lines.push({ externalLineNumber: l.customerLineNumber, shippedQuantity: l.shippedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
+    }
+    if (nestedTruncated(so?.orderLines)) {
+      const label = so?.number ?? `id ${fo.id}`;
+      truncatedOrders.push(label);
+      console.warn(`[deposco] fulfillment ${label}: Deposco returned only ${so?.orderLines?.data?.length ?? 0} of ${so?.orderLines?.pages ?? '?'} page(s) of order lines — the rest are UNREADABLE via the API`);
     }
   }
-  return out;
+  return { lines, truncatedOrders };
+}
+
+/**
+ * Post-push audit of a customerOrder.
+ *
+ * `POST /orders/customerOrders` does NOT reject an unknown item the way the PO endpoint does —
+ * there is no 404 "Item with business key number = [X]", so the lazy-create in postDeposcoOrder
+ * never fires. Instead Deposco returns 201 and quietly writes the line with `item: {id: null,
+ * businessKey: null}` and `packQuantity: null`. The order then sits in Review, unpickable, while
+ * our log says "pushed to Deposco / ok".
+ *
+ * Seen live on DISO210970: lines 13000 (ME0EK01S-IRON-MD) and 17000 (ME0EK01S-IRON-3XL) landed
+ * unlinked because those two items were absent from Deposco — their UPCs had been bound to the
+ * retired "OLD Iron" (…-IRN-…) items by the go-live catalog load, so the creates 400'd on
+ * "UPC … exists for item …" and nobody saw it.
+ *
+ * So: read the order back, find lines whose item did not resolve, and lazy-create those items so
+ * the NEXT push is clean. The order already written cannot be repaired — Deposco has no PATCH on
+ * a customerOrder (405) and no coLines sub-resource (404) — so the caller must surface this as a
+ * desync for a human to cancel + re-push.
+ *
+ * `intended` maps externalLineNumber -> the item number we asked for, which is the only way to
+ * know what an unlinked line was SUPPOSED to be (Deposco keeps no record of the rejected value).
+ */
+export interface PushAudit {
+  orderId: number;
+  checked: number;
+  truncated: boolean;
+  unlinked: Array<{ externalLineNumber: string; itemNumber: string; quantity: number }>;
+  created: string[];
+}
+
+export async function auditPushedCustomerOrder(
+  bcCfg: SyncBcConfig,
+  deposcoCfg: DeposcoConfig,
+  token: string,
+  externalOrderNumber: string,
+  intended: Map<string, string>,
+): Promise<PushAudit | null> {
+  interface CoLine { externalLineNumber?: string; orderQuantity?: number; item?: { businessKey?: { number?: string } | null } | null }
+  interface CoLines { data?: CoLine[]; complete?: boolean | null; pages?: number | null }
+  // The push returns 202 Accepted, NOT 201 — Deposco creates the customerOrder ASYNCHRONOUSLY,
+  // so an immediate read-back races it and finds nothing (verified on DISO211157: the POST
+  // returned 202, the lookup came back empty, and CO407 existed moments later). Poll briefly
+  // rather than reporting a healthy order as unverifiable.
+  let id: number | null = null;
+  for (let attempt = 1; attempt <= AUDIT_LOOKUP_ATTEMPTS; attempt++) {
+    id = await lookupDeposcoOrderId(deposcoCfg, token, '/orders/customerOrders', { externalOrderNumber }, { liveOnly: true });
+    if (id !== null) break;
+    if (attempt < AUDIT_LOOKUP_ATTEMPTS) await new Promise((r) => setTimeout(r, AUDIT_LOOKUP_DELAY_MS));
+  }
+  if (id === null) {
+    console.warn(`[audit] ${externalOrderNumber}: order not visible in Deposco after ${AUDIT_LOOKUP_ATTEMPTS} attempts — cannot verify the push landed cleanly`);
+    return null;
+  }
+  const resp = await authReq<{ customerOrder?: { coLines?: CoLines } }>('get', `${deposcoCfg.apiBase}/orders/customerOrders/${id}`, token);
+  const coLines = resp.customerOrder?.coLines;
+  const rows = coLines?.data ?? [];
+  const unlinked: PushAudit['unlinked'] = [];
+  for (const l of rows) {
+    if (l.item?.businessKey?.number) continue;
+    const ext = String(l.externalLineNumber ?? '');
+    unlinked.push({ externalLineNumber: ext, itemNumber: intended.get(ext) ?? '(unknown)', quantity: l.orderQuantity ?? 0 });
+  }
+  // Create what's missing so the re-push succeeds. Deduped: several lines can want one item.
+  const created: string[] = [];
+  for (const n of new Set(unlinked.map((u) => u.itemNumber).filter((n) => n && n !== '(unknown)'))) {
+    if (await createMissingItem(bcCfg, deposcoCfg, n)) created.push(n);
+  }
+  return { orderId: id, checked: rows.length, truncated: nestedTruncated(coLines), unlinked, created };
 }
 
 export interface DeposcoTrackingLine {
@@ -283,6 +400,11 @@ function trimOversizeField(payload: unknown, msg: string): { path: string; limit
   target.obj[target.key] = val.slice(0, limit).trim();
   return { path: m[1], limit, from: val.length };
 }
+
+// Deposco accepts a customerOrder with 202 and materializes it asynchronously, so the read-back
+// audit has to wait for it to appear. ~8s of headroom in total.
+const AUDIT_LOOKUP_ATTEMPTS = parseInt(process.env.DEPOSCO_AUDIT_ATTEMPTS ?? '5', 10);
+const AUDIT_LOOKUP_DELAY_MS = parseInt(process.env.DEPOSCO_AUDIT_DELAY_MS ?? '2000', 10);
 
 const MAX_ROUNDS = 6;
 // Known-good orderSource to fall back to if Deposco rejects a programme code.

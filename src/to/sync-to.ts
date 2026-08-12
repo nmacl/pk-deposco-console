@@ -34,7 +34,14 @@ import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIX = process.env.TO_PREFIX ?? 'TRFO';
-const PER_TICK = parseInt(process.env.TO_PER_TICK ?? '25', 10);
+// Cover the WHOLE open backlog, not a newest-N slice. 53 Released transfers against $top=25 left
+// 28 invisible to every tick, permanently. Widening is safe HERE because a transfer leaves the
+// Transfer Header table once fully posted, so this list self-drains — unlike sales orders, where
+// Released is permanent and the equivalent set is 1,278.
+const PER_TICK = parseInt(process.env.TO_PER_TICK ?? '250', 10);
+// BC transfer posting is a heavyweight operation (item ledger + reservation entries) and blows
+// past the 30s default on larger orders — seen live as ECONNABORTED on TRFO001688.
+const POST_TIMEOUT_MS = parseInt(process.env.TO_POST_TIMEOUT_MS ?? '180000', 10);
 const PUSH_ENABLED = (process.env.TO_PUSH_ENABLED ?? 'false').toLowerCase() === 'true';
 const POST_ENABLED = (process.env.TO_POST_ENABLED ?? 'false').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
@@ -77,8 +84,16 @@ function adaptTransferHeader(h: BmiTransferHeader): BcRow {
 async function listRecentTransferOrders(cfg: SyncBcConfig, companyId: string, token: string): Promise<BcRow[]> {
   // Open transfer orders can still be edited. Only Released transfers are ready for WMS export.
   const filter = encodeURIComponent(`startswith(no,'${odataStr(PREFIX)}') and status eq 'Released'`);
-  const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders?$filter=${filter}&$orderby=postingDate desc&$top=${PER_TICK}`;
+  // Order by document NUMBER, not postingDate. postingDate is a business date the user can set
+  // to anything — a backdated transfer sorts into the middle of the list and is invisible from
+  // the moment it's created, no matter how new it is (TRFO001666 ranked 49th of 53 on day one).
+  // `no` is sequential and monotonic with creation, so ascending = oldest-outstanding first:
+  // if the cap is ever hit, the most overdue work goes first instead of being starved forever.
+  const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders?$filter=${filter}&$orderby=no asc&$top=${PER_TICK}`;
   const rows = (await authReq<{ value: BmiTransferHeader[] }>('get', url, token)).value ?? [];
+  // A full page means there may be more we never looked at. Silent truncation is what made this
+  // a year-long invisible bug; say it out loud.
+  if (rows.length >= PER_TICK) console.warn(`[tick] ⚠ hit the ${PER_TICK}-order cap — there may be Released transfers this tick never saw. Raise TO_PER_TICK.`);
   return rows.map(adaptTransferHeader);
 }
 
@@ -297,7 +312,16 @@ async function bmiPost(cfg: SyncBcConfig, companyId: string, no: string, action:
   const order = (await authReq<{ value: Array<{ systemId: string }> }>('get',
     `${bmi}/bmiTransferOrders?$filter=${encodeURIComponent(`no eq '${odataStr(no)}'`)}`, token)).value?.[0];
   if (!order) { console.warn(`[pull] ${no}: not on bmiTransferOrders page — cannot ${action}`); return; }
-  const doc = await authReq<string>('post', `${bmi}/bmiTransferOrders(${order.systemId})/Microsoft.NAV.${action}`, token, { data: {} });
+  // Posting a transfer in BC writes item ledger + reservation entries; on a many-line order it
+  // routinely runs past the 30s default and came back ECONNABORTED, so the post was never
+  // confirmed even when BC completed it. Give it room.
+  //
+  // Deliberately NOT retried on timeout: a POST that timed out may well have posted, and firing
+  // it again would double-ship. It's safe to just let it go — the next tick recomputes
+  // delta = deposcoQty − bcPostedQty, so a post that did land shows up as delta 0 and a post
+  // that didn't gets retried from scratch. The loop is self-correcting; a blind retry is not.
+  const doc = await authReq<string>('post', `${bmi}/bmiTransferOrders(${order.systemId})/Microsoft.NAV.${action}`, token,
+    { data: {}, timeout: POST_TIMEOUT_MS });
   const posted = typeof doc === 'object' && doc && 'value' in (doc as Record<string, unknown>) ? (doc as { value: unknown }).value : doc;
   console.log(`[pull] ${no}: ✅ ${action} → BC doc ${JSON.stringify(posted)}`);
 }
@@ -340,7 +364,9 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
     const poId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/purchaseOrders', { number: no });
     if (poId === null) { console.log(`[pull] ${no}: not in Deposco (purchaseOrder) yet — skip receive`); return; }
     const recv = new Map<number, number>();
-    for (const r of await fetchReceivedFromPurchaseOrder(deposcoCfg, dToken, poId)) recv.set(r.line, (recv.get(r.line) ?? 0) + r.quantity);
+    const received = await fetchReceivedFromPurchaseOrder(deposcoCfg, dToken, poId);
+    if (received.truncated) console.error(`[pull] ${no}: ❌ Deposco truncated the PO line list (>10 lines) — received qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
+    for (const r of received.lines) recv.set(r.line, (recv.get(r.line) ?? 0) + r.quantity);
     console.log(`[pull] ${no}: RECEIVE — Deposco received ${[...recv].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}`);
     // Origin doesn't post its own shipment, so post it (→ in transit) then receive — both to the received qty.
     await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', recv, direct);
@@ -349,7 +375,9 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
     const coId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/customerOrders', { externalOrderNumber: no });
     if (coId === null) { console.log(`[pull] ${no}: not in Deposco (customerOrder) yet — skip ship`); return; }
     const shipped = new Map<number, number>();
-    for (const l of await fetchShippedFromFulfillment(deposcoCfg, dToken, coId)) {
+    const ship = await fetchShippedFromFulfillment(deposcoCfg, dToken, coId);
+    if (ship.truncatedOrders.length > 0) console.error(`[pull] ${no}: ❌ Deposco truncated the line list on ${ship.truncatedOrders.join(', ')} (>10 lines) — shipped qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
+    for (const l of ship.lines) {
       const ln = parseInt(l.externalLineNumber ?? '', 10);
       if (Number.isFinite(ln)) shipped.set(ln, (shipped.get(ln) ?? 0) + Number(l.shippedQuantity ?? 0));
     }
