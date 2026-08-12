@@ -671,7 +671,31 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
 
   console.log(`[pull] ${soNumber}: POST bmiSalesOrders/postShipment (ship-only)...`);
   bcToken = await getBcToken(bcCfg);
-  await postShipmentOnly(bcCfg, bcToken, companyId, soNumber);
+  try {
+    await postShipmentOnly(bcCfg, bcToken, companyId, soNumber);
+  } catch (err) {
+    // A thrown post does NOT mean nothing was posted. BC commits the shipment inside Sales-Post
+    // and can then fail on the way out — observed three times live, where the shipment (SLSS846339,
+    // SLSS846354, SLSS846360) existed with shipped qty correct while the call returned
+    //   HTTP 403 (TableData 50008 ESalesHeader Modify: PK_BC_customization)
+    // Treating that as failure is actively harmful: the caller reports a desync for work that
+    // succeeded, and /logs fills with red that hides the failures that ARE real.
+    //
+    // So ask BC what actually happened rather than trusting the exception. A new posted shipment
+    // means the work landed — carry on and let the tracking write-back run against it. No new
+    // shipment means the post genuinely failed, and the error is rethrown untouched.
+    const e = err as AxiosError;
+    bcToken = await getBcToken(bcCfg);
+    const afterErr = await shipmentNosForOrder(bcCfg, bcToken, companyId, soNumber);
+    const madeIt = [...afterErr].filter((n) => !shipmentsBefore.has(n));
+    if (madeIt.length === 0) throw err;
+    const msg = `post returned HTTP ${e.response?.status ?? '?'} but BC posted ${madeIt.join(',')} anyway — treating as posted`;
+    console.warn(`[pull] ${soNumber}: ⚠ ${msg}`);
+    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber,
+                     action: 'pull', status: 'desync', side: 'bc', message: msg,
+                     detail: JSON.stringify(e.response?.data ?? e.message).slice(0, 2000),
+                     dedupeKey: dailyDedupe('co-post-threw', soNumber, msg) });
+  }
 
   // Verify BC advanced; warn loudly if we accidentally invoiced (would be a bug).
   bcToken = await getBcToken(bcCfg);
