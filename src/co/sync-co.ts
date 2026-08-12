@@ -49,10 +49,13 @@ const INTERVAL_MS = parseInt(process.env.SO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIXES = (process.env.SO_PREFIXES ?? 'PKSO,WSOD,HDSO,DISO').split(',').map((p) => p.trim()).filter(Boolean);
 const PER_PREFIX = parseInt(process.env.SO_PER_PREFIX ?? '25', 10);
 const PULL_ENABLED = (process.env.SO_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
-// SystemModifiedAt high-water mark per prefix (sync_cursors), replacing the newest-25 window that
-// left 1,278 of 1,408 open orders permanently unreachable. Set SO_CURSOR_ENABLED=false to fall
-// back to the old newest-N behaviour if the cursor ever misbehaves in production.
+// Numeric rotating scan (see listOrdersToSync), replacing the newest-25-by-Order_Date window that
+// left 1,278 of 1,408 open orders permanently unreachable. The rotation position per prefix is a
+// document NUMBER held in sync_cursors. SO_CURSOR_ENABLED=false pins it to the HEAD pass only
+// (newest by number), which is still numeric — there is no date-ordered path left to fall back to.
 const CURSOR_ENABLED = (process.env.SO_CURSOR_ENABLED ?? 'true').toLowerCase() === 'true';
+// Newest-by-number orders re-read every tick so a brand-new order doesn't wait for the rotation.
+const SCAN_HEAD = parseInt(process.env.SO_SCAN_HEAD ?? '25', 10);
 // Tracking write-back onto the posted sales shipment. Needs the AL extension (>= v2.4.0.0,
 // page bmiShipmentTrackings) published to the target BC environment.
 const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
@@ -77,52 +80,60 @@ const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WESTERLY').split
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * The candidate list is a CURSOR, not a newest-N window.
+ * Candidate selection is NUMERIC — never by date. NOTHING that picks work out of BC may sort or
+ * filter on a date field.
  *
- * The old query took the newest 25 by Order_Date. That starved catastrophically: 1,408 Released
- * sales orders exist and the tick could only ever see 100 of them (25 x 4 prefixes). Worse,
- * Order_Date is a business date, so a backdated order sorts into the middle of the list and is
- * invisible from the moment it's created — it never enters the window no matter how long you wait.
+ * Dates on a BC document are business values: a user can set Order_Date/Posting_Date to whatever
+ * the paperwork says, and the integrations backdate them routinely. So an order can be CREATED
+ * already sorted into the middle of a date-ordered list, and a newest-N window will never contain
+ * it — not late, never. That is not hypothetical: on 2026-08-12, 17 DISO orders that Deposco had
+ * shipped Complete sat at BC shipped=0 because they ranked 57th-240th of 399 by Order_Date while
+ * the tick read the newest 25. ~273 units left the warehouse with BC still showing them on hand,
+ * and NOT ONE error was logged, because the code never looked at those orders.
+ * Document numbers are issued sequentially and cannot be edited, so they are the only safe key.
+ * (The inventory worker already does this with `entryNo gt N`, and the PO worker with
+ * `number gt 'WSP…'`; this brings the sales-order worker in line.)
  *
- * Widening the window is not an option here (unlike transfers, which self-drain): 1,278 open
- * orders x ~4 Deposco calls is ~5,100 calls a tick against an account-wide 4/sec ceiling — 21
- * minutes of solid traffic, which would guarantee the 429s we're already fighting.
+ * A plain high-water mark is NOT enough either. An old order can need work again long after
+ * newer ones — DISO210925 was modified today — and `No gt cursor` would skip it forever, which is
+ * the same starvation on a different axis. So this is a ROTATING scan over the open set:
  *
- * So: order by SystemModifiedAt ASC and only look at what changed since the last successful tick,
- * advancing a high-water mark stored in sync_cursors. Steady state is ~10 orders a tick instead
- * of 100, which fixes the starvation AND cuts Deposco load. The first run after deploy drains the
- * backlog at SO_PER_PREFIX per tick, oldest first, so nothing is stranded.
+ *   HEAD    the newest SCAN_HEAD orders by number, every tick, so a brand-new order pushes
+ *           immediately instead of waiting for the rotation to come round to it.
+ *   ROTATE  the next `count` orders above the cursor, ascending. On reaching the end the cursor
+ *           resets and the next lap starts from the bottom, so EVERY open order is visited on a
+ *           fixed cycle regardless of its number or age.
  *
- * `since` empty => no cursor yet (first run): fall back to the newest-N window so a fresh install
- * still does something sensible rather than trying to replay all of history.
+ * `Completely_Shipped eq false` keeps the working set bounded (finished orders drop out of the
+ * rotation on their own), so a lap stays short and the cost per tick stays flat.
  */
-async function listChangedSos(odata: string, token: string, prefix: string, count: number, since: string | null): Promise<BcRow[]> {
-  if (!since) return listRecentSos(odata, token, prefix, count);
-  const filter = encodeURIComponent(
-    `startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false and SystemModifiedAt gt ${since}`);
-  const url = `${odata}/Sales_Order?$filter=${filter}&$orderby=SystemModifiedAt asc&$top=${count}`;
-  const rows = (await bcGet<{ value: BcRow[] }>(url, token)).value ?? [];
-  if (rows.length >= count) console.log(`[tick] ${prefix}: ${rows.length} changed (cap) — backlog still draining, cursor advances each tick`);
-  return rows;
-}
+interface ScanBatch { rows: BcRow[]; nextCursor: string; wrapped: boolean }
 
-/** Newest-N fallback, used only until a cursor exists. */
-async function listRecentSos(odata: string, token: string, prefix: string, count: number): Promise<BcRow[]> {
-  // Only RELEASED orders sync — an Open order is still being edited; we don't push it to the
-  // WMS until it's released. (BC Sales_Order Status is exactly 'Open' | 'Released'.)
-  // Completely_Shipped orders are finished work — they can only ever be re-read as no-ops, and
-  // leaving them in crowds live orders out of the window (824 Released WSOD, 749 still open).
-  const filter = encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`);
-  // NOTE: Order_Date has the same flaw as the transfer worker's postingDate — it's a business
-  // date, so a backdated order sorts into the middle and is never seen. It is NOT changed to
-  // `No desc` yet: with ~1,278 open orders against a 25-cap, ANY fixed ordering starves most of
-  // them. The real fix is a SystemModifiedAt cursor (sync_cursors is already built) — until then
-  // this at least stops finished orders from eating the window, and says when it truncates.
-  const url = `${odata}/Sales_Order?$filter=${filter}&$orderby=Order_Date desc&$top=${count}`;
-  const body = await bcGet<{ value: BcRow[] }>(url, token);
-  const rows = body.value ?? [];
-  if (rows.length >= count) console.warn(`[tick] ${prefix}: ⚠ hit the ${count}-order cap — open orders exist that this tick never saw (starvation). Needs the SystemModifiedAt cursor.`);
-  return rows;
+async function listOrdersToSync(odata: string, token: string, prefix: string, count: number, cursor: string | null): Promise<ScanBatch> {
+  // Only RELEASED orders sync — an Open order is still being edited; we don't push it to the WMS
+  // until it's released. (BC Sales_Order Status is exactly 'Open' | 'Released'.)
+  const open = `startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`;
+  const q = (filter: string, order: string, top: number): string =>
+    `${odata}/Sales_Order?$filter=${encodeURIComponent(filter)}&$orderby=${order}&$top=${top}`;
+
+  const head = (await bcGet<{ value: BcRow[] }>(q(open, 'No desc', SCAN_HEAD), token)).value ?? [];
+
+  const from = cursor ?? '';
+  const rotFilter = from ? `${open} and No gt '${odataStr(from)}'` : open;
+  const rot = (await bcGet<{ value: BcRow[] }>(q(rotFilter, 'No asc', count), token)).value ?? [];
+
+  // A short batch means the end of the set — wrap so the next tick starts a fresh lap.
+  const wrapped = rot.length < count;
+  const nextCursor = wrapped ? '' : pick(rot[rot.length - 1], 'No');
+
+  // HEAD and ROTATE overlap once the rotation reaches the top of the range.
+  const seen = new Set<string>();
+  const rows: BcRow[] = [];
+  for (const r of [...head, ...rot]) {
+    const no = pick(r, 'No');
+    if (no && !seen.has(no)) { seen.add(no); rows.push(r); }
+  }
+  return { rows, nextCursor, wrapped };
 }
 
 async function getSoLines(odata: string, token: string, soNumber: string): Promise<BcRow[]> {
@@ -883,27 +894,20 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
 
   for (const prefix of PREFIXES) {
     let sos: BcRow[];
-    // Per-prefix cursor: the prefixes advance independently, so a quiet PKSO can't drag the
-    // busy WSOD watermark backwards (or vice versa).
-    const since = CURSOR_ENABLED ? await readCursor('co', prefix) : null;
+    let batch: ScanBatch;
+    // Rotation position per prefix, so a quiet PKSO can't drag the busy WSOD lap backwards.
+    const cursor = CURSOR_ENABLED ? await readCursor('co', prefix) : null;
     try {
-      sos = await listChangedSos(odata, bcToken, prefix, PER_PREFIX, since);
+      batch = await listOrdersToSync(odata, bcToken, prefix, PER_PREFIX, cursor);
+      sos = batch.rows;
     } catch (err) {
       const e = err as AxiosError;
       console.error(`[tick] ${prefix}: list FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
       continue;
     }
-    console.log(`[tick] ${prefix}: ${sos.length} SO(s): ${sos.map((s) => pick(s, 'No')).join(', ') || '(none)'}`);
-
-    // Cursor watermark. Rows are ASC by SystemModifiedAt, so we advance only across an unbroken
-    // run of successes and STOP at the first failure — a failed order must stay in scope for the
-    // next tick. Advancing past it would recreate the exact bug we're fixing: an order silently
-    // dropped forever because nothing remembers it needs work.
-    let watermark: string | null = null;
-    let held = false;
+    console.log(`[tick] ${prefix}: ${sos.length} SO(s) [head+rotate from ${cursor || 'start'}]: ${sos.map((s) => pick(s, 'No')).join(', ') || '(none)'}`);
     for (const header of sos) {
       const soNumber = pick(header, 'No');
-      let failedHere = false;
       try {
         const r = await pushSo(bcCfg, deposcoCfg, header, runId);
         if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'ok', message: 'pushed to Deposco' }); }
@@ -915,7 +919,6 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
         console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
         fail++;
-        failedHere = true;
         const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
         await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', soNumber, msg) });
       }
@@ -935,20 +938,17 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
           pullFail++;
           const msg = `shipment pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
           await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-pull', soNumber, msg) });
-          failedHere = true;
         }
       }
-      // Only carry the watermark forward while nothing has failed. Once one order fails we stop
-      // advancing for this prefix, so it (and everything after it) is still in scope next tick.
-      if (failedHere) held = true;
-      else if (!held) watermark = pick(header, 'SystemModifiedAt') || watermark;
     }
 
-    if (CURSOR_ENABLED && watermark) {
-      await writeCursor('co', prefix, watermark);
-      console.log(`[tick] ${prefix}: cursor → ${watermark}${held ? ' (held at first failure — the rest re-run next tick)' : ''}`);
-    } else if (held) {
-      console.warn(`[tick] ${prefix}: cursor NOT advanced — the first order in this batch failed; it will be retried next tick`);
+    // Advance the rotation unconditionally, INCLUDING past failures. With a high-water mark that
+    // would be wrong (a failed order would be skipped forever), but a rotation always comes back
+    // round — so a failed order is retried next lap without stalling every order behind it on one
+    // bad document. The failure itself is already recorded in sync_events.
+    if (CURSOR_ENABLED) {
+      await writeCursor('co', prefix, batch.nextCursor);
+      console.log(`[tick] ${prefix}: rotation → ${batch.wrapped ? 'end of set, next lap starts from the beginning' : `resumes above ${batch.nextCursor}`}`);
     }
   }
 

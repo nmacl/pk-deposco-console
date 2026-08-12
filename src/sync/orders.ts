@@ -406,6 +406,10 @@ function trimOversizeField(payload: unknown, msg: string): { path: string; limit
 const AUDIT_LOOKUP_ATTEMPTS = parseInt(process.env.DEPOSCO_AUDIT_ATTEMPTS ?? '5', 10);
 const AUDIT_LOOKUP_DELAY_MS = parseInt(process.env.DEPOSCO_AUDIT_DELAY_MS ?? '2000', 10);
 
+// 429 retries for the order POST, budgeted separately from MAX_ROUNDS so a rate limit never eats
+// the lazy-create rounds. Matches authReq's DEPOSCO_RATE_LIMIT_ATTEMPTS default.
+const RATE_LIMIT_RETRIES = parseInt(process.env.DEPOSCO_RATE_LIMIT_ATTEMPTS ?? '8', 10);
+
 const MAX_ROUNDS = 6;
 // Known-good orderSource to fall back to if Deposco rejects a programme code.
 const ORDER_SOURCE_FALLBACK = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
@@ -422,6 +426,7 @@ export async function postDeposcoOrder(
   const attempted = new Set<string>();
   let sourceRetried = false;
   let sizeTrims = 0;
+  let rateLimited = 0;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const token = await getDeposcoToken(deposcoCfg);
@@ -440,6 +445,24 @@ export async function postDeposcoOrder(
       // Verbose-always (global): surface method + endpoint + status + body, so a CO/PO push
       // failure never collapses to a bare "Request failed with status code 400".
       const verbose = new Error(`POST ${endpoint} [${logKey}] → HTTP ${status ?? axErr.code ?? '?'}: ${(typeof axErr.response?.data === 'string' ? axErr.response.data : JSON.stringify(axErr.response?.data ?? axErr.message)).slice(0, 600)}`);
+      // Rate limit. This POST goes through raw axios rather than authReq, so it does NOT inherit
+      // authReq's 429 budget — a rate-limited push was simply DROPPED, and Deposco's limit is
+      // account-wide (4/sec) while each worker process throttles independently, so bursts are
+      // routine: TRFO001663/1667 and DISO210961/211101 were all lost inside 21 seconds on
+      // 2026-08-12. A 429 means the request was REJECTED, never processed, so re-sending is
+      // always safe — and it must not consume a lazy-create round, hence the separate budget and
+      // the `round--`.
+      if (status === 429 && rateLimited < RATE_LIMIT_RETRIES) {
+        rateLimited++;
+        const retryAfter = Number(axErr.response?.headers?.['retry-after']);
+        const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
+          ? retryAfter * 1000
+          : Math.min(1000 * 2 ** (rateLimited - 1), 20_000) + Math.floor(Math.random() * 500);
+        console.log(`[push] ${logKey}: Deposco rate limit — retry ${rateLimited}/${RATE_LIMIT_RETRIES} in ${waitMs}ms`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        round--;
+        continue;
+      }
       if (status === 400 && /cannot be updated while in the status of/i.test(msg)) {
         console.log(`[push] ${logKey}: Deposco order in progress, update skipped`);
         return 'skip';
