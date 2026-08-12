@@ -158,18 +158,34 @@ export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: str
   const lines: DeposcoCoLineShip[] = [];
   const truncatedOrders: string[] = [];
   for (const fo of co?.fulfillmentOrders ?? []) {
-    // NOTE: the salesOrder detail comes back at the response ROOT, not wrapped in `salesOrder`
-    // (unlike customerOrders/purchaseOrders) — handle both.
-    const resp = await authReq<{ salesOrder?: { number?: string; orderLines?: SoLines }; number?: string; orderLines?: SoLines }>('get',
-      `${cfg.apiBase}/orders/salesOrders/${fo.id}`, token);
-    const so = resp.salesOrder ?? resp;
-    for (const l of so?.orderLines?.data ?? []) {
+    // Read the lines from the SUB-RESOURCE, not from the order detail's nested `orderLines`.
+    // The nested copy is capped at 10 rows with no reachable page 2 (see nestedTruncated), which
+    // silently under-reports any order over 10 lines: SO320 showed 10 lines / 28 units nested,
+    // but 12 lines / 36 units here — BC would have been short 8 units and nothing would have said
+    // so. The sub-resource returns the whole set (complete=true, pages=1).
+    // NOTE it is `/orderLines` on salesOrders; the equivalent `/coLines` on customerOrders 404s.
+    const page = await authReq<{ data?: SalesOrderLine[]; complete?: boolean | null; pages?: number | null }>(
+      'get', `${cfg.apiBase}/orders/salesOrders/${fo.id}/orderLines`, token);
+    let rows = page.data ?? [];
+    let complete = page.complete !== false;
+
+    // Fall back to the order detail if the sub-resource ever stops answering, so a Deposco-side
+    // change degrades to the old (truncating) behaviour rather than losing the pull entirely.
+    if (rows.length === 0) {
+      const resp = await authReq<{ salesOrder?: { number?: string; orderLines?: SoLines }; number?: string; orderLines?: SoLines }>('get',
+        `${cfg.apiBase}/orders/salesOrders/${fo.id}`, token);
+      const so = resp.salesOrder ?? resp;
+      rows = so?.orderLines?.data ?? [];
+      complete = !nestedTruncated(so?.orderLines);
+    }
+
+    for (const l of rows) {
       lines.push({ externalLineNumber: l.customerLineNumber, shippedQuantity: l.shippedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
     }
-    if (nestedTruncated(so?.orderLines)) {
-      const label = so?.number ?? `id ${fo.id}`;
+    if (!complete) {
+      const label = `SO id ${fo.id}`;
       truncatedOrders.push(label);
-      console.warn(`[deposco] fulfillment ${label}: Deposco returned only ${so?.orderLines?.data?.length ?? 0} of ${so?.orderLines?.pages ?? '?'} page(s) of order lines — the rest are UNREADABLE via the API`);
+      console.warn(`[deposco] fulfillment ${label}: only ${rows.length} line(s) readable and the set is incomplete — the rest are UNREADABLE via the API`);
     }
   }
   return { lines, truncatedOrders };
