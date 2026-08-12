@@ -176,8 +176,43 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
       if (/already been posted/i.test(body)) { console.log(`[pull] #${id}: already posted (idempotent)`); await ev(id, 'skip', { message: 'already posted (idempotent)' }); advance(id); await saveState(state); continue; }
-      console.error(`[pull] #${id} FAILED HTTP ${e.response?.status}: ${body} — DEAD-LETTER, continuing`);
-      await deadLetter({ id, error: body }); failed++; await ev(id, 'fail', { side: 'bc', message: `HTTP ${e.response?.status}`, detail: body }); advance(id); await saveState(state);
+      // TRANSIENT vs PERMANENT. Dead-lettering exists so one unusable record can't block the
+      // queue, but it advances the cursor — which for a TRANSIENT fault silently discards a real
+      // stock movement. Adjustment #57 (25543-BCW-LG +1) was lost exactly that way: BC deadlocked
+      // against a warehouse user mid-post, the record was dead-lettered, and the cursor moved to
+      // #93, so it was never retried and BC is short by 1.
+      //
+      // A deadlock/429/5xx/network fault says nothing about the record — only about the moment.
+      // authReq already retries these in-request; if it has exhausted that, hold the cursor and
+      // stop the batch so the SAME id is reprocessed next tick, and keep doing so until it lands.
+      // The batch stops rather than continues because these are applied in Deposco's order and
+      // the cursor is a single high-water mark — skipping ahead would strand this one again.
+      const status = e.response?.status;
+      const transient = /deadlock/i.test(body) || status === 429 || (status !== undefined && status >= 500) || !e.response;
+
+      // Say WHAT was lost, not just that something failed. authReq throws a plain Error (the
+      // status is already baked into its message), so `e.response?.status` is undefined here and
+      // the old event logged the literal string "HTTP undefined" with the real cause buried in
+      // `detail` — unreadable in /logs and impossible to act on. Name the item, place and
+      // quantity, and say plainly that BC does NOT have this stock movement.
+      const who = `${a.item?.businessKey?.number ?? '?'} @${a.facility?.businessKey?.number ?? '?'} ${a.quantity > 0 ? '+' : ''}${a.quantity}`;
+      const cause = /deadlock/i.test(body) ? 'BC deadlocked against another user posting to the Item Ledger'
+        : status ? `BC HTTP ${status}` : (e as Error).message.slice(0, 160);
+
+      if (transient) {
+        const m = `#${id} ${who} NOT applied to BC — ${cause}. Cursor held; retrying every tick until it posts.`;
+        console.error(`[pull] ⚠ ${m}`);
+        failed++;
+        await ev(id, 'fail', { side: 'bc', message: m, detail: { item: a.item?.businessKey?.number, facility: a.facility?.businessKey?.number, quantity: a.quantity, transient: true, error: body } });
+        await saveState(state);
+        break;
+      }
+      const m = `#${id} ${who} NOT applied to BC — ${cause}. Dead-lettered: this stock movement must be entered in BC by hand, or Deposco and BC stay out of step for this item.`;
+      console.error(`[pull] ❌ ${m}`);
+      await deadLetter({ id, item: a.item?.businessKey?.number, facility: a.facility?.businessKey?.number, quantity: a.quantity, error: body });
+      failed++;
+      await ev(id, 'fail', { side: 'bc', message: m, detail: { item: a.item?.businessKey?.number, facility: a.facility?.businessKey?.number, quantity: a.quantity, transient: false, error: body } });
+      advance(id); await saveState(state);
     }
   }
 

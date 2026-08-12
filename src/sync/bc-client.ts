@@ -76,9 +76,12 @@ export async function authReq<T>(
   // expected; patience is cheaper than a lost order.
   const MAX_ATTEMPTS = 4;
   const MAX_ATTEMPTS_RATE_LIMIT = parseInt(process.env.DEPOSCO_RATE_LIMIT_ATTEMPTS ?? '8', 10);
-  const MAX_ATTEMPTS_DEADLOCK = parseInt(process.env.BC_DEADLOCK_ATTEMPTS ?? '5', 10);
+  // A deadlock can persist as long as the other transaction runs — a warehouse user posting a
+  // large journal is seconds, not milliseconds — so give it a real window rather than 4 attempts
+  // inside 4 seconds. Worst case ~35s, all of it safe: the victim is rolled back every time.
+  const MAX_ATTEMPTS_DEADLOCK = parseInt(process.env.BC_DEADLOCK_ATTEMPTS ?? '8', 10);
   let ax: AxiosError | undefined;
-  for (let attempt = 1; attempt <= Math.max(MAX_ATTEMPTS, MAX_ATTEMPTS_RATE_LIMIT); attempt++) {
+  for (let attempt = 1; attempt <= Math.max(MAX_ATTEMPTS, MAX_ATTEMPTS_RATE_LIMIT, MAX_ATTEMPTS_DEADLOCK); attempt++) {
     try {
       if (isDeposco(url)) await deposcoThrottle();
       const resp = await axios.request<T>({
