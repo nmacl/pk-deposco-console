@@ -696,7 +696,8 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   // One run per tick. Log only NEW pushes (ok) and failures — not the every-tick skips of
   // already-synced orders (that would flood sync_events since most Released orders already exist).
   const runId = await startRun('co', process.env.SYNC_TRIGGER || 'manual');
-  let ok = 0, skip = 0, fail = 0;
+  // pullFail is counted separately from `fail` (pushes) so a run row shows which half broke.
+  let ok = 0, skip = 0, fail = 0, pullFail = 0;
 
   for (const prefix of PREFIXES) {
     let sos: BcRow[];
@@ -729,15 +730,25 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
         try {
           await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
         } catch (err) {
+          // This used to console.error only, which made shipment-pull failures invisible in
+          // /logs — DISO211236 re-staged and re-failed every tick for a day with nothing to see
+          // but a churning External Document No. BC's real complaint (e.g. insufficient
+          // inventory at the ship-from location) is in the response body, so keep the whole
+          // body in `detail` and only truncate the summary line.
           const e = err as AxiosError;
-          console.error(`[pull] ${soNumber} FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
+          const body = JSON.stringify(e.response?.data ?? e.message);
+          const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+          console.error(`[pull] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
+          pullFail++;
+          const msg = `shipment pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
+          await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-pull', soNumber, msg) });
         }
       }
     }
   }
 
-  await finishRun(runId, fail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail });
-  console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} failed`);
+  await finishRun(runId, fail > 0 || pullFail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail, pullFailed: pullFail });
+  console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} push-failed, ${pullFail} pull-failed`);
 }
 
 async function main(): Promise<void> {

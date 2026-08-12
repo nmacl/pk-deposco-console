@@ -360,7 +360,11 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
 }
 
 // ── Single-order sync (the web-UI button backend) + batch tick ──────────────
-interface SyncResult { plan: TransferPlan; push?: PushOutcome; }
+// postError carries a post-back failure out separately from a push failure: they have different
+// causes (push = Deposco rejected us; post = BC rejected us) and lumping both into the tick's
+// generic 'sync' event is what left a bare "404" in /logs with no hint that the OData
+// TransferOrderLines page was the thing missing.
+interface SyncResult { plan: TransferPlan; push?: PushOutcome; postError?: { status?: number; body: string } }
 async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, opts: { push: boolean; post: boolean }): Promise<SyncResult> {
   const no = pick(header, 'No');
   const from = pick(header, 'Transfer_from_Code').toUpperCase();
@@ -372,8 +376,19 @@ async function syncOne(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: 
 
   let push: PushOutcome | undefined;
   if (opts.push) push = await pushTransfer(cfg, deposcoCfg, companyId, header, plan);
-  if (opts.post) await pull(cfg, deposcoCfg, companyId, header, plan, direct);
-  return { plan, push };
+  let postError: SyncResult['postError'];
+  if (opts.post) {
+    try {
+      await pull(cfg, deposcoCfg, companyId, header, plan, direct);
+    } catch (err) {
+      const e = err as AxiosError;
+      const body = JSON.stringify(e.response?.data ?? e.message);
+      const url = e.config?.url ? ` [${e.config.method?.toUpperCase()} ${e.config.url}]` : '';
+      postError = { status: e.response?.status, body: `${body}${url}` };
+      console.error(`[pull] ${no} post-back FAILED HTTP ${e.response?.status}${url}: ${body.slice(0, 500)}`);
+    }
+  }
+  return { plan, push, postError };
 }
 
 
@@ -402,7 +417,12 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
     processed++;
     const no = pick(header, 'No');
     try {
-      const { plan, push } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      const { plan, push, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      if (postError) {
+        failed++;
+        const pmsg = `post-back to BC: HTTP ${postError.status ?? '?'}: ${postError.body.slice(0, 300)}`;
+        await logEvent({ runId, worker: 'to', direction: 'deposco->bc', entityType: 'order', entityId: no, action: 'post', status: 'fail', side: 'bc', message: pmsg, detail: postError.body.slice(0, 4000), dedupeKey: dailyDedupe('to-post', no, pmsg) });
+      }
       if (plan === 'skip') {
         await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: no, action: 'sync', status: 'skip', message: 'not WMS-relevant', dedupeKey: dailyDedupe('to-skip', no, 'skip') });
       } else if (push?.kind === 'notReleased') {
@@ -451,10 +471,13 @@ async function main(): Promise<void> {
     const companyId = await getCompanyId(cfg, token);
     const header = await getTransferOrder(cfg, companyId, token, orderArg);
     if (!header) { console.error(`[to] ${orderArg}: not found`); process.exit(1); }
-    const { push } = await syncOne(cfg, deposcoCfg, companyId, header, { push: !postOnly, post: !pushOnly });
+    const { push, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: !postOnly, post: !pushOnly });
     // Exit 3 when a push was attempted but nothing was pushable, so the console button records it
     // as a desync (warning) instead of a green "ok". (0 / not-found = 1 / real error via throw.)
     if (push?.kind === 'none') { console.warn(`[to] ${orderArg}: nothing pushed — flagged as desync`); process.exit(3); }
+    // pull() no longer throws out of syncOne, so exit non-zero here or the console button would
+    // report a failed post-back as a green "ok".
+    if (postError) { console.error(`[to] ${orderArg}: post-back failed — HTTP ${postError.status ?? '?'}`); process.exit(1); }
     return;
   }
 
