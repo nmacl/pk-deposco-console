@@ -897,7 +897,7 @@ async function writeTrackingBack(
 // Cursor: highest shipment NUMBER processed (sequential, same numeric discipline as everywhere
 // else). RECHECK re-reads the newest few regardless, so a tracking number or extra quantity added
 // to an already-seen shipment is still picked up.
-const SHIPMENT_RECHECK = parseInt(process.env.SO_SHIPMENT_RECHECK ?? '20', 10);
+const SHIPMENT_RECHECK = parseInt(process.env.SO_SHIPMENT_RECHECK ?? '100', 10);
 
 async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, runId: number | null): Promise<void> {
   const dToken = await getDeposcoToken(deposcoCfg);
@@ -906,11 +906,26 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
 
   const cursorRaw = await readCursor('co', 'shipments');
   const cursor = Number(cursorRaw ?? 0) || 0;
+  const seenUpdatedAt = await readCursor('co', 'shipments-updated');
   const highest = Math.max(...shipments.map((s) => s.number));
-  // New since last tick, plus a rolling recheck window for late tracking/quantity updates.
+
+  // A shipment becomes due three ways. The point is to catch work that arrives WITHOUT the
+  // shipment being new — most importantly a tracking number Deposco attaches minutes or hours
+  // after the shipment itself, which is the case the old backfill existed for.
+  //   1. number > cursor          — genuinely new since the last sweep
+  //   2. updatedDate > last sweep — Deposco TOUCHED it since we last looked, at any age. This is
+  //      the wide net, and it costs nothing: updatedDate is already in the list we just read.
+  //      (Filtering on a Deposco-side date is fine — it's their own change stamp, not a BC
+  //      business date that a user can backdate.)
+  //   3. within the trailing RECHECK window — belt and braces for anything whose updatedDate
+  //      doesn't move when it should.
   const recheckFloor = highest - SHIPMENT_RECHECK;
-  const due = shipments.filter((s) => s.number > cursor || s.number > recheckFloor);
-  console.log(`[ship] ${shipments.length} shipment(s) in Deposco, highest #${highest}, cursor #${cursor} → ${due.length} to check`);
+  const due = shipments.filter((s) =>
+    s.number > cursor
+    || s.number > recheckFloor
+    || (seenUpdatedAt !== null && s.updatedDate !== '' && s.updatedDate > seenUpdatedAt));
+  const newestUpdated = shipments.reduce((m, s) => (s.updatedDate > m ? s.updatedDate : m), '');
+  console.log(`[ship] ${shipments.length} shipment(s), highest #${highest}, cursor #${cursor}, updated-since ${seenUpdatedAt ?? '(none)'} → ${due.length} to check`);
   if (due.length === 0) return;
 
   const byOrder = await resolveCustomerOrderNumbers(deposcoCfg, dToken, due.flatMap((s) => s.salesOrderIds));
@@ -933,10 +948,15 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
       await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-ship-pull', soNumber, msg) });
     }
   }
-  // Only advance past shipments whose orders all got a clean pass; a failure leaves the cursor so
+  // Only advance past shipments whose orders all got a clean pass; a failure leaves both marks so
   // the shipment is reconsidered next tick (the recheck window covers it either way).
-  if (failed === 0) await writeCursor('co', 'shipments', String(highest));
-  console.log(`[ship] done — ${posted} order(s) pulled, ${failed} failed, cursor ${failed === 0 ? `→ #${highest}` : `held at #${cursor}`}`);
+  // The updated-watermark is the newest updatedDate we SAW, not "now": Deposco stamps these, and
+  // using our own clock would skip anything updated during the sweep or across clock skew.
+  if (failed === 0) {
+    await writeCursor('co', 'shipments', String(highest));
+    if (newestUpdated) await writeCursor('co', 'shipments-updated', newestUpdated);
+  }
+  console.log(`[ship] done — ${posted} order(s) pulled, ${failed} failed, cursor ${failed === 0 ? `→ #${highest} / updated ${newestUpdated}` : `held at #${cursor}`}`);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
