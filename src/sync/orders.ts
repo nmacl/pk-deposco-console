@@ -35,6 +35,34 @@ export type PostResult = 'ok' | 'skip';
 const nestedTruncated = (c: { complete?: boolean | null; pages?: number | null } | undefined): boolean =>
   c?.complete === false || (c?.pages ?? 1) > 1;
 
+/**
+ * Read an order's lines from the SUB-RESOURCE (…/{id}/orderLines) and walk it to the end.
+ *
+ * This is the escape hatch from the 10-row nested cap. The sub-resource is a proper paged
+ * collection — 25 rows a page with a working links[].rel='next' — so following `next` yields the
+ * whole set: WSP32262 gives 82 lines over 4 pages where the nested copy showed 10 of 9 "pages".
+ * Both order types support it; note the path is `/orderLines` on salesOrders AND purchaseOrders,
+ * while `/coLines` on customerOrders 404s.
+ *
+ * `complete` is false only if we bailed on maxPages — running out of `next` links means we
+ * genuinely reached the end.
+ */
+async function fetchLinesPaged<T>(cfg: DeposcoConfig, token: string, path: string, maxPages = 40): Promise<{ rows: T[]; complete: boolean }> {
+  interface Page { data?: T[]; links?: Array<{ rel?: string; href?: string }>; complete?: boolean | null }
+  const rows: T[] = [];
+  let url = `${cfg.apiBase}${path}`;
+  for (let page = 0; page < maxPages; page++) {
+    const body = await authReq<Page>('get', url, token);
+    rows.push(...(body.data ?? []));
+    if (body.complete) return { rows, complete: true };
+    const next = body.links?.find((l) => l.rel === 'next')?.href;
+    if (!next) return { rows, complete: true };
+    url = next;
+  }
+  console.warn(`[deposco] ${path}: stopped after ${maxPages} pages — line list may be incomplete`);
+  return { rows, complete: false };
+}
+
 /** Look up a Deposco order id. endpoint = '/orders/purchaseOrders' (params {number}) or
  *  '/orders/customerOrders' (params {externalOrderNumber}). */
 interface DsOrderRef { self?: { id?: number }; number?: string; status?: string; orderStatus?: string }
@@ -121,15 +149,30 @@ export interface ReceivedResult {
 export async function fetchReceivedFromPurchaseOrder(cfg: DeposcoConfig, token: string, poId: number): Promise<ReceivedResult> {
   interface PoLine { lineNumber?: string; receivedPackQuantity?: number; item?: { businessKey?: { number?: string } } }
   interface PoLines { data?: PoLine[]; complete?: boolean | null; pages?: number | null }
-  const d = await authReq<{ purchaseOrder?: { orderLines?: PoLines }; orderLines?: PoLines }>(
-    'get', `${cfg.apiBase}/orders/purchaseOrders/${poId}`, token);
-  const po = d.purchaseOrder ?? d;
+
+  // Sub-resource, walked to the end — the purchaseOrder detail's nested `orderLines` is capped at
+  // 10 with no reachable page 2, so reading it under-reports received quantity on any PO over 10
+  // lines and BC would be left short with nothing to show for it (WSP32262: 10 nested vs 82 real).
+  const paged = await fetchLinesPaged<PoLine>(cfg, token, `/orders/purchaseOrders/${poId}/orderLines`);
+  let rows = paged.rows;
+  let complete = paged.complete;
+
+  // Degrade to the nested copy rather than lose the pull entirely if the sub-resource ever stops
+  // answering; it still reports truncation so a short read can't pass as a full one.
+  if (rows.length === 0) {
+    const d = await authReq<{ purchaseOrder?: { orderLines?: PoLines }; orderLines?: PoLines }>(
+      'get', `${cfg.apiBase}/orders/purchaseOrders/${poId}`, token);
+    const po = d.purchaseOrder ?? d;
+    rows = po.orderLines?.data ?? [];
+    complete = !nestedTruncated(po.orderLines);
+  }
+
   const lines: ReceivedResult['lines'] = [];
-  for (const l of po.orderLines?.data ?? []) {
+  for (const l of rows) {
     const line = parseInt((l.lineNumber ?? '').split('-').pop() ?? '', 10);
     if (Number.isFinite(line)) lines.push({ line, quantity: l.receivedPackQuantity ?? 0, itemNumber: l.item?.businessKey?.number ?? null });
   }
-  return { lines, truncated: nestedTruncated(po.orderLines) };
+  return { lines, truncated: !complete };
 }
 
 export interface DeposcoCoLineShip { externalLineNumber?: string; shippedQuantity?: number; itemNumber?: string | null }
@@ -158,16 +201,15 @@ export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: str
   const lines: DeposcoCoLineShip[] = [];
   const truncatedOrders: string[] = [];
   for (const fo of co?.fulfillmentOrders ?? []) {
-    // Read the lines from the SUB-RESOURCE, not from the order detail's nested `orderLines`.
-    // The nested copy is capped at 10 rows with no reachable page 2 (see nestedTruncated), which
-    // silently under-reports any order over 10 lines: SO320 showed 10 lines / 28 units nested,
-    // but 12 lines / 36 units here — BC would have been short 8 units and nothing would have said
-    // so. The sub-resource returns the whole set (complete=true, pages=1).
+    // Read the lines from the SUB-RESOURCE, walked to the end — not from the order detail's
+    // nested `orderLines`. The nested copy is capped at 10 rows with no reachable page 2 (see
+    // nestedTruncated), which silently under-reports any order over 10 lines: SO320 showed 10
+    // lines / 28 units nested, but 12 lines / 36 units here — BC would have been short 8 units
+    // and nothing would have said so.
     // NOTE it is `/orderLines` on salesOrders; the equivalent `/coLines` on customerOrders 404s.
-    const page = await authReq<{ data?: SalesOrderLine[]; complete?: boolean | null; pages?: number | null }>(
-      'get', `${cfg.apiBase}/orders/salesOrders/${fo.id}/orderLines`, token);
-    let rows = page.data ?? [];
-    let complete = page.complete !== false;
+    const paged = await fetchLinesPaged<SalesOrderLine>(cfg, token, `/orders/salesOrders/${fo.id}/orderLines`);
+    let rows = paged.rows;
+    let complete = paged.complete;
 
     // Fall back to the order detail if the sub-resource ever stops answering, so a Deposco-side
     // change degrades to the old (truncating) behaviour rather than losing the pull entirely.
