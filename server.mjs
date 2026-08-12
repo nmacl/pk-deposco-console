@@ -70,6 +70,17 @@ function runScheduledInvPull() {
   child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); invBusy = false; });
 }
 
+// Run-lock for manual order pushes, keyed by order number and SHARED across /sync requests
+// (same idea as invBusy; single Railway replica → an in-process set is a sufficient lock).
+//
+// Why this exists: the workers' "already in Deposco?" existence check is a read followed by a
+// POST, which is only safe if one process at a time is doing it for a given order. On
+// 2026-08-12 two /sync requests for DISO210970 landed 78ms apart (runs 13483/13484), each
+// spawned its own `sync-co.js --order …` child, both lookups answered "not found", and both
+// POSTed — Deposco ended up with CO381 and CO382, duplicate copies of one BC sales order.
+// customerOrders POST does not upsert, so a duplicate is a real second document in the WMS.
+const inFlightOrders = new Set();
+
 // Scheduled sales-order push — the CO worker's batch tick (--once) lists recent RELEASED SOs
 // per prefix and pushes any not yet in Deposco (idempotent existence check). Own lock so
 // overlapping ticks can't double-run. The worker logs each new push / failure to the DB.
@@ -341,14 +352,26 @@ const server = createServer((req, res) => {
   if (url.pathname === '/sync') {
     // Accepts one or many orders (?orders=A,B,C — or legacy ?order=A). Mixed types are fine;
     // each routes to its own worker and runs SEQUENTIALLY (readable logs, no concurrent posts).
+    // "Sequential" only holds WITHIN one request — see inFlightOrders for the cross-request lock.
     const raw = url.searchParams.get('orders') || url.searchParams.get('order') || '';
     const mode = url.searchParams.get('mode') === 'post' ? 'post' : 'push';
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
     const send = (data) => res.write(`data: ${String(data).replace(/\n/g, '\ndata: ')}\n\n`);
     const done = (code) => { res.write(`event: done\ndata: ${code}\n\n`); res.end(); };
 
-    const orders = [...new Set(raw.split(/[\s,]+/).map((s) => s.trim().toUpperCase()).filter(Boolean))].slice(0, 50);
-    if (orders.length === 0) { send('no order numbers provided'); return done(1); }
+    const requested = [...new Set(raw.split(/[\s,]+/).map((s) => s.trim().toUpperCase()).filter(Boolean))].slice(0, 50);
+    if (requested.length === 0) { send('no order numbers provided'); return done(1); }
+
+    // Claim each order for the life of this request. A double-fired button (or a second tab)
+    // gets "already syncing" instead of a second child process racing the first one's
+    // existence check — which is how duplicate Deposco documents get created.
+    const orders = requested.filter((o) => !inFlightOrders.has(o));
+    for (const o of requested) {
+      if (orders.includes(o)) inFlightOrders.add(o);
+      else send(`⚠ ${o}: already syncing right now — skipped (no duplicate push)`);
+    }
+    if (orders.length === 0) { send('nothing to do — all requested orders are already syncing'); return done(0); }
+    const release = () => { for (const o of orders) inFlightOrders.delete(o); };
 
     const flag = mode === 'push' ? '--push-only' : '--post-only';
     let currentChild = null;
@@ -377,22 +400,28 @@ const server = createServer((req, res) => {
     });
 
     (async () => {
-      send(`▸ ${orders.length} order(s) [${mode}]: ${orders.join(', ')}`);
-      const runId = await logRunStart('orders', 'manual');
-      const direction = mode === 'push' ? 'bc->deposco' : 'deposco->bc';
-      let ok = 0, fail = 0;
-      for (const order of orders) {
-        if (aborted) break;
-        const r = await runOne(order);
-        if (r.skipped) continue;
-        // exit 3 = push attempted but nothing pushable (data problem) → desync warning, not a hard fail.
-        const status = r.code === 0 ? 'ok' : r.code === 3 ? 'desync' : 'fail';
-        if (status === 'ok') ok++; else fail++;
-        const side = /EOM|not subscribed|deposco/i.test(r.lastErr) ? 'deposco' : (status === 'ok' ? undefined : 'bc');
-        await logOrderEvent({ runId, worker: r.worker, direction, action: mode, entityId: order, status, side, message: status === 'ok' ? 'ok' : (r.lastErr || r.lastLine || `exit ${r.code}`) });
+      try {
+        send(`▸ ${orders.length} order(s) [${mode}]: ${orders.join(', ')}`);
+        const runId = await logRunStart('orders', 'manual');
+        const direction = mode === 'push' ? 'bc->deposco' : 'deposco->bc';
+        let ok = 0, fail = 0;
+        for (const order of orders) {
+          if (aborted) break;
+          const r = await runOne(order);
+          if (r.skipped) continue;
+          // exit 3 = push attempted but nothing pushable (data problem) → desync warning, not a hard fail.
+          const status = r.code === 0 ? 'ok' : r.code === 3 ? 'desync' : 'fail';
+          if (status === 'ok') ok++; else fail++;
+          const side = /EOM|not subscribed|deposco/i.test(r.lastErr) ? 'deposco' : (status === 'ok' ? undefined : 'bc');
+          await logOrderEvent({ runId, worker: r.worker, direction, action: mode, entityId: order, status, side, message: status === 'ok' ? 'ok' : (r.lastErr || r.lastLine || `exit ${r.code}`) });
+        }
+        await logRunFinish(runId, fail > 0 ? 'partial' : 'ok', { ok, fail });
+        if (!aborted) done(0);
+      } finally {
+        // Always unlock — an abort (browser closed mid-stream) or a logging failure must not
+        // leave an order permanently stuck as "already syncing".
+        release();
       }
-      await logRunFinish(runId, fail > 0 ? 'partial' : 'ok', { ok, fail });
-      if (!aborted) done(0);
     })();
     return;
   }
