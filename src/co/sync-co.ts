@@ -173,6 +173,11 @@ function firstEmail(raw: string, logKey: string): string {
 // Name / Line1 / City / State Province / Postal Code / Country against these fields.
 interface DeposcoFreightBillToContact {
   attention: string; firstName: string; lastName: string;
+  /** Deposco's "Bill To Name". It is NOT derived from firstName/lastName — Deposco confirmed
+   *  (test order UA SO12562) that the bill-to name has to arrive in this field or their Bill To
+   *  Name shows empty, which is what we were doing: splitting Bill_to_Name into first/last and
+   *  never sending contactName. Carries the full unsplit name. */
+  contactName: string;
   line1: string; line2: string; city: string; stateProvince: string; postalCode: string; country: string;
   phone: string;
 }
@@ -196,6 +201,11 @@ function freightBillToContact(h: BcRow): DeposcoFreightBillToContact {
     attention: capName(pick(h, 'Bill_to_Contact') || name),
     firstName: capName(parts[0] || name || 'N/A'),
     lastName: capName(parts.slice(1).join(' ') || parts[0] || 'N/A'),
+    // Full name, deliberately NOT put through capName: the 30-char cap exists because Deposco
+    // limits firstName/lastName, and truncating a payer's legal name on a freight bill would be
+    // worse than a retry. postDeposcoOrder trims any single oversize field and re-posts if
+    // Deposco objects, so the whole name goes out and only gets shortened if it actually has to.
+    contactName: name || pick(h, 'Bill_to_Contact') || 'N/A',
     line1: pick(h, 'Bill_to_Address'),
     line2: pick(h, 'Bill_to_Address_2'),
     city: pick(h, 'Bill_to_City'),
