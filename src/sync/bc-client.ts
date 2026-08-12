@@ -76,6 +76,7 @@ export async function authReq<T>(
   // expected; patience is cheaper than a lost order.
   const MAX_ATTEMPTS = 4;
   const MAX_ATTEMPTS_RATE_LIMIT = parseInt(process.env.DEPOSCO_RATE_LIMIT_ATTEMPTS ?? '8', 10);
+  const MAX_ATTEMPTS_DEADLOCK = parseInt(process.env.BC_DEADLOCK_ATTEMPTS ?? '5', 10);
   let ax: AxiosError | undefined;
   for (let attempt = 1; attempt <= Math.max(MAX_ATTEMPTS, MAX_ATTEMPTS_RATE_LIMIT); attempt++) {
     try {
@@ -102,13 +103,25 @@ export async function authReq<T>(
       const isRateLimit = status === 429;
       const isTransient = status !== undefined && status >= 500;
       const isNetwork = !ax.response;
-      const retryable = isRateLimit || ((isTransient || isNetwork) && method === 'get');
-      const budget = isRateLimit ? MAX_ATTEMPTS_RATE_LIMIT : MAX_ATTEMPTS;
+      // SQL deadlock, for ANY method. BC surfaces it as 409 Internal_ServerError "The activity was
+      // deadlocked with another user who was modifying the Item Ledger…" — seen posting
+      // bmiInventoryAdjustments while a warehouse user touched the same item. A deadlock VICTIM is
+      // rolled back by SQL Server, so nothing was applied and re-posting cannot double-apply; that
+      // is what makes this safe to retry where a plain 5xx on a POST is not.
+      const errText = typeof ax.response?.data === 'string' ? ax.response.data : JSON.stringify(ax.response?.data ?? '');
+      const isDeadlock = /deadlock/i.test(errText);
+      const retryable = isRateLimit || isDeadlock || ((isTransient || isNetwork) && method === 'get');
+      const budget = isRateLimit ? MAX_ATTEMPTS_RATE_LIMIT : isDeadlock ? MAX_ATTEMPTS_DEADLOCK : MAX_ATTEMPTS;
       if (retryable && attempt < budget) {
         const retryAfter = Number(ax.response?.headers?.['retry-after']);
+        // Deadlocks want a SHORT, heavily randomised wait: the lock clears the moment the other
+        // transaction finishes, and a fixed backoff would just march both contenders back into
+        // each other. Rate limits and 5xx keep the longer exponential climb.
         const waitMs = Number.isFinite(retryAfter) && retryAfter > 0
           ? retryAfter * 1000
-          : Math.min(1500 * 2 ** (attempt - 1), 20_000) + Math.floor(Math.random() * 500);
+          : isDeadlock
+            ? 250 * 2 ** (attempt - 1) + Math.floor(Math.random() * 750)
+            : Math.min(1500 * 2 ** (attempt - 1), 20_000) + Math.floor(Math.random() * 500);
         console.log(`[http] ${method.toUpperCase()} ${(url.split('.com')[1] ?? url).slice(0, 60)} → HTTP ${status ?? ax.code} — retry ${attempt}/${budget - 1} in ${waitMs}ms`);
         await new Promise((r) => setTimeout(r, waitMs));
         continue;
