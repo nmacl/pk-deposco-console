@@ -537,6 +537,9 @@ const AUDIT_LOOKUP_DELAY_MS = parseInt(process.env.DEPOSCO_AUDIT_DELAY_MS ?? '20
 // 429 retries for the order POST, budgeted separately from MAX_ROUNDS so a rate limit never eats
 // the lazy-create rounds. Matches authReq's DEPOSCO_RATE_LIMIT_ATTEMPTS default.
 const RATE_LIMIT_RETRIES = parseInt(process.env.DEPOSCO_RATE_LIMIT_ATTEMPTS ?? '8', 10);
+// Deposco optimistic-lock conflicts (409 "updated by a concurrent request"). Budgeted apart from
+// MAX_ROUNDS so a busy resource never eats the lazy-create rounds.
+const CONFLICT_RETRIES = parseInt(process.env.DEPOSCO_CONFLICT_ATTEMPTS ?? '6', 10);
 
 const MAX_ROUNDS = 6;
 // Known-good orderSource to fall back to if Deposco rejects a programme code.
@@ -555,6 +558,7 @@ export async function postDeposcoOrder(
   let sourceRetried = false;
   let sizeTrims = 0;
   let rateLimited = 0;
+  let conflicts = 0;
   for (let round = 0; round < MAX_ROUNDS; round++) {
     try {
       const token = await getDeposcoToken(deposcoCfg);
@@ -587,6 +591,22 @@ export async function postDeposcoOrder(
           ? retryAfter * 1000
           : Math.min(1000 * 2 ** (rateLimited - 1), 20_000) + Math.floor(Math.random() * 500);
         console.log(`[push] ${logKey}: Deposco rate limit — retry ${rateLimited}/${RATE_LIMIT_RETRIES} in ${waitMs}ms`);
+        await new Promise((r) => setTimeout(r, waitMs));
+        round--;
+        continue;
+      }
+      // Concurrency conflict: "The resource was updated by a concurrent request. Please retry
+      // when the resource is not in use." Deposco's optimistic lock — something else (the
+      // warehouse UI, another worker, their own async processing) touched the order between our
+      // read and our write. Like a 429 and like a SQL deadlock, the write was REJECTED, not
+      // half-applied, so re-sending is safe; and the order POST is an upsert keyed on the order
+      // number, so a retry cannot duplicate. Seen on WSP32638.
+      if (status === 409 && /concurrent request|not in use/i.test(msg) && conflicts < CONFLICT_RETRIES) {
+        conflicts++;
+        // Short, randomised: whatever held the resource is usually done in moments, and a fixed
+        // wait would just collide with the other writer again.
+        const waitMs = 400 * 2 ** (conflicts - 1) + Math.floor(Math.random() * 600);
+        console.log(`[push] ${logKey}: Deposco resource busy — retry ${conflicts}/${CONFLICT_RETRIES} in ${waitMs}ms`);
         await new Promise((r) => setTimeout(r, waitMs));
         round--;
         continue;

@@ -112,7 +112,11 @@ export async function authReq<T>(
       // rolled back by SQL Server, so nothing was applied and re-posting cannot double-apply; that
       // is what makes this safe to retry where a plain 5xx on a POST is not.
       const errText = typeof ax.response?.data === 'string' ? ax.response.data : JSON.stringify(ax.response?.data ?? '');
-      const isDeadlock = /deadlock/i.test(errText);
+      // Same shape on both sides of the integration: the write lost a race and was REJECTED, so
+      // re-sending is safe. BC says "deadlocked with another user"; Deposco says 409 "The resource
+      // was updated by a concurrent request. Please retry when the resource is not in use."
+      const isDeadlock = /deadlock/i.test(errText)
+        || (status === 409 && /concurrent request|not in use/i.test(errText));
       const retryable = isRateLimit || isDeadlock || ((isTransient || isNetwork) && method === 'get');
       const budget = isRateLimit ? MAX_ATTEMPTS_RATE_LIMIT : isDeadlock ? MAX_ATTEMPTS_DEADLOCK : MAX_ATTEMPTS;
       if (retryable && attempt < budget) {
