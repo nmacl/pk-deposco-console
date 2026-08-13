@@ -169,6 +169,29 @@ export async function bcGet<T>(url: string, token: string, extraHeaders?: Record
   throw lastErr;
 }
 
+/**
+ * GET every page of a BC OData collection, following `@odata.nextLink`.
+ *
+ * BC pages large results whether you ask it to or not, and a caller that reads `value` once gets a
+ * silent partial set — the same failure mode as Deposco's nested collections. Verified against
+ * Sales_Order_Line: 1,617 WESTERLY lines come back as 4 pages at maxpagesize=500 and the walked
+ * total matches the unpaged total exactly.
+ *
+ * The page size is requested explicitly so behaviour doesn't drift with BC's default.
+ */
+export async function bcGetAll<T>(url: string, token: string, pageSize = 5000, maxPages = 200): Promise<T[]> {
+  const out: T[] = [];
+  interface ODataPage { value?: T[]; '@odata.nextLink'?: string }
+  let next: string | undefined = url;
+  for (let page = 0; page < maxPages && next; page++) {
+    const body: ODataPage = await bcGet<ODataPage>(next, token, { Prefer: `odata.maxpagesize=${pageSize}` });
+    out.push(...(body.value ?? []));
+    next = body['@odata.nextLink'];
+  }
+  if (next) console.warn(`[bc] ${url.split('/').pop()?.slice(0, 60)}: stopped after ${maxPages} pages — result may be incomplete`);
+  return out;
+}
+
 /** Company SystemId is the same across the api/v2.0, automation, and bmi surfaces; cache it per process. */
 let cachedCompanyId: string | null = null;
 export async function getCompanyId(cfg: SyncBcConfig, token?: string): Promise<string> {

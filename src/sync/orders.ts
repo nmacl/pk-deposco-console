@@ -322,6 +322,40 @@ export async function auditPushedCustomerOrder(
  * updatedDateFrom / status were all tried and every one returned the identical first page. So
  * filtering MUST happen client-side on what comes back, never by asking the API to filter.
  */
+/**
+ * Every customerOrder Deposco holds, as a set of the BC order numbers they were pushed under.
+ *
+ * This replaces asking "do you have this order?" one order at a time. That cost one call per
+ * candidate — 375 calls to cover the open book — which is why the push used to look at a 25-order
+ * slice instead of everything. The whole list is 489 orders over 20 pages (2026-08-13), so one
+ * bulk read costs ~20 calls and covers every order there is, and the existence check becomes a
+ * local Set lookup costing nothing.
+ *
+ * Cancelled copies are excluded: an order whose every copy is cancelled must count as ABSENT so a
+ * clean one can be pushed (same rule as lookupDeposcoOrderId's liveOnly).
+ */
+export async function fetchAllCustomerOrderNumbers(cfg: DeposcoConfig, token: string, maxPages = 200): Promise<Set<string>> {
+  interface Row { externalOrderNumber?: string; status?: string; orderStatus?: string }
+  interface Page { data?: Row[]; links?: Array<{ rel?: string; href?: string }>; complete?: boolean }
+  const live = new Set<string>();
+  const cancelledOnly = new Map<string, boolean>();
+  let url = `${cfg.apiBase}/orders/customerOrders`;
+  for (let page = 0; page < maxPages; page++) {
+    const body = await authReq<Page>('get', url, token);
+    for (const r of body.data ?? []) {
+      const ext = (r.externalOrderNumber ?? '').trim();
+      if (!ext) continue;
+      if (isCancelled(r)) { if (!cancelledOnly.has(ext)) cancelledOnly.set(ext, true); }
+      else live.add(ext);
+    }
+    if (body.complete) break;
+    const next = body.links?.find((l) => l.rel === 'next')?.href;
+    if (!next) break;
+    url = next;
+  }
+  return live;
+}
+
 export interface OutboundShipmentRef {
   number: number;
   salesOrderIds: number[];

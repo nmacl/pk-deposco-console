@@ -38,8 +38,8 @@ import { type AxiosError } from 'axios';
 import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
-import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, type DeposcoTracking } from '../sync/orders.js';
+import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, bcGetAll, pick, numOf, getCompanyId, authReq, mapWithConcurrency, type BcRow } from '../sync/bc-client.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
@@ -49,13 +49,14 @@ const INTERVAL_MS = parseInt(process.env.SO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIXES = (process.env.SO_PREFIXES ?? 'PKSO,WSOD,HDSO,DISO').split(',').map((p) => p.trim()).filter(Boolean);
 const PER_PREFIX = parseInt(process.env.SO_PER_PREFIX ?? '25', 10);
 const PULL_ENABLED = (process.env.SO_PULL_ENABLED ?? 'false').toLowerCase() === 'true';
-// Numeric rotating scan (see listOrdersToSync), replacing the newest-25-by-Order_Date window that
-// left 1,278 of 1,408 open orders permanently unreachable. The rotation position per prefix is a
-// document NUMBER held in sync_cursors. SO_CURSOR_ENABLED=false pins it to the HEAD pass only
-// (newest by number), which is still numeric — there is no date-ordered path left to fall back to.
-const CURSOR_ENABLED = (process.env.SO_CURSOR_ENABLED ?? 'true').toLowerCase() === 'true';
 // Newest-by-number orders re-read every tick so a brand-new order doesn't wait for the rotation.
-const SCAN_HEAD = parseInt(process.env.SO_SCAN_HEAD ?? '25', 10);
+// Pushes per tick. The SCAN is unbounded (it costs ~20 Deposco calls regardless of order count);
+// only pushing scales with work, so only pushing is capped. 100 at ~0.6 push/s is ~3 min of tick.
+const MAX_PUSH = parseInt(process.env.SO_MAX_PUSH ?? '100', 10);
+// Concurrent pushes. The process-wide Deposco throttle still serialises the actual requests at
+// ~2.9/s, so this does not raise the request rate — it overlaps the dead time each push spends
+// waiting on the async create, which was most of the ~7s per order.
+const PUSH_CONCURRENCY = parseInt(process.env.SO_PUSH_CONCURRENCY ?? '6', 10);
 // Tracking write-back onto the posted sales shipment. Needs the AL extension (>= v2.4.0.0,
 // page bmiShipmentTrackings) published to the target BC environment.
 const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
@@ -107,42 +108,51 @@ const WMS_LOCATIONS = new Set((process.env.SO_WMS_LOCATIONS ?? 'WESTERLY').split
  * `Completely_Shipped eq false` keeps the working set bounded (finished orders drop out of the
  * rotation on their own), so a lap stays short and the cost per tick stays flat.
  */
-interface ScanBatch { rows: BcRow[]; nextCursor: string; wrapped: boolean }
+/**
+ * BULK JOIN — every open order, every tick, no cursor.
+ *
+ * Selection used to be a 25-order slice because the existence check cost one Deposco call per
+ * candidate. It doesn't any more (see fetchAllCustomerOrderNumbers), so there is no reason to look
+ * at a subset: read all the BC candidates, read all the Deposco order numbers, and subtract.
+ *
+ * SCANNING is unbounded and cheap (~20 Deposco calls + a few unmetered BC queries regardless of
+ * order count); PUSHING is what costs, and that is capped per tick. So a backlog is queued rather
+ * than invisible — the distinction the rotation got wrong.
+ *
+ * This is deliberately STATELESS. Every cursor scheme here has failed in production: the
+ * Order_Date window silently starved 199 orders (4,666 units), and its replacement stopped every
+ * push for ~11 hours when a leftover timestamp poisoned a Code[20] filter. Both bugs are
+ * inexpressible without stored position. Each tick recomputes from scratch and is idempotent.
+ */
+interface Candidate { no: string; header: BcRow; lines: BcRow[]; units: number }
 
-async function listOrdersToSync(odata: string, token: string, prefix: string, count: number, cursor: string | null): Promise<ScanBatch> {
-  // Only RELEASED orders sync — an Open order is still being edited; we don't push it to the WMS
-  // until it's released. (BC Sales_Order Status is exactly 'Open' | 'Released'.)
-  const open = `startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`;
-  const q = (filter: string, order: string, top: number): string =>
-    `${odata}/Sales_Order?$filter=${encodeURIComponent(filter)}&$orderby=${order}&$top=${top}`;
-
-  const head = (await bcGet<{ value: BcRow[] }>(q(open, 'No desc', SCAN_HEAD), token)).value ?? [];
-
-  // The cursor MUST look like a document number. It used to hold a SystemModifiedAt timestamp,
-  // and those values survived the switch to numeric rotation: `No gt '2026-08-12T17:13:54.753Z'`
-  // is a 24-char value against a Code[20] field, so BC rejected the whole query with
-  // Application_FilterErrorException. listOrdersToSync threw, the tick caught it and `continue`d,
-  // and every prefix was skipped on every tick — the sales-order push stopped entirely and 199
-  // Released orders (4,666 units) sat unimported with nothing in the logs but a silent skip.
-  // Anything that isn't a plausible number for this prefix is discarded and the lap restarts.
-  const valid = cursor !== null && cursor.length > 0 && cursor.length <= 20 && cursor.startsWith(prefix);
-  if (cursor && !valid) console.warn(`[tick] ${prefix}: ignoring unusable cursor ${JSON.stringify(cursor)} — restarting the rotation from the beginning`);
-  const from = valid ? cursor : '';
-  const rotFilter = from ? `${open} and No gt '${odataStr(from)}'` : open;
-  const rot = (await bcGet<{ value: BcRow[] }>(q(rotFilter, 'No asc', count), token)).value ?? [];
-
-  // A short batch means the end of the set — wrap so the next tick starts a fresh lap.
-  const wrapped = rot.length < count;
-  const nextCursor = wrapped ? '' : pick(rot[rot.length - 1], 'No');
-
-  // HEAD and ROTATE overlap once the rotation reaches the top of the range.
-  const seen = new Set<string>();
-  const rows: BcRow[] = [];
-  for (const r of [...head, ...rot]) {
-    const no = pick(r, 'No');
-    if (no && !seen.has(no)) { seen.add(no); rows.push(r); }
+async function loadCandidates(odata: string, token: string): Promise<Candidate[]> {
+  // Headers per prefix, then ALL WESTERLY item lines in one paged read (bcGetAll follows
+  // @odata.nextLink — BC pages this at ~500 and a single-page read would silently truncate).
+  const heads = new Map<string, BcRow>();
+  for (const prefix of PREFIXES) {
+    const url = `${odata}/Sales_Order?$filter=${encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`)}&$select=No,Status,Completely_Shipped,ProgramID,WebShopOrderId,Order_Date,Document_Date,Sell_to_E_Mail,Sell_to_Phone_No,Ship_to_Name,Ship_to_Contact,Ship_to_Address,Ship_to_Address_2,Ship_to_City,Ship_to_County,Ship_to_Post_Code,Ship_to_Country_Region_Code,Ship_to_Phone_No,Bill_to_Name,Bill_to_Contact,Bill_to_Address,Bill_to_Address_2,Bill_to_City,Bill_to_County,Bill_to_Post_Code,Bill_to_Country_Region_Code,Bill_to_Phone_No,LAX_E_Ship_Agent_Service,LAX_Shipping_Agent_Code,Shipping_Agent_Code,LAX_Shipping_Payment_Type,LAX_Third_Party_Ship_Acct_No`;
+    for (const h of await bcGetAll<BcRow>(url, token)) heads.set(pick(h, 'No'), h);
   }
-  return { rows, nextCursor, wrapped };
+
+  const wms = [...WMS_LOCATIONS].map((l) => `Location_Code eq '${odataStr(l)}'`).join(' or ');
+  const linesUrl = `${odata}/Sales_Order_Line?$filter=${encodeURIComponent(`Type eq 'Item' and (${wms})`)}&$select=Document_No,Line_No,No,WebshopVariantCode,Location_Code,Type,Quantity,Quantity_Shipped,Unit_Price`;
+  const byOrder = new Map<string, BcRow[]>();
+  for (const l of await bcGetAll<BcRow>(linesUrl, token)) {
+    const doc = pick(l, 'Document_No');
+    if (!heads.has(doc)) continue;              // not a Released/open order we care about
+    const arr = byOrder.get(doc) ?? [];
+    arr.push(l);
+    byOrder.set(doc, arr);
+  }
+
+  const out: Candidate[] = [];
+  for (const [no, lines] of byOrder) {
+    out.push({ no, header: heads.get(no) as BcRow, lines, units: lines.reduce((s, l) => s + numOf(l, 'Quantity'), 0) });
+  }
+  // Oldest document number first, so a backlog drains in a predictable order.
+  out.sort((a, b) => (a.no < b.no ? -1 : a.no > b.no ? 1 : 0));
+  return out;
 }
 
 async function getSoLines(odata: string, token: string, soNumber: string): Promise<BcRow[]> {
@@ -986,57 +996,52 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   // pullFail is counted separately from `fail` (pushes) so a run row shows which half broke.
   let ok = 0, skip = 0, fail = 0, pullFail = 0;
 
-  for (const prefix of PREFIXES) {
-    let sos: BcRow[];
-    let batch: ScanBatch;
-    // Rotation position per prefix, so a quiet PKSO can't drag the busy WSOD lap backwards.
-    const cursor = CURSOR_ENABLED ? await readCursor('co', prefix) : null;
-    try {
-      batch = await listOrdersToSync(odata, bcToken, prefix, PER_PREFIX, cursor);
-      sos = batch.rows;
-    } catch (err) {
-      // Must reach the DB, not just stdout. When this threw on a bad cursor the tick skipped the
-      // whole prefix silently — /logs showed a clean run with zero pushes, and nobody could tell
-      // that every sales order was being ignored.
-      const e = err as AxiosError;
-      const detail = JSON.stringify(e.response?.data ?? e.message).slice(0, 600);
-      const msg = `CANDIDATE LIST FAILED (HTTP ${e.response?.status ?? '?'}) — NO orders were synced for ${prefix} this tick: ${detail.slice(0, 200)}`;
-      console.error(`[tick] ${prefix}: ${msg}`);
-      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: `(${prefix} list)`, action: 'list', status: 'fail', side: 'bc', message: msg, detail, dedupeKey: dailyDedupe('co-list', prefix, msg) });
-      fail++;
-      continue;
+  // ── Bulk join: every open order, minus everything Deposco already has ──────
+  let toPush: Candidate[] = [];
+  try {
+    const [candidates, inDeposco] = await Promise.all([
+      loadCandidates(odata, bcToken),
+      fetchAllCustomerOrderNumbers(deposcoCfg, await getDeposcoToken(deposcoCfg)),
+    ]);
+    const missing = candidates.filter((c) => !inDeposco.has(c.no));
+    toPush = missing.slice(0, MAX_PUSH);
+    skip += candidates.length - missing.length;
+    console.log(`[tick] ${candidates.length} open order(s) with ${[...WMS_LOCATIONS].join('/')} lines | ${inDeposco.size} already in Deposco | ${missing.length} to push${missing.length > toPush.length ? ` (capped at ${MAX_PUSH} this tick, ${missing.length - toPush.length} queued for the next)` : ''}`);
+    if (missing.length > toPush.length) {
+      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: '(backlog)', action: 'list', status: 'skip', side: 'bc',
+        message: `${missing.length} orders missing from Deposco; pushing ${toPush.length} this tick, ${missing.length - toPush.length} queued`,
+        dedupeKey: dailyDedupe('co-backlog', 'backlog', String(missing.length)) });
     }
-    console.log(`[tick] ${prefix}: ${sos.length} SO(s) [head+rotate from ${cursor || 'start'}]: ${sos.map((s) => pick(s, 'No')).join(', ') || '(none)'}`);
-    for (const header of sos) {
-      const soNumber = pick(header, 'No');
-      try {
-        const r = await pushSo(bcCfg, deposcoCfg, header, runId);
-        if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'ok', message: 'pushed to Deposco' }); }
-        else { skip++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'skip', message: 'already in Deposco / no WMS lines', dedupeKey: dailyDedupe('co-skip', soNumber, 'skip') }); }
-      } catch (err) {
-        const e = err as AxiosError;
-        const body = JSON.stringify(e.response?.data ?? e.message).slice(0, 300);
-        // 429 bodies are empty, so the text match alone mislabelled rate limits as a BC fault.
-      const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
-        console.error(`[push] ${soNumber} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
-        fail++;
-        const msg = `HTTP ${e.response?.status}: ${body.slice(0, 180)}`;
-        await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', soNumber, msg) });
-      }
-      // NOTE: no pull here any more. Asking Deposco about every order in the rotation was the
-      // bulk of the Deposco traffic and nearly all of it returned "nothing shipped". The pull now
-      // runs once per tick, driven by Deposco's own shipment list — see pullFromShipments below.
-    }
-
-    // Advance the rotation unconditionally, INCLUDING past failures. With a high-water mark that
-    // would be wrong (a failed order would be skipped forever), but a rotation always comes back
-    // round — so a failed order is retried next lap without stalling every order behind it on one
-    // bad document. The failure itself is already recorded in sync_events.
-    if (CURSOR_ENABLED) {
-      await writeCursor('co', prefix, batch.nextCursor);
-      console.log(`[tick] ${prefix}: rotation → ${batch.wrapped ? 'end of set, next lap starts from the beginning' : `resumes above ${batch.nextCursor}`}`);
-    }
+  } catch (err) {
+    // Must reach the DB, not just stdout. A selection failure used to skip silently and /logs
+    // showed a clean run with zero pushes while every sales order was being ignored.
+    const e = err as AxiosError;
+    const detail = JSON.stringify(e.response?.data ?? (err as Error).message).slice(0, 600);
+    const msg = `CANDIDATE SELECTION FAILED (HTTP ${e.response?.status ?? '?'}) — NO orders were synced this tick: ${detail.slice(0, 200)}`;
+    console.error(`[tick] ${msg}`);
+    await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: '(selection)', action: 'list', status: 'fail', side: 'bc', message: msg, detail, dedupeKey: dailyDedupe('co-list', 'selection', msg) });
+    fail++;
   }
+
+  // Pushed with bounded concurrency. Deposco calls stay serialised by the process-wide throttle
+  // (~2.9/s) whichever way this runs, so concurrency does NOT raise the request rate — it only
+  // stops each push idling while the read-back audit waits on Deposco's async create. That idle
+  // time was most of the ~7s per order.
+  await mapWithConcurrency(toPush, PUSH_CONCURRENCY, async (c) => {
+    try {
+      const r = await pushSo(bcCfg, deposcoCfg, c.header, runId);
+      if (r === 'ok') { ok++; await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: c.no, action: 'push', status: 'ok', message: `pushed to Deposco (${c.lines.length} line(s), ${c.units} units)` }); }
+      else { skip++; }
+    } catch (err) {
+      const e = err as AxiosError;
+      const body = JSON.stringify(e.response?.data ?? (err as Error).message).slice(0, 300);
+      const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      console.error(`[push] ${c.no} FAILED HTTP ${e.response?.status}: ${body.slice(0, 500)}`);
+      fail++;
+      const msg = `HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 180)}`;
+      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: c.no, action: 'push', status: 'fail', side, message: msg, dedupeKey: dailyDedupe('co', c.no, msg) });
+    }
+  });
 
   // One shipment-driven pull for the whole tick, after the pushes.
   if (PULL_ENABLED) {
