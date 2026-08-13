@@ -425,6 +425,9 @@ export interface DeposcoTracking {
   totalPackages: number;
   totalWeight: number;
   actualShipDate: string | null;
+  /** Freight for THIS parcel — Deposco shippingCosts.shippingCost. Summed across an order's
+   *  parcels by the caller; see the write-once note in writeTrackingBack. */
+  shippingCost: number;
   /** Units actually on this label. Deposco emits shipments with a tracking number and ZERO
    *  quantity (a label created then not used) — those must not be treated as the primary
    *  tracking number, so callers filter on this. */
@@ -447,6 +450,10 @@ interface DsOutboundShipment {
   // 'Edm.Decimal'". Tolerate both shapes.
   totalWeight?: number | { value?: number; units?: string };
   shipmentDates?: { actualShipDate?: string };
+  // Freight lives in a nested block; only `shippingCost` is populated in practice (the tax /
+  // insurance / handling / labor / materials siblings are all 0), but they are summed too so a
+  // later Deposco change cannot silently under-report.
+  shippingCosts?: { shippingCost?: number; extendedShippingCost?: number; taxCost?: number; insuranceCost?: number; handlingCost?: number; laborCost?: number; materialsCost?: number };
   shippedContainers?: { data?: Array<{ lpnNumber?: string }> };
   shipmentLines?: { data?: DsShipmentLine[] };
 }
@@ -519,6 +526,9 @@ export async function fetchTrackingForSalesOrder(
       containerLpn: (s.shippedContainers?.data?.[0]?.lpnNumber ?? s.lpnNumber ?? '').trim(),
       totalPackages: s.totalPackages ?? 0,
       shippedUnits: lines.reduce((n, l) => n + l.quantity, 0),
+      shippingCost: [s.shippingCosts?.shippingCost, s.shippingCosts?.extendedShippingCost, s.shippingCosts?.taxCost,
+        s.shippingCosts?.insuranceCost, s.shippingCosts?.handlingCost, s.shippingCosts?.laborCost,
+        s.shippingCosts?.materialsCost].reduce((n: number, v) => n + (Number(v) || 0), 0),
       lines,
       totalWeight: typeof s.totalWeight === 'number' ? s.totalWeight : (s.totalWeight?.value ?? 0),
       actualShipDate: s.shipmentDates?.actualShipDate ?? null,

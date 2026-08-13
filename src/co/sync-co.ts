@@ -496,10 +496,17 @@ async function auditPush(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: s
     const dToken = await getDeposcoToken(deposcoCfg);
     const audit = await auditPushedCustomerOrder(bcCfg, deposcoCfg, dToken, soNumber, intended);
     if (!audit) return;
+    // NOT a desync. Nothing is out of step — we simply cannot see past Deposco's 10-row cap on a
+    // customerOrder, and unlike salesOrders/purchaseOrders there is no sub-resource to escape
+    // through (/coLines, /orderLines and /lines all 404 on customerOrders). Any order over 10
+    // lines hits this, so logging it at desync buried the Issues view next to real failures
+    // during the backfill. Recorded as a skip: the order pushed fine, N lines just went
+    // unverified. Only genuinely unlinked lines below are a desync.
     if (audit.truncated) {
-      const m = `Deposco returned only ${audit.checked} of ${payload.customerOrder.coLines.data.length} line(s) on read-back — lines beyond the first page cannot be audited`;
-      console.warn(`[audit] ${soNumber}: ⚠ ${m}`);
-      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'audit', status: 'desync', side: 'deposco', message: m, dedupeKey: dailyDedupe('co-audit-trunc', soNumber, 'truncated') });
+      const total = payload.customerOrder.coLines.data.length;
+      const m = `pushed OK; ${audit.checked} of ${total} line(s) verified — Deposco caps the read-back at 10 and offers no paged sub-resource for customerOrders, so the rest could not be checked`;
+      console.log(`[audit] ${soNumber}: ${m}`);
+      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: soNumber, action: 'audit', status: 'skip', side: 'deposco', message: m, dedupeKey: dailyDedupe('co-audit-trunc', soNumber, 'truncated') });
     }
     if (audit.unlinked.length === 0) {
       // Say so explicitly: silence would be indistinguishable from the audit never running.
@@ -795,8 +802,10 @@ async function writeTrackingBack(
   }
   try {
     const dToken = await getDeposcoToken(deposcoCfg);
-    const co = await authReq<{ customerOrder?: { fulfillmentOrders?: Array<{ id: number }> } }>(
+    const co = await authReq<{ customerOrder?: { status?: string; orderStatus?: string; fulfillmentOrders?: Array<{ id: number }> } }>(
       'get', `${deposcoCfg.apiBase}/orders/customerOrders/${customerOrderId}`, dToken);
+    // Freight is only final once Deposco stops adding parcels — see orderComplete below.
+    const coStatus = co.customerOrder?.status ?? co.customerOrder?.orderStatus ?? '';
 
     const all: DeposcoTracking[] = [];
     for (const fo of co.customerOrder?.fulfillmentOrders ?? []) {
@@ -815,6 +824,13 @@ async function writeTrackingBack(
     const empty = all.length - real.length;
     if (empty > 0) console.log(`[track] ${soNumber}: ignoring ${empty} zero-quantity label(s): ${all.filter((t) => t.shippedUnits === 0).map((t) => t.trackingNumber).join(', ')}`);
     const used = real.length > 0 ? real : all;   // all-empty => keep them rather than lose the info
+
+    // "Complete" is Deposco's own word for the customer order being finished — no further parcels
+    // are coming, so the freight total is final and safe to write once. Anything else (Released,
+    // In Fulfillment, Partially Shipped, Review) means more cost may still arrive, so we hold off
+    // and let a later tick write it. Checked case-insensitively because the field arrives as
+    // `status` on some responses and `orderStatus` on others.
+    const orderComplete = /^complete$/i.test(coStatus.trim());
 
     const bcToken = await getBcToken(bcCfg);
     const companyId = await getCompanyId(bcCfg, bcToken);
@@ -871,6 +887,17 @@ async function writeTrackingBack(
       containerLpn: primary.containerLpn,
       totalPackages: used.reduce((s, t) => s + t.totalPackages, 0),
       totalWeight: used.reduce((s, t) => s + t.totalWeight, 0),
+      // ORDER-level freight, sent ONLY once Deposco reports the order complete.
+      //
+      // Deposco charges per parcel and an order can post across several BC shipments, so there is
+      // no moment before completion when a running total is correct: send it early and parcels
+      // shipped later are missed; send it every time and the same parcels are counted onto every
+      // shipment. Waiting for Complete means the parcel set is final, so one write is exact.
+      // `all`, not `used` — a zero-quantity label still cost money even though it carries no
+      // units, and freight is about what was billed, not what moved.
+      // The AL side additionally refuses to overwrite a non-zero value, so a replayed buffer row
+      // or a manual re-post cannot double it.
+      ...(orderComplete ? { orderFreightTotal: all.reduce((s, t) => s + t.shippingCost, 0) } : {}),
       ...(primary.actualShipDate ? { actualShipDate: primary.actualShipDate } : {}),
     };
     const res = await authReq<{ applied?: boolean; appliedTo?: string; errorMessage?: string }>(
