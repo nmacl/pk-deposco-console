@@ -71,6 +71,12 @@ pageextension 60231 "PK Posted Sales Shpt Ext" extends "Posted Sales Shipment"
                     ApplicationArea = All;
                     Caption = 'Actual Ship Date';
                 }
+                field("PK Deposco Order Freight Tot"; Rec."PK Deposco Order Freight Tot")
+                {
+                    ApplicationArea = All;
+                    Caption = 'Order Freight Total';
+                    ToolTip = 'Total Deposco freight for the WHOLE sales order, not just this shipment. Written once, when Deposco reports the order complete. If an order posted several shipments this value sits on one of them and the rest show blank — sum the column across the order rather than reading a single shipment as its own cost.';
+                }
                 field("PK Deposco Synced At"; Rec."PK Deposco Synced At")
                 {
                     ApplicationArea = All;

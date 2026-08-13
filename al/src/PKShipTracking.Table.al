@@ -34,6 +34,10 @@ table 60211 "PK Ship Tracking"
         field(28; "Total Packages"; Integer) { Caption = 'Total Packages'; }
         field(29; "Total Weight"; Decimal) { Caption = 'Total Weight'; }
         field(30; "Container LPN"; Code[50]) { Caption = 'Container LPN'; }
+        // Order-level freight total (see "PK Deposco Order Freight Tot" on the shipment for why
+        // it is order-level). Sent only once Deposco reports the order complete; 0 means
+        // "not final yet", and the codeunit leaves any existing value alone.
+        field(32; "Order Freight Total"; Decimal) { Caption = 'Order Freight Total'; }
         // Explicit erase. Blank payload fields mean "not supplied" (so a partial update can't
         // silently wipe a good tracking number); this flag is the only way to clear one — for a
         // voided shipment or a value written in error.

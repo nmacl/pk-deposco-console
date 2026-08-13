@@ -49,6 +49,7 @@ page 60207 "PK Posted Sales Shipment API"
                 field(totalPackages; Rec."Total Packages") { }
                 field(totalWeight; Rec."Total Weight") { }
                 field(containerLpn; Rec."Container LPN") { }
+                field(orderFreightTotal; Rec."Order Freight Total") { }
                 field(clearTracking; Rec."Clear Tracking") { }
                 field(applied; Rec.Applied) { Editable = false; }
                 field(appliedTo; Rec."Applied To") { Editable = false; }

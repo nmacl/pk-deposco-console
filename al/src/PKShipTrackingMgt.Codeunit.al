@@ -51,18 +51,42 @@ codeunit 60222 "PK Ship Tracking Mgt"
         if Buf."Tracking No." <> '' then
             Shpt."Package Tracking No." := CopyStr(PrimaryTracking(Buf."Tracking No."), 1, MaxStrLen(Shpt."Package Tracking No."));
 
-        Shpt."PK Deposco Shipment No." := Buf."Deposco Shipment No.";
-        Shpt."PK Deposco Sales Order No." := Buf."Deposco Sales Order No.";
-        Shpt."PK Deposco Tracking No." := Buf."Tracking No.";
-        Shpt."PK Deposco Tracking URL" := Buf."Tracking URL";
-        Shpt."PK Deposco Carrier" := Buf.Carrier;
-        Shpt."PK Deposco Ship Via" := Buf."Ship Via";
-        Shpt."PK Deposco Ship Method" := Buf."Ship Method";
-        Shpt."PK Deposco Actual Ship Date" := Buf."Actual Ship Date";
-        Shpt."PK Deposco Total Packages" := Buf."Total Packages";
-        Shpt."PK Deposco Total Weight" := Buf."Total Weight";
-        Shpt."PK Deposco Container LPN" := Buf."Container LPN";
+        // BLANK MEANS "LEAVE ALONE", not "erase". These used to assign unconditionally, which made
+        // any partial payload destructive: a caller sending only shipmentNo + orderFreightTotal —
+        // exactly what a freight backfill sends — would blank the tracking number, URL, carrier and
+        // the rest on a shipment that already had them. Wiping is still available, deliberately and
+        // explicitly, via the "Clear Tracking" flag handled above.
+        if Buf."Deposco Shipment No." <> '' then
+            Shpt."PK Deposco Shipment No." := Buf."Deposco Shipment No.";
+        if Buf."Deposco Sales Order No." <> '' then
+            Shpt."PK Deposco Sales Order No." := Buf."Deposco Sales Order No.";
+        if Buf."Tracking No." <> '' then
+            Shpt."PK Deposco Tracking No." := Buf."Tracking No.";
+        if Buf."Tracking URL" <> '' then
+            Shpt."PK Deposco Tracking URL" := Buf."Tracking URL";
+        if Buf.Carrier <> '' then
+            Shpt."PK Deposco Carrier" := Buf.Carrier;
+        if Buf."Ship Via" <> '' then
+            Shpt."PK Deposco Ship Via" := Buf."Ship Via";
+        if Buf."Ship Method" <> '' then
+            Shpt."PK Deposco Ship Method" := Buf."Ship Method";
+        if Buf."Actual Ship Date" <> 0DT then
+            Shpt."PK Deposco Actual Ship Date" := Buf."Actual Ship Date";
+        if Buf."Total Packages" <> 0 then
+            Shpt."PK Deposco Total Packages" := Buf."Total Packages";
+        if Buf."Total Weight" <> 0 then
+            Shpt."PK Deposco Total Weight" := Buf."Total Weight";
+        if Buf."Container LPN" <> '' then
+            Shpt."PK Deposco Container LPN" := Buf."Container LPN";
         Shpt."PK Deposco Synced At" := CurrentDateTime();
+
+        // WRITE-ONCE. The middleware only sends a non-zero total when Deposco reports the order
+        // complete, and once set it must never be recomputed: a later shipment on the same order
+        // would otherwise write the order total a second time and double the freight in BC.
+        // Guarding here rather than in the middleware means a manual re-post or a replayed buffer
+        // row cannot double it either.
+        if (Buf."Order Freight Total" <> 0) and (Shpt."PK Deposco Order Freight Tot" = 0) then
+            Shpt."PK Deposco Order Freight Tot" := Buf."Order Freight Total";
 
         // Mirror the carrier into PK_BC18_TAB's PackageCarrier (50130) for anything already
         // reading it. By field number + NAME interlock — no dependency, and a silent no-op if
@@ -113,6 +137,7 @@ codeunit 60222 "PK Ship Tracking Mgt"
         Shpt."PK Deposco Total Packages" := 0;
         Shpt."PK Deposco Total Weight" := 0;
         Shpt."PK Deposco Container LPN" := '';
+        Shpt."PK Deposco Order Freight Tot" := 0;
         Shpt."PK Deposco Synced At" := CurrentDateTime();
         RecRef.GetTable(Shpt);
         if OptField.TrySetText(RecRef, 50130, 'PackageCarrier', '') then

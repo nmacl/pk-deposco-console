@@ -97,5 +97,24 @@ tableextension 60230 "PK Sales Shipment Ext" extends "Sales Shipment Header"
             DataClassification = CustomerContent;
             Editable = false;
         }
+        field(60212; "PK Deposco Order Freight Tot"; Decimal)
+        {
+            // ORDER-level total, deliberately not "shipment freight cost". Deposco charges freight
+            // per parcel and an order can post across several BC shipments, so a per-shipment
+            // figure would either double-count (summing every parcel onto each shipment) or lose
+            // the parcels shipped after the first posting. Instead this is written ONCE, when
+            // Deposco reports the customer order Complete, and holds the freight for the WHOLE
+            // order. On a multi-shipment order it lands on one shipment and the others stay 0 —
+            // so sum this column across an order's shipments, never read one as that shipment's
+            // own cost. The name says "Order" for exactly that reason.
+            //
+            // Source: Deposco outboundShipment.shippingCosts.shippingCost, summed across the
+            // order's parcels. Informational only — nothing posts it to the ledger.
+            Caption = 'Deposco Order Freight Total';
+            DataClassification = CustomerContent;
+            Editable = false;
+            AutoFormatType = 1;
+            BlankZero = true;
+        }
     }
 }
