@@ -131,7 +131,13 @@ async function loadCandidates(odata: string, token: string): Promise<Candidate[]
   // @odata.nextLink — BC pages this at ~500 and a single-page read would silently truncate).
   const heads = new Map<string, BcRow>();
   for (const prefix of PREFIXES) {
-    const url = `${odata}/Sales_Order?$filter=${encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`)}&$select=No,Status,Completely_Shipped,ProgramID,WebShopOrderId,Order_Date,Document_Date,Sell_to_E_Mail,Sell_to_Phone_No,Ship_to_Name,Ship_to_Contact,Ship_to_Address,Ship_to_Address_2,Ship_to_City,Ship_to_County,Ship_to_Post_Code,Ship_to_Country_Region_Code,Ship_to_Phone_No,Bill_to_Name,Bill_to_Contact,Bill_to_Address,Bill_to_Address_2,Bill_to_City,Bill_to_County,Bill_to_Post_Code,Bill_to_Country_Region_Code,Bill_to_Phone_No,LAX_E_Ship_Agent_Service,LAX_Shipping_Agent_Code,Shipping_Agent_Code,LAX_Shipping_Payment_Type,LAX_Third_Party_Ship_Acct_No`;
+    // NO $select on the header. A hand-maintained field list is a trap here in two ways:
+    // 'Bill_to_Phone_No' does not exist on this page and BC 400s the WHOLE query over one bad
+    // name, which took a prefix's entire sync down; and worse, quietly omitting a field the
+    // payload builder reads (Ship_to_*, Bill_to_*, LAX_*, Sell_to_*) would push orders with
+    // silently missing address or freight data — a far quieter failure than a 400. BC is
+    // unmetered and this is ~1,267 rows, so take the whole row.
+    const url = `${odata}/Sales_Order?$filter=${encodeURIComponent(`startswith(No,'${odataStr(prefix)}') and Status eq 'Released' and Completely_Shipped eq false`)}`;
     for (const h of await bcGetAll<BcRow>(url, token)) heads.set(pick(h, 'No'), h);
   }
 
