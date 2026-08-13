@@ -43,3 +43,12 @@ create table if not exists sync_cursors (
   updated_at  timestamptz not null default now(),
   primary key (worker, key)
 );
+
+-- Lock the tables away from Supabase's auto-generated REST API (anon/authenticated roles).
+-- The middleware connects as the postgres role (table owner), which bypasses RLS — so with RLS
+-- on and no policies, PostgREST gets nothing and the workers are unaffected. Applied live
+-- 2026-08-12 after Supabase flagged rls_disabled_in_public; kept here so a re-run can't regress it.
+alter table sync_runs    enable row level security;
+alter table sync_events  enable row level security;
+alter table sync_cursors enable row level security;
+revoke all on table sync_runs, sync_events, sync_cursors from anon, authenticated;
