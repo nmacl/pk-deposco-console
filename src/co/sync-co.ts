@@ -118,7 +118,16 @@ async function listOrdersToSync(odata: string, token: string, prefix: string, co
 
   const head = (await bcGet<{ value: BcRow[] }>(q(open, 'No desc', SCAN_HEAD), token)).value ?? [];
 
-  const from = cursor ?? '';
+  // The cursor MUST look like a document number. It used to hold a SystemModifiedAt timestamp,
+  // and those values survived the switch to numeric rotation: `No gt '2026-08-12T17:13:54.753Z'`
+  // is a 24-char value against a Code[20] field, so BC rejected the whole query with
+  // Application_FilterErrorException. listOrdersToSync threw, the tick caught it and `continue`d,
+  // and every prefix was skipped on every tick — the sales-order push stopped entirely and 199
+  // Released orders (4,666 units) sat unimported with nothing in the logs but a silent skip.
+  // Anything that isn't a plausible number for this prefix is discarded and the lap restarts.
+  const valid = cursor !== null && cursor.length > 0 && cursor.length <= 20 && cursor.startsWith(prefix);
+  if (cursor && !valid) console.warn(`[tick] ${prefix}: ignoring unusable cursor ${JSON.stringify(cursor)} — restarting the rotation from the beginning`);
+  const from = valid ? cursor : '';
   const rotFilter = from ? `${open} and No gt '${odataStr(from)}'` : open;
   const rot = (await bcGet<{ value: BcRow[] }>(q(rotFilter, 'No asc', count), token)).value ?? [];
 
@@ -986,8 +995,15 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
       batch = await listOrdersToSync(odata, bcToken, prefix, PER_PREFIX, cursor);
       sos = batch.rows;
     } catch (err) {
+      // Must reach the DB, not just stdout. When this threw on a bad cursor the tick skipped the
+      // whole prefix silently — /logs showed a clean run with zero pushes, and nobody could tell
+      // that every sales order was being ignored.
       const e = err as AxiosError;
-      console.error(`[tick] ${prefix}: list FAILED HTTP ${e.response?.status}: ${(e.message ?? '').slice(0, 200)}`);
+      const detail = JSON.stringify(e.response?.data ?? e.message).slice(0, 600);
+      const msg = `CANDIDATE LIST FAILED (HTTP ${e.response?.status ?? '?'}) — NO orders were synced for ${prefix} this tick: ${detail.slice(0, 200)}`;
+      console.error(`[tick] ${prefix}: ${msg}`);
+      await logEvent({ runId, worker: 'co', direction: 'bc->deposco', entityType: 'order', entityId: `(${prefix} list)`, action: 'list', status: 'fail', side: 'bc', message: msg, detail, dedupeKey: dailyDedupe('co-list', prefix, msg) });
+      fail++;
       continue;
     }
     console.log(`[tick] ${prefix}: ${sos.length} SO(s) [head+rotate from ${cursor || 'start'}]: ${sos.map((s) => pick(s, 'No')).join(', ') || '(none)'}`);
