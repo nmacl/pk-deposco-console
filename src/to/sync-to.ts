@@ -56,6 +56,18 @@ const DEPOSCO_NAME_MAX = 30;
 const capName = (v: string): string => (v.length <= DEPOSCO_NAME_MAX ? v : v.slice(0, DEPOSCO_NAME_MAX).trim());
 const WMS_LOCATIONS = new Set((process.env.TO_WMS_LOCATIONS ?? 'WESTERLY').split(',').map((s) => s.trim().toUpperCase()).filter(Boolean));
 
+// BC routes internal shuttle legs under its own shipping-agent codes; Deposco only recognises its
+// named ship vias, and an unmapped code goes over as literal garbage (a raw "TO_EP" is sitting on
+// a live CO). Map code → Deposco name; extendable via TO_SHIPVIA_MAP='CODE=Name,CODE=Name'.
+const SHIPVIA_MAP = new Map<string, string>([
+  ['TO_WSTRLY', 'Westerly Shuttle'],
+  ['TO_EP', 'East Providence Shuttle'],
+]);
+for (const pair of (process.env.TO_SHIPVIA_MAP ?? '').split(',')) {
+  const [code, name] = pair.split('=').map((s) => s.trim());
+  if (code && name) SHIPVIA_MAP.set(code.toUpperCase(), name);
+}
+
 const toDate = (iso: string): string => (iso && iso !== '0001-01-01' ? iso.slice(0, 10) : '');
 const toDateTime = (iso: string): string => { const d = toDate(iso); return d ? `${d}T00:00:00Z` : ''; };
 
@@ -193,12 +205,29 @@ async function sourceOrderShipping(odata: string, token: string, sourceNo: strin
   if (!so) return null;
   const agent = pick(so, 'Shipping_Agent_Code');
   const service = pick(so, 'Shipping_Agent_Service_Code');
+  // A mapped shuttle code becomes its Deposco name and carries no vendor (shuttles have none);
+  // anything else keeps the raw "AGENT SERVICE" form Deposco already accepts for carriers.
+  const mapped = SHIPVIA_MAP.get(agent.toUpperCase());
   return {
-    shipVendor: agent,
-    shipVia: [agent, service].filter(Boolean).join(' '),
+    shipVendor: mapped ? '' : agent,
+    shipVia: mapped ?? [agent, service].filter(Boolean).join(' '),
     freightTermsType: pick(so, 'LAX_Shipping_Payment_Type') || 'Prepaid',
     programId: pick(so, 'ProgramID', 'ProgramId').trim(),
   };
+}
+
+// Fallback when the transfer has no source SO: shuttle transfers carry the agent on their OWN
+// lines (TRFO001798 → FEHIVE had TO_WSTRLY and no SO at all, so its CO went over with no ship
+// via and parked in review). Only a MAPPED agent produces ShipInfo — an unmapped code (FEDEX)
+// falls through to the old no-ship-info path rather than leaking a BC code into Deposco.
+async function transferLineShipping(odata: string, token: string, no: string): Promise<ShipInfo | null> {
+  try {
+    for (const l of await getTransferLines(odata, token, no)) {
+      const mapped = SHIPVIA_MAP.get(pick(l, 'Shipping_Agent_Code').toUpperCase());
+      if (mapped) return { shipVia: mapped, shipVendor: '', freightTermsType: 'Prepaid', programId: '' };
+    }
+  } catch { /* the OData lines feed vanishes after prod refreshes — degrade to no ship info */ }
+  return null;
 }
 
 // ship (out of WMS) → Deposco customerOrder; ship-to is the transfer destination location,
@@ -216,7 +245,9 @@ function buildTransferAsCustomerOrder(header: BcRow, lines: BmiToLine[], ship: S
       // Programme code from the source sales order; ORDER_SOURCE when there's no source SO.
       orderSource: (ORDER_SOURCE_FROM_PROGRAM && ship?.programId) || ORDER_SOURCE,
       placedDate: toDateTime(pick(header, 'Posting_Date', 'Order_Date')),
-      ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
+      ...(ship?.shipVia ? { shipVia: ship.shipVia } : {}),
+      ...(ship?.shipVendor ? { shipVendor: ship.shipVendor } : {}),
+      ...(ship ? { freightTermsType: ship.freightTermsType } : {}),
       shipToContact: {
         attention: pick(header, 'Transfer_to_Contact', 'Transfer_to_Name'),
         // Deposco caps these at 30; a long destination name overflows the split (see NAME_MAX).
@@ -242,12 +273,14 @@ function buildTransferAsCustomerOrder(header: BcRow, lines: BmiToLine[], ship: S
   };
 }
 
-// Skip a customerOrder push if Deposco already has one (CO POST doesn't upsert — it dupes).
+// Skip a customerOrder push if Deposco already has a LIVE one (CO POST doesn't upsert — it
+// dupes). liveOnly: copies that are ALL cancelled count as absent, so cancelling a bad transfer
+// CO in Deposco lets the next tick push a clean replacement — the same remediation path the CO
+// worker uses (proven on DISO210970). Any non-cancelled copy still blocks the push.
 async function customerOrderExists(deposcoCfg: DeposcoConfig, externalOrderNumber: string): Promise<boolean> {
   const token = await getDeposcoToken(deposcoCfg);
-  const body = await authReq<{ data?: unknown[] }>('get',
-    `${deposcoCfg.apiBase}/orders/customerOrders`, token, { params: { externalOrderNumber } });
-  return (body.data?.length ?? 0) > 0;
+  const id = await lookupDeposcoOrderId(deposcoCfg, token, '/orders/customerOrders', { externalOrderNumber }, { liveOnly: true });
+  return id !== null;
 }
 
 // Outcome of a push attempt — so the caller can log ok vs "nothing pushed" (a data problem)
@@ -288,10 +321,16 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
     if (await customerOrderExists(deposcoCfg, no)) {
       console.log(`[push] ${no}: customerOrder already in Deposco — skipping create (no upsert)`);
     } else {
-      // ship-via comes from the source SO (PKSourceNo == Transfer_to_Contact == line SourceNo).
+      // A mapped shuttle agent on the transfer's OWN lines describes how THIS leg physically
+      // moves and beats the source SO's customer carrier — every shuttle transfer pushed with
+      // the SO's FEDEX has been hand-corrected to "… Shuttle" in Deposco (the whole completed
+      // EPDEC batch, TRFO001759/001806). The source SO still supplies ship-via when the lines
+      // carry no mapped agent, and is always the only source of programId.
       const sourceNo = pick(header, 'PKSourceNo', 'Transfer_to_Contact');
-      const ship = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
-      if (!ship) console.warn(`[push] ${no}: no source SO shipping found (source=${sourceNo || 'none'}) — CO may land in review`);
+      const soShip = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
+      const lineShip = await transferLineShipping(bcOdataBase(cfg), await getBcToken(cfg), no);
+      const ship = lineShip ? { ...lineShip, programId: soShip?.programId ?? '' } : soShip;
+      if (!ship) console.warn(`[push] ${no}: no source SO shipping and no mapped line agent (source=${sourceNo || 'none'}) — CO may land in review`);
       await postDeposcoOrder(cfg, deposcoCfg, '/orders/customerOrders', buildTransferAsCustomerOrder(header, lines, ship), no, `${lines.length} line(s) as CO (ship)${ship ? `, via ${ship.shipVia}${ship.programId ? `, program ${ship.programId}` : ''}` : ''}`, { worker: 'to' });
       posted++;
     }
