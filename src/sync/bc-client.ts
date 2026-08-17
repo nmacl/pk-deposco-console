@@ -145,7 +145,12 @@ export async function authReq<T>(
   const detail = (typeof body === 'string' ? body : JSON.stringify(body ?? ax?.message)).slice(0, 600);
   // 429 bodies are empty, which made failures read as a generic error with no cause. Say it.
   const note = status === 429 ? ` (Deposco rate limit — exhausted ${MAX_ATTEMPTS_RATE_LIMIT} attempts; raise DEPOSCO_MIN_INTERVAL_MS)` : '';
-  throw new Error(`${method.toUpperCase()} ${path} → HTTP ${status}${note}: ${detail}`);
+  const err = new Error(`${method.toUpperCase()} ${path} → HTTP ${status}${note}: ${detail}`) as Error & { httpStatus?: number };
+  // The real HTTP status as DATA, not just prose: callers that classify transient-vs-permanent
+  // (inv pull's dead-letter decision) were reading e.response?.status, got undefined on this
+  // wrapped Error, and mislabelled every failure — a permanent 400 held the cursor for 3 days.
+  err.httpStatus = ax?.response?.status;
+  throw err;
 }
 
 /** GET with a 4-attempt backoff. Used for all read-side BC calls. */

@@ -187,8 +187,12 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
       // stop the batch so the SAME id is reprocessed next tick, and keep doing so until it lands.
       // The batch stops rather than continues because these are applied in Deposco's order and
       // the cursor is a single high-water mark — skipping ahead would strand this one again.
-      const status = e.response?.status;
-      const transient = /deadlock/i.test(body) || status === 429 || (status !== undefined && status >= 500) || !e.response;
+      // authReq wraps failures in a plain Error carrying httpStatus — e.response only exists if
+      // the axios error somehow escaped raw. Without httpStatus, `!e.response` classified EVERY
+      // failure as transient, so a permanent 400 (#227, insufficient BC inventory) held the
+      // cursor from Aug 14 and 298 adjustments queued behind it unimported.
+      const status = e.response?.status ?? (err as { httpStatus?: number }).httpStatus;
+      const transient = /deadlock/i.test(body) || status === 429 || (status !== undefined && status >= 500) || (status === undefined && !e.response);
 
       // Say WHAT was lost, not just that something failed. authReq throws a plain Error (the
       // status is already baked into its message), so `e.response?.status` is undefined here and
