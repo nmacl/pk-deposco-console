@@ -29,7 +29,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment, ensureItemsExist } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
@@ -331,6 +331,9 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
       const lineShip = await transferLineShipping(bcOdataBase(cfg), await getBcToken(cfg), no);
       const ship = lineShip ? { ...lineShip, programId: soShip?.programId ?? '' } : soShip;
       if (!ship) console.warn(`[push] ${no}: no source SO shipping and no mapped line agent (source=${sourceNo || 'none'}) — CO may land in review`);
+      // Pre-flight: CO creates with unknown items land unlinked and unrepairable (see ensureItemsExist).
+      const preCreated = await ensureItemsExist(cfg, deposcoCfg, await getDeposcoToken(deposcoCfg), lines.map((l) => l.webshopVariantCode));
+      if (preCreated.length) console.log(`[push] ${no}: pre-created ${preCreated.length} missing item(s): ${preCreated.join(', ')}`);
       await postDeposcoOrder(cfg, deposcoCfg, '/orders/customerOrders', buildTransferAsCustomerOrder(header, lines, ship), no, `${lines.length} line(s) as CO (ship)${ship ? `, via ${ship.shipVia}${ship.programId ? `, program ${ship.programId}` : ''}` : ''}`, { worker: 'to' });
       posted++;
     }

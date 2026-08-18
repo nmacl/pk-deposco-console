@@ -39,7 +39,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, bcGetAll, pick, numOf, getCompanyId, authReq, mapWithConcurrency, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, type DeposcoTracking } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, ensureItemsExist, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
@@ -477,7 +477,12 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow,
   const payload = buildCustomerOrder(header, lines);
   const via = payload.customerOrder.shipVia;
   if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
-  const result = await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}`);
+  // Pre-flight: a CO created with an unknown item gets an unrepairable unlinked line, so make
+  // sure every item exists BEFORE the first push (a brand-new style's first order otherwise
+  // always lands broken and needs a manual cancel — DISO212053 et al).
+  const preCreated = await ensureItemsExist(bcCfg, deposcoCfg, dToken, payload.customerOrder.coLines.data.map((l) => l.itemNumber));
+  if (preCreated.length) console.log(`[push] ${soNumber}: pre-created ${preCreated.length} missing item(s): ${preCreated.join(', ')}`);
+  const result = await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}${preCreated.length ? `, ${preCreated.length} item(s) pre-created` : ''}`);
   if (result === 'ok') await auditPush(bcCfg, deposcoCfg, soNumber, payload, runId);
   return result;
 }

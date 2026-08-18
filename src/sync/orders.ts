@@ -255,6 +255,31 @@ export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: str
  * `intended` maps externalLineNumber -> the item number we asked for, which is the only way to
  * know what an unlinked line was SUPPOSED to be (Deposco keeps no record of the rejected value).
  */
+/**
+ * PRE-FLIGHT item check for customerOrder creates. Deposco's CO POST does not reject an unknown
+ * item — it creates the line with NO item linked, and CO lines cannot be repaired via the API,
+ * so the order is scrap the moment it lands (DISO212053/212014/211969: brand-new styles whose
+ * first-ever order beat the item into Deposco; each needed a manual cancel). Ensure every item
+ * exists BEFORE the first push — the same createMissingItem the after-the-fact audit uses, just
+ * run before the damage instead of after it. Returns the numbers it created. Never throws: a
+ * failed lookup/create degrades to today's behaviour (audit catches it after the push).
+ */
+export async function ensureItemsExist(bcCfg: SyncBcConfig, deposcoCfg: DeposcoConfig, token: string, numbers: string[]): Promise<string[]> {
+  const created: string[] = [];
+  for (const n of [...new Set(numbers)].filter(Boolean)) {
+    try {
+      const found = await authReq<{ data?: unknown[] }>('get', `${deposcoCfg.apiBase}/items`, token, { params: { number: n } });
+      if ((found.data?.length ?? 0) > 0) continue;
+      console.log(`[preflight] item ${n} not in Deposco — creating before the push`);
+      if (await createMissingItem(bcCfg, deposcoCfg, n)) created.push(n);
+      else console.warn(`[preflight] ${n}: create failed — the CO line will land unlinked (audit will retry after the push)`);
+    } catch (err) {
+      console.warn(`[preflight] ${n}: lookup failed (${err instanceof Error ? err.message.slice(0, 120) : err}) — pushing anyway, audit covers it`);
+    }
+  }
+  return created;
+}
+
 export interface PushAudit {
   orderId: number;
   checked: number;
