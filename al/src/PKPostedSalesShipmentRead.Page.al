@@ -49,6 +49,10 @@ page 60208 "PK Sales Shipment Read API"
                 field(deposcoTotalPackages; Rec."PK Deposco Total Packages") { }
                 field(deposcoTotalWeight; Rec."PK Deposco Total Weight") { }
                 field(deposcoContainerLpn; Rec."PK Deposco Container LPN") { }
+                // Order-level freight (see the tableextension for why it is order-level). Exposed
+                // so the backfill can tell "already written" from "never written" and so the value
+                // is verifiable without opening the card.
+                field(deposcoOrderFreightTot; Rec."PK Deposco Order Freight Tot") { }
                 field(deposcoSyncedAt; Rec."PK Deposco Synced At") { }
             }
         }

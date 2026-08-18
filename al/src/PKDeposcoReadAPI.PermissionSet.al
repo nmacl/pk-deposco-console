@@ -15,10 +15,13 @@ permissionset 60200 "PK Deposco Read API"
         page "PK Posted Sales Shipment API" = X,
         page "PK Sales Shipment Read API" = X,
         page "PK Sales Order API" = X,
+        page "PK Sales Return Order API" = X,
+        page "PK Sales Return Line API" = X,
         codeunit "PK Inv Adjustment Mgt" = X,
         codeunit "PK Ship Tracking Mgt" = X,
         codeunit "PK Optional Field" = X,
         codeunit "PK Sales Ship Mgt" = X,
+        codeunit "PK Sales Return Rcpt Mgt" = X,
         tabledata "Transfer Line" = R,
         tabledata "Purchase Line" = R,
         // Ship-only posting stages nothing itself, but Sales-Post reads/updates both the header

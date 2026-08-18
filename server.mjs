@@ -128,6 +128,21 @@ function runScheduledToSync() {
   child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); toBusy = false; });
 }
 
+// Scheduled RO sync (sales return orders → Deposco PO receive flow). Same gating shape as TO:
+// push on by default for the scheduled run, BC-side receipt posting gated by RO_POST_ENABLED.
+const RO_SCHEDULE_MS = parseInt(process.env.RO_SCHEDULE_MS ?? '300000', 10);
+let roBusy = false;
+function runScheduledRoSync() {
+  if (roBusy) { console.log('[schedule] RO sync skipped — previous run still running'); return; }
+  roBusy = true;
+  console.log(`[schedule] RO sync tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/ro/sync-ro.js'), '--once'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule', RO_PUSH_ENABLED: process.env.RO_PUSH_ENABLED ?? 'true' } });
+  child.stdout.on('data', (d) => process.stdout.write('[ro] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[ro] ' + d));
+  child.on('close', () => { roBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); roBusy = false; });
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -148,6 +163,7 @@ function authOk(req) {
 function workerFor(order) {
   const u = order.toUpperCase();
   if (u.startsWith('TRFO')) return { script: 'dist/to/sync-to.js', kind: 'transfer' };
+  if (u.startsWith('SRTO')) return { script: 'dist/ro/sync-ro.js', kind: 'sales return' };
   if (u.startsWith('WSP')) return { script: 'dist/po/sync-po.js', kind: 'purchase order' };
   if (/^(PKSO|WSOD|HDSO|DISO|TEST)/.test(u)) return { script: 'dist/co/sync-co.js', kind: 'sales order' };
   return null;
@@ -471,4 +487,5 @@ server.listen(PORT, () => {
   startScheduler('order push (Released SOs)', runScheduledOrderPush, ORDER_SCHEDULE_MS, 50_000);
   startScheduler('PO sync', runScheduledPoSync, PO_SCHEDULE_MS, 95_000);
   startScheduler('TO sync', runScheduledToSync, TO_SCHEDULE_MS, 140_000);
+  startScheduler('RO sync (returns)', runScheduledRoSync, RO_SCHEDULE_MS, 185_000);
 });
