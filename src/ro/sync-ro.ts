@@ -261,9 +261,12 @@ async function main(): Promise<void> {
   const orderIdx = process.argv.indexOf('--order');
   const orderArg = orderIdx >= 0 ? process.argv[orderIdx + 1] : null;
 
-  // No threshold → no sync, loudly. Chris's hand-processed history must never flow (see THRESHOLD).
-  if (!THRESHOLD) {
-    console.error('[ro-sync] RO_THRESHOLD is not set — refusing to run. Set it to the last hand-processed return order number (e.g. RO_THRESHOLD=SRTO001234); only orders AFTER it will sync.');
+  // No/malformed threshold → no sync, loudly. The filter is a STRING compare against order
+  // numbers, so a value that doesn't look like one silently opens the gate: RO_THRESHOLD=8560
+  // (prefix forgotten) let the entire backlog through on go-live day because 'SRTO…' > '8560'.
+  // RO_THRESHOLD=SRTO000001 is the explicit "sync everything" setting.
+  if (!THRESHOLD || !THRESHOLD.toUpperCase().startsWith(PREFIX.toUpperCase())) {
+    console.error(`[ro-sync] RO_THRESHOLD ${THRESHOLD ? `'${THRESHOLD}' doesn't start with '${PREFIX}'` : 'is not set'} — refusing to run. Set it to a full order number (e.g. RO_THRESHOLD=${PREFIX}008590); only orders AFTER it sync. ${PREFIX}000001 = sync everything.`);
     process.exit(1);
   }
   if (orderArg && orderArg.toUpperCase() <= THRESHOLD.toUpperCase()) {
