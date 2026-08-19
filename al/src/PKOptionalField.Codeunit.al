@@ -44,4 +44,104 @@ codeunit 60221 "PK Optional Field"
         FldRef.Value := CopyStr(NewValue, 1, FldRef.Length);
         exit(true);
     end;
+
+    /// Decimal write with the same interlock as TrySetText. Caller owns the RecRef.Modify().
+    procedure TrySetDecimal(var RecRef: RecordRef; FieldNo: Integer; ExpectedName: Text; NewValue: Decimal): Boolean
+    var
+        FldRef: FieldRef;
+    begin
+        if not RecRef.FieldExist(FieldNo) then
+            exit(false);
+        FldRef := RecRef.Field(FieldNo);
+        if FldRef.Type <> FieldType::Decimal then
+            exit(false);
+        if not NameMatches(FldRef, ExpectedName) then
+            exit(false);
+        FldRef.Value := NewValue;
+        exit(true);
+    end;
+
+    /// Decimal read. Unlike AsCode this REQUIRES the name to match: these values feed arithmetic
+    /// (markup %), where a blind read landing on an unrelated decimal would silently price an
+    /// order wrong instead of visibly degrading to blank the way a display column does.
+    procedure TryGetDecimal(RecRef: RecordRef; FieldNo: Integer; ExpectedName: Text; var Value: Decimal): Boolean
+    var
+        FldRef: FieldRef;
+    begin
+        Value := 0;
+        if not RecRef.FieldExist(FieldNo) then
+            exit(false);
+        FldRef := RecRef.Field(FieldNo);
+        if FldRef.Type <> FieldType::Decimal then
+            exit(false);
+        if not NameMatches(FldRef, ExpectedName) then
+            exit(false);
+        Value := FldRef.Value;
+        exit(true);
+    end;
+
+    /// Code/Text read with the name interlock, for values used as FILTERS or keys (G/L account
+    /// no.) rather than display — same wrong-field rationale as TryGetDecimal.
+    procedure TryGetCode(RecRef: RecordRef; FieldNo: Integer; ExpectedName: Text; var Value: Text): Boolean
+    var
+        FldRef: FieldRef;
+    begin
+        Value := '';
+        if not RecRef.FieldExist(FieldNo) then
+            exit(false);
+        FldRef := RecRef.Field(FieldNo);
+        if not (FldRef.Type in [FieldType::Text, FieldType::Code]) then
+            exit(false);
+        if not NameMatches(FldRef, ExpectedName) then
+            exit(false);
+        Value := Format(FldRef.Value);
+        exit(true);
+    end;
+
+    /// Option/Enum counterpart of TryGetCode. TryGetCode deliberately refuses anything that is
+    /// not Text or Code, so an Option field owned by another extension had no safe reader.
+    /// Returns the option's CAPTION-independent identifier via Format(), which is what AL
+    /// comparisons against a literal like 'Third Party' expect.
+    ///
+    /// Same number+name interlock and the same reason: field numbers only mean something inside
+    /// the app that owns them, and reading 14000617 blind in an environment without Lanham
+    /// E-Ship could land on an unrelated field.
+    procedure TryGetOptionText(RecRef: RecordRef; FieldNo: Integer; ExpectedName: Text; var Value: Text): Boolean
+    var
+        FldRef: FieldRef;
+    begin
+        Value := '';
+        if not RecRef.FieldExist(FieldNo) then
+            exit(false);
+        FldRef := RecRef.Field(FieldNo);
+        if not (FldRef.Type in [FieldType::Option]) then
+            exit(false);
+        if not NameMatches(FldRef, ExpectedName) then
+            exit(false);
+        Value := Format(FldRef.Value);
+        exit(true);
+    end;
+
+    /// SetRange on an optional field, interlocked like the writers: filtering posted purchase
+    /// invoices by PK_BC18_TAB's SalesOrderNo (50010) on the wrong field would quietly match
+    /// nothing — or worse, everything — so refuse unless number AND name agree.
+    procedure TrySetRange(var RecRef: RecordRef; FieldNo: Integer; ExpectedName: Text; Value: Text): Boolean
+    var
+        FldRef: FieldRef;
+    begin
+        if not RecRef.FieldExist(FieldNo) then
+            exit(false);
+        FldRef := RecRef.Field(FieldNo);
+        if not (FldRef.Type in [FieldType::Text, FieldType::Code]) then
+            exit(false);
+        if not NameMatches(FldRef, ExpectedName) then
+            exit(false);
+        FldRef.SetRange(Value);
+        exit(true);
+    end;
+
+    local procedure NameMatches(FldRef: FieldRef; ExpectedName: Text): Boolean
+    begin
+        exit(UpperCase(DelChr(FldRef.Name, '<>', ' ')) = UpperCase(DelChr(ExpectedName, '<>', ' ')));
+    end;
 }

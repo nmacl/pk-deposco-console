@@ -25,6 +25,7 @@ plus the inventory-adjustment write path (item-journal post).
 | `PKShipTracking.Table` (60211) | Table | Buffer/audit table for the tracking write-back. `InherentPermissions = RIMDX` (same reason as 60210). |
 | `PKShipTrackingMgt.Codeunit` (60222) | Codeunit | Applies a buffer row onto the posted shipment. Holds `Permissions = tabledata "Sales Shipment Header" = RM` — a page modifying it directly runs under the CALLER's rights and 403s on the S2S license. Also mirrors the carrier into UPG's `PackageCarrier` (50130) and handles `clearTracking`. |
 | `PKPostedSalesShipmentAPI.Page` (60207) | API page | `bmiShipmentTrackings` — POST tracking, applied-on-insert. Match by `shipmentNo` or `externalDocumentNo` (the `SHIP-{soNo}-{epoch}` ref sync-co.ts stamps before posting). |
+| `PKIPaymentFix.Table` (60214) / `PKIPaymentFixAPI.Page` (60214) / `PKIPaymentFixMgt.Codeunit` (60226) | Table / API page / Codeunit | **One-off ops tool** (`bmiIPaymentFixes`, execute-on-insert): LIST/DELETE rows of iSolutions' iPayments Customer Setup table 70437044 via RecordRef (no dependency) + guarded customer RENAME. Added for the "customer S → CTDI003931" fix (Aug 2026); remove once obsolete. |
 | `PKDeposcoReadAPI.PermissionSet` | PermissionSet | Grants all pages/codeunits/tabledata. |
 
 ## Build (headless, macOS)

@@ -22,6 +22,11 @@ permissionset 60200 "PK Deposco Read API"
         codeunit "PK Optional Field" = X,
         codeunit "PK Sales Ship Mgt" = X,
         codeunit "PK Sales Return Rcpt Mgt" = X,
+        // One-off iPayment fix surface (LIST/DELETE on iSolutions table 70437044 rides on the
+        // API user's own permission sets — RecordRef, not declarable here without a dependency).
+        page "PK IPayment Fix API" = X,
+        codeunit "PK IPayment Fix Mgt" = X,
+        tabledata "PK IPayment Fix" = RIMD,
         tabledata "Transfer Line" = R,
         tabledata "Purchase Line" = R,
         // Ship-only posting stages nothing itself, but Sales-Post reads/updates both the header
@@ -42,5 +47,11 @@ permissionset 60200 "PK Deposco Read API"
         // Tracking write-back: buffer/audit table + annotate an already-posted sales
         // shipment (no insert/delete). The elevated Modify runs in "PK Ship Tracking Mgt".
         tabledata "PK Ship Tracking" = RIMD,
-        tabledata "Sales Shipment Header" = RM;
+        tabledata "Sales Shipment Header" = RM,
+        // Kept from the rolled-back shipping-cost button (2.12): harmless reads, and removing
+        // grants is what breaks callers. The codeunit/pageext sources are parked in al-hold/.
+        tabledata "Purch. Inv. Header" = R,
+        tabledata "Purch. Inv. Line" = R,
+        tabledata "Purchases & Payables Setup" = R,
+        tabledata "Sales & Receivables Setup" = R;
 }
