@@ -106,33 +106,45 @@ codeunit 60225 "PK Deposco Ship Cost"
             WriteFreightLine(SalesHeader, Total, PoFreight);
     end;
 
-    /// Materialises the customer-facing freight line for the one case release refuses to handle.
-    ///
-    /// Deliberately mirrors RecreateShippingCostLines field-for-field — same G/L account from
-    /// Sales & Receivables Setup, Unit Price = the marked-up charge, Unit Cost (LCY) = raw
-    /// inbound vendor freight, Quantity 1, Location/Responsibility Centre/Order Type off the
-    /// header — so an invoice cannot tell which code path produced it.
-    ///
-    /// Only ever touches a line with Qty. Invoiced (Base) = 0, the same protection release uses:
-    /// an already-invoiced freight line is never rewritten. Existing lines are overwritten rather
-    /// than added to, so clicking the button twice recalculates instead of stacking.
-    ///
-    /// If PK_BC_customization ever drops its Third Party gate, release would find this line,
-    /// delete it (uninvoiced) and rebuild it from the same ShippingCost and Purchase Shipping
-    /// Cost — same numbers, no duplicate. Whoever owns that app should know we lean on it.
+    // Materialises the customer-facing freight line for the one case release refuses to handle.
+    // 
+    // Deliberately mirrors RecreateShippingCostLines field-for-field — same G/L account from
+    // Sales & Receivables Setup, Unit Price = the marked-up charge, Unit Cost (LCY) = raw
+    // inbound vendor freight, Quantity 1, Location/Responsibility Centre/Order Type off the
+    // header — so an invoice cannot tell which code path produced it.
+    // 
+    // Only ever touches a line with Qty. Invoiced (Base) = 0, the same protection release uses:
+    // an already-invoiced freight line is never rewritten. Existing lines are overwritten rather
+    // than added to, so clicking the button twice recalculates instead of stacking.
+    // 
+    // If PK_BC_customization ever drops its Third Party gate, release would find this line,
+    // delete it (uninvoiced) and rebuild it from the same ShippingCost and Purchase Shipping
+    // Cost — same numbers, no duplicate. Whoever owns that app should know we lean on it.
     local procedure WriteFreightLine(SalesHeader: Record "Sales Header"; ChargeAmount: Decimal; RawInboundCost: Decimal)
     var
         SalesSetup: Record "Sales & Receivables Setup";
         SalesLine: Record "Sales Line";
+        Opt: Codeunit "PK Optional Field";
+        SetupRef: RecordRef;
+        FreightAcc: Text;
         NextLineNo: Integer;
+        FreightAccMissingErr: Label 'Sales & Receivables Setup field 50002 "Sales Shipping Cost G/L Acc." was not found or is blank. Is PK_BC18_TAB installed in this environment?';
     begin
+        // The freight account is PK_BC18_TAB's (Sales & Receivables Setup 50002), not a standard
+        // field, so it is read by number + name like everything else here rather than by taking a
+        // dependency on that app. Blank or missing is an ERROR, not a silent skip: posting the
+        // line to the wrong account would be worse than refusing.
         SalesSetup.Get();
-        SalesSetup.TestField("Sales Shipping Cost G/L Acc.");
+        SetupRef.GetTable(SalesSetup);
+        if not Opt.TryGetCode(SetupRef, 50002, 'Sales Shipping Cost G/L Acc.', FreightAcc) then
+            Error(FreightAccMissingErr);
+        if FreightAcc = '' then
+            Error(FreightAccMissingErr);
 
         SalesLine.SetRange("Document Type", SalesHeader."Document Type");
         SalesLine.SetRange("Document No.", SalesHeader."No.");
         SalesLine.SetRange(Type, SalesLine.Type::"G/L Account");
-        SalesLine.SetRange("No.", SalesSetup."Sales Shipping Cost G/L Acc.");
+        SalesLine.SetRange("No.", CopyStr(FreightAcc, 1, 20));
         SalesLine.SetRange("Qty. Invoiced (Base)", 0);
         if SalesLine.FindFirst() then begin
             SalesLine.Validate("Unit Cost (LCY)", RawInboundCost);
@@ -154,7 +166,7 @@ codeunit 60225 "PK Deposco Ship Cost"
         SalesLine.Validate("Line No.", NextLineNo);
         SalesLine.Insert(true);
         SalesLine.Validate(Type, SalesLine.Type::"G/L Account");
-        SalesLine.Validate("No.", SalesSetup."Sales Shipping Cost G/L Acc.");
+        SalesLine.Validate("No.", CopyStr(FreightAcc, 1, 20));
         SalesLine.Validate("Location Code", SalesHeader."Location Code");
         SalesLine.Validate("Responsibility Center", SalesHeader."Responsibility Center");
         SalesLine.Validate(Quantity, 1);
@@ -163,7 +175,12 @@ codeunit 60225 "PK Deposco Ship Cost"
         SalesLine.Modify(true);
     end;
 
-    // Freight terms live on Lanham E-Ship's "LAX Shipping Payment Type" (Sales Header 14000617).
+    // Freight terms live on Lanham E-Ship's "LAX Shipping Payment Type", Sales Header field
+    // 14000716. NOT 14000617 — that is the Enum OBJECT's id, which is what the symbol file shows
+    // in the field's TypeDefinition. Using it meant FieldExist() was false, the guard silently
+    // returned "not third party", and DISO211844 billed $19.40 of outbound Deposco freight it
+    // should never have seen. Verified against the Lanham symbol reference: Sales Header 14000716,
+    // Sales Line 14000722, Sales Shipment Header 14000716.
     // Read through PK Optional Field by number AND name: Lanham is being sunsetted, and this way
     // its removal degrades the check to "not third party" instead of breaking the button. It is
     // also not a new dependency — the Deposco customerOrder push already sources freightTermsType
@@ -173,10 +190,14 @@ codeunit 60225 "PK Deposco Ship Cost"
         Opt: Codeunit "PK Optional Field";
         HdrRef: RecordRef;
         PaymentType: Text;
+        PaymentTypeUnreadableErr: Label 'Could not read Sales Header field 14000716 "LAX Shipping Payment Type". Is Lanham E-Ship installed? Refusing to calculate: assuming NOT third party here would bill the customer for freight on their own carrier account.';
     begin
+        // Deliberately an ERROR, not a silent exit(false). An unreadable payment type used to
+        // degrade to "not third party", which is the dangerous direction — it bills outbound
+        // freight that belongs on the customer's account. Refuse instead.
         HdrRef.GetTable(SalesHeader);
-        if not Opt.TryGetOptionText(HdrRef, 14000617, 'LAX Shipping Payment Type', PaymentType) then
-            exit(false);
+        if not Opt.TryGetOptionText(HdrRef, 14000716, 'LAX Shipping Payment Type', PaymentType) then
+            Error(PaymentTypeUnreadableErr);
         exit(PaymentType.ToLower().Replace(' ', '') = 'thirdparty');
     end;
 

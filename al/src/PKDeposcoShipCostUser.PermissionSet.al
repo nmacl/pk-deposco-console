@@ -12,7 +12,7 @@
 ///
 /// The table access the calculation needs is declared on codeunit 60225 itself, so it is not
 /// repeated here — that is the point of putting it there.
-permissionset 60201 "PK Deposco Ship Cost User"
+permissionset 60201 "PK Deposco Freight"
 {
     Assignable = true;
     Caption = 'PK Deposco Calculate Shipping Price';

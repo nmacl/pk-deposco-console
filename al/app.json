@@ -4,7 +4,7 @@
   "publisher": "Parsons Kellogg",
   "brief": "Read-only line API pages for the BC-Deposco middleware",
   "description": "Adds read-only API pages under api/bmi/pk/v1.0 that return document lines flattened (No., Line No., quantities, and later WebshopVariantCode + Location Code) in a single GET, eliminating GUID-resolution round-trips in the Node middleware.",
-  "version": "2.12.0.0",
+  "version": "2.12.0.1",
   "platform": "27.0.0.0",
   "application": "27.0.0.0",
   "runtime": "16.0",
