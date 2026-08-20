@@ -9,6 +9,9 @@
  *                      bmiSalesOrderLines, bmiTransferOrderLines. See al/.)
  */
 import axios, { type AxiosError } from 'axios';
+import { mkdirSync, readFileSync, rmdirSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { getBcToken, ipv4Agent } from '../auth.js';
 import type { SyncBcConfig } from './config.js';
 
@@ -45,18 +48,62 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  */
 // ── Deposco rate limiter (Deposco allows ~4 req/sec) ────────────────────────────
 // Space Deposco calls ≥ DEPOSCO_MIN_INTERVAL_MS apart (default 350ms ≈ 2.8/s, comfortable margin
-// under 4/s even if two worker processes briefly overlap).
-// A chained promise serializes acquisition so even concurrent callers stay spaced. Per-process
-// (each scheduled worker is its own process) — combined with staggered scheduler starts + the
-// 429 backoff below, this keeps us under Deposco's limit.
+// under 4/s).
+//
+// The limit is ACCOUNT-WIDE while the workers are separate processes, and the 45s scheduler
+// stagger only separates their STARTS: measured 2026-08-20, po ticks run ~200-245s, to ~160-200s,
+// ro ~120-137s (all every 5 min) and co ticks run ~36 MINUTES, so 3-4 workers fire concurrently
+// most of the time — a per-process 350ms spacing multiplied out to ~11 req/s and daily 429 storms
+// that exhausted even the 8-attempt budget. So the schedule is shared through the filesystem
+// (every worker is spawned by server.mjs in the same container): a lock directory (mkdir is
+// atomic) guards a "next free slot" timestamp file; each caller claims slot = max(now, last +
+// interval), advances the file, and sleeps until its slot. The in-process promise chain stays as
+// a cheap first stage so one process's concurrent callers queue without spinning on the lock.
 const DEPOSCO_MIN_INTERVAL_MS = parseInt(process.env.DEPOSCO_MIN_INTERVAL_MS ?? '350', 10);
+const THROTTLE_DIR = process.env.DEPOSCO_THROTTLE_DIR ?? join(tmpdir(), 'pk-deposco-throttle');
+const THROTTLE_LOCK = join(THROTTLE_DIR, 'lock');
+const THROTTLE_SLOT = join(THROTTLE_DIR, 'next-slot');
+// A crashed holder must not wedge every worker: a lock this old is stale and gets stolen.
+const LOCK_STALE_MS = 5_000;
+
+const jitter = (base: number): number => base + Math.floor(Math.random() * base);
+
+/** Claim the next global send slot (epoch ms). Falls back to "now" if the fs is unusable —
+ *  a broken throttle file must degrade to the old per-process behaviour, never block syncs. */
+async function claimDeposcoSlot(): Promise<number> {
+  try {
+    mkdirSync(THROTTLE_DIR, { recursive: true });
+    const giveUpAt = Date.now() + 30_000;
+    for (;;) {
+      try { mkdirSync(THROTTLE_LOCK); break; } catch {
+        try { if (Date.now() - statSync(THROTTLE_LOCK).mtimeMs > LOCK_STALE_MS) rmdirSync(THROTTLE_LOCK); } catch { /* raced another waiter */ }
+        if (Date.now() > giveUpAt) return Date.now();
+        await new Promise((r) => setTimeout(r, jitter(15)));
+      }
+    }
+    try {
+      let last = 0;
+      try { last = Number(readFileSync(THROTTLE_SLOT, 'utf8')) || 0; } catch { /* first call */ }
+      const slot = Math.max(Date.now(), last + DEPOSCO_MIN_INTERVAL_MS);
+      writeFileSync(THROTTLE_SLOT, String(slot));
+      return slot;
+    } finally {
+      try { rmdirSync(THROTTLE_LOCK); } catch { /* stolen as stale */ }
+    }
+  } catch {
+    const slot = Math.max(Date.now(), lastDeposcoAt + DEPOSCO_MIN_INTERVAL_MS);
+    lastDeposcoAt = slot;
+    return slot;
+  }
+}
+
 let deposcoChain: Promise<void> = Promise.resolve();
 let lastDeposcoAt = 0;
 export function deposcoThrottle(): Promise<void> {
   const p = deposcoChain.then(async () => {
-    const wait = lastDeposcoAt + DEPOSCO_MIN_INTERVAL_MS - Date.now();
+    const slot = await claimDeposcoSlot();
+    const wait = slot - Date.now();
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    lastDeposcoAt = Date.now();
   });
   deposcoChain = p.catch(() => {});
   return p;
