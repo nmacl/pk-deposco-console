@@ -6,7 +6,8 @@
  *   2. For each PO:
  *      - Push BC → Deposco: POST /orders/purchaseOrders (creates Deposco PO)
  *      - Pull Deposco → BC: aggregate /receipts, diff vs BC receivedQuantity,
- *        post receive-only via Microsoft.NAV.receiveAndInvoice (invoiceQty=0)
+ *        post receive-only via bmiPurchaseReceipts (AL: PK Purch Receive Mgt) —
+ *        one POST per pull, tagged RCPT-{poNo}-{epoch} on the posted receipt
  *
  * Env:
  *   SYNC_INTERVAL_MS  (default 60000)   — sleep between ticks
@@ -123,44 +124,6 @@ async function getLines(
   const body = await authReq<{ value: BcPurchaseOrderLine[] }>('get',
     `${base}/companies(${companyId})/purchaseOrders(${poId})/purchaseOrderLines`, token);
   return body.value;
-}
-
-async function patchLine(
-  base: string,
-  token: string,
-  companyId: string,
-  lineId: string,
-  body: Record<string, unknown>,
-): Promise<Record<string, unknown>> {
-  return authReq<Record<string, unknown>>('patch',
-    `${base}/companies(${companyId})/purchaseOrderLines(${lineId})`, token,
-    { data: body, headers: { 'If-Match': '*' } });
-}
-
-async function setVendorInvoiceNo(
-  odata: string,
-  token: string,
-  poNumber: string,
-  vendorInvNo: string,
-): Promise<void> {
-  const body = await authReq<{ value: Array<{ '@odata.etag': string }> }>('get',
-    `${odata}/Purchase_Order?$filter=No eq '${poNumber}'`, token);
-  const po = body.value[0];
-  if (!po) throw new Error(`PO ${poNumber} not found via ODataV4`);
-  await authReq('patch',
-    `${odata}/Purchase_Order(Document_Type='Order',No='${poNumber}')`, token,
-    { data: { Vendor_Invoice_No: vendorInvNo }, headers: { 'If-Match': po['@odata.etag'] } });
-}
-
-async function postReceiveAndInvoice(
-  base: string,
-  token: string,
-  companyId: string,
-  poId: string,
-): Promise<void> {
-  await authReq('post',
-    `${base}/companies(${companyId})/purchaseOrders(${poId})/Microsoft.NAV.receiveAndInvoice`, token,
-    { data: {} });
 }
 
 // A flattened purchase-order line from our sibling extension's bmiPurchaseOrderLines
@@ -326,54 +289,45 @@ async function pushPo(
 // ────────────────────────────────────────────────────────────────────────────
 
 interface ReceiveLine {
-  lineId: string;
+  lineNo: number; // BC "Line No." (the api page's `sequence`)
   label: string;
   quantity: number;
 }
 
+interface BmiPurchaseReceiptRow {
+  postedReceiptNo?: string;
+  linesReceived?: number;
+  alreadyPosted?: boolean;
+}
+
+// One POST to bmiPurchaseReceipts posts a receive-only purchase receipt in a single BC
+// transaction (AL: PK Purch Receive Mgt). Replaces the old flow — Vendor-Invoice-No. stamp +
+// 2 PATCHes per line + Microsoft.NAV.receiveAndInvoice — which existed only because the
+// standard action refuses to post with an empty Vendor Invoice No. even at invoiceQty=0. The
+// RCPT-… ref now lands in the dedicated "PK Deposco Receipt Ref" (PO card + every posted
+// receipt it creates), and Vendor Invoice No. stays free for AP's real vendor invoice number.
 async function postReceiveOnly(
   bcCfg: BcConfig,
   companyId: string,
   po: BcPurchaseOrder,
   lines: ReceiveLine[],
 ): Promise<void> {
-  const base = bcApiBase(bcCfg);
-  const odata = bcOdataBase(bcCfg);
   const receiptRef = `RCPT-${po.number}-${Date.now()}`;
-  let token = await getBcToken(bcCfg);
-  await setVendorInvoiceNo(odata, token, po.number, receiptRef);
+  const linesSpec = lines.map((l) => `${l.lineNo}:${l.quantity}`).join(',');
+  console.log(`[pull] ${po.number}: POST bmiPurchaseReceipts ref=${receiptRef} lines=${linesSpec}`);
 
-  console.log(`[pull] ${po.number}: vendor invoice ref = ${receiptRef}`);
+  const token = await getBcToken(bcCfg);
+  const row = await authReq<BmiPurchaseReceiptRow>('post',
+    `${bmiApiBase(bcCfg)}/companies(${companyId})/bmiPurchaseReceipts`, token, {
+      data: { orderNo: po.number, deposcoReceiptRef: receiptRef, lines: linesSpec },
+      timeout: 120_000,
+    });
 
-  for (const line of lines) {
-    token = await getBcToken(bcCfg);
-    await patchLine(base, token, companyId, line.lineId, { receiveQuantity: line.quantity });
-    token = await getBcToken(bcCfg);
-    const r = await patchLine(base, token, companyId, line.lineId, { invoiceQuantity: 0 });
-    console.log(`  PATCHed ${po.number} ${line.label}: pending receiveQty=${r['receiveQuantity']} invoiceQty=${r['invoiceQuantity']}`);
+  if (row.alreadyPosted) {
+    console.log(`[pull] ${po.number}: ref ${receiptRef} was already posted as ${row.postedReceiptNo} — no-op`);
+    return;
   }
-
-  console.log(`[pull] ${po.number}: POST receiveAndInvoice...`);
-  token = await getBcToken(bcCfg);
-  await postReceiveAndInvoice(base, token, companyId, po.id);
-
-  // Verify BC actually advanced — re-GET lines and show new receivedQuantity / invoicedQuantity.
-  // If invoicedQuantity bumped from 0, we accidentally invoiced (would be a bug).
-  token = await getBcToken(bcCfg);
-  const after = await getLines(base, token, companyId, po.id);
-  const afterMap = new Map(after.map((l) => [l.id, l]));
-  console.log(`[pull] ${po.number}: BC state after post:`);
-  for (const line of lines) {
-    const a = afterMap.get(line.lineId);
-    if (!a) {
-      console.log(`  ${line.label}: line not found in post-state`);
-      continue;
-    }
-    const invStr = (a as { invoicedQuantity?: number }).invoicedQuantity ?? 0;
-    const flag = invStr > 0 ? ' ⚠ INVOICED' : '';
-    console.log(`  ${line.label}: received=${a.receivedQuantity} invoiced=${invStr}${flag} (posted +${line.quantity})`);
-  }
-  console.log(`[pull] ${po.number}: ✓ receipt posted (receive-only, ref=${receiptRef})`);
+  console.log(`[pull] ${po.number}: ✓ posted receipt ${row.postedReceiptNo ?? '?'} (receive-only, ${row.linesReceived ?? lines.length} line(s), ref=${receiptRef})`);
 }
 
 async function pullReceiptsForPo(
@@ -447,7 +401,7 @@ async function pullReceiptsForPo(
     const flag = delta > 0 ? '→ POST' : delta === 0 ? '✓ in sync' : 'BC ahead, SKIP';
     console.log(`  seq=${seq} item=${item} deposco=${depQty} bc=${bcQty} delta=${delta} ${flag}`);
     if (delta > 0) {
-      toReceive.push({ lineId: bcLine.id, label: `seq${seq}/${bcLine.lineObjectNumber}`, quantity: delta });
+      toReceive.push({ lineNo: seq, label: `seq${seq}/${bcLine.lineObjectNumber}`, quantity: delta });
     } else if (delta === 0) {
       inSync++;
     } else {

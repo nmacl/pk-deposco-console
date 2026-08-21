@@ -27,6 +27,12 @@ permissionset 60200 "PK Deposco Read API"
         page "PK IPayment Fix API" = X,
         codeunit "PK IPayment Fix Mgt" = X,
         tabledata "PK IPayment Fix" = RIMD,
+        // Receive-only purchase posting (replaces the receiveAndInvoice + Vendor-Invoice-No.
+        // workaround). Header/line writes are elevated inside "PK Purch Receive Mgt".
+        page "PK Purch Receipt API" = X,
+        codeunit "PK Purch Receive Mgt" = X,
+        tabledata "PK Purch Receipt" = RIMD,
+        tabledata "Purch. Rcpt. Header" = R,
         tabledata "Transfer Line" = R,
         tabledata "Purchase Line" = R,
         // Ship-only posting stages nothing itself, but Sales-Post reads/updates both the header
