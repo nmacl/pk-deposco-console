@@ -70,6 +70,44 @@ export async function logEvent(ev: SyncEvent): Promise<void> {
   } catch (e) { console.warn(`[db-log] logEvent: ${(e as Error).message}`); }
 }
 
+/**
+ * Entities that have been failing for more than a day — the ones a watermark must be allowed to
+ * move past (see pullFromShipments).
+ *
+ * A watermark that holds back to its oldest failure is correct for a TRANSIENT fault: the work
+ * is reconsidered next tick and the mark catches up. For a PERMANENT one it is the old bug in
+ * slow motion — the mark parks on that entity's stamp and "everything since" grows without
+ * bound, which is exactly how the shipment sweep reached 2424 shipments a tick.
+ *
+ * `dailyDedupe` collapses a repeated failure to one row per entity per day per distinct message,
+ * so the number of DISTINCT DAYS an entity appears is a good "still broken" signal and a bad
+ * one for a blip. Two days means it survived a full cycle of retries.
+ *
+ * Returns an empty set when there is no DB — callers then behave exactly as before.
+ */
+export async function chronicFailures(
+  worker: string,
+  action: string,
+  opts: { lookbackDays?: number; minDays?: number } = {},
+): Promise<Set<string>> {
+  const p = getPool();
+  if (!p) return new Set();
+  const lookback = opts.lookbackDays ?? 7;
+  const minDays = opts.minDays ?? 2;
+  try {
+    const r = await p.query(
+      `select entity_id, count(distinct (ts at time zone 'UTC')::date) as days
+         from sync_events
+        where worker = $1 and action = $2 and status = 'fail'
+          and entity_id is not null
+          and ts > now() - ($3 || ' days')::interval
+        group by entity_id
+       having count(distinct (ts at time zone 'UTC')::date) >= $4`,
+      [worker, action, String(lookback), minDays]);
+    return new Set(r.rows.map((row) => row.entity_id as string));
+  } catch (e) { console.warn(`[db-log] chronicFailures: ${(e as Error).message}`); return new Set(); }
+}
+
 // ── Cursors (sync_cursors) ─────────────────────────────────────────────────
 // High-water marks live in the DB so they survive Railway restarts / redeploys (the old
 // .inv-state.json file is ephemeral there). Returns null when no DB or no row yet.

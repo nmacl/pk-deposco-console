@@ -192,7 +192,12 @@ export async function authReq<T>(
   const detail = (typeof body === 'string' ? body : JSON.stringify(body ?? ax?.message)).slice(0, 600);
   // 429 bodies are empty, which made failures read as a generic error with no cause. Say it.
   const note = status === 429 ? ` (Deposco rate limit — exhausted ${MAX_ATTEMPTS_RATE_LIMIT} attempts; raise DEPOSCO_MIN_INTERVAL_MS)` : '';
-  const err = new Error(`${method.toUpperCase()} ${path} → HTTP ${status}${note}: ${detail}`) as Error & { httpStatus?: number };
+  // CAUSE FIRST, path last. Callers truncate this into a log column (sync_events.message is
+  // sliced to ~180-300 chars); with the path leading, a long BC resource URL — tenant GUID,
+  // company GUID, systemId GUID — ate the entire budget and every failure logged as a bare
+  // "POST /v2.0/…/bmiSalesOrders(…)/Microsoft.NAV" with the actual error cut off the end. Weeks
+  // of postShipment timeouts were invisible in /logs for exactly this reason.
+  const err = new Error(`HTTP ${status}${note}: ${detail} — ${method.toUpperCase()} ${path}`) as Error & { httpStatus?: number };
   // The real HTTP status as DATA, not just prose: callers that classify transient-vs-permanent
   // (inv pull's dead-letter decision) were reading e.response?.status, got undefined on this
   // wrapped Error, and mislabelled every failure — a permanent 400 held the cursor for 3 days.

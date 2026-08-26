@@ -40,7 +40,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, bcGetAll, pick, numOf, getCompanyId, authReq, mapWithConcurrency, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, ensureItemsExist, type DeposcoTracking } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor, chronicFailures } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -60,6 +60,12 @@ const PUSH_CONCURRENCY = parseInt(process.env.SO_PUSH_CONCURRENCY ?? '6', 10);
 // Tracking write-back onto the posted sales shipment. Needs the AL extension (>= v2.4.0.0,
 // page bmiShipmentTrackings) published to the target BC environment.
 const TRACKING_ENABLED = (process.env.SO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
+// Posting a shipment in BC writes item ledger + reservation entries and runs the posting
+// routines; on a many-line order that routinely passes the 30s authReq default and comes back
+// ECONNABORTED, so the post is never confirmed even when BC completed it. The `to` and `ro`
+// workers already learned this (TO_POST_TIMEOUT_MS / RO_POST_TIMEOUT_MS); `co` was left on the
+// default and every timeout cost a whole tick AND pinned the shipment cursor. Same value here.
+const POST_TIMEOUT_MS = parseInt(process.env.CO_POST_TIMEOUT_MS ?? '180000', 10);
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
 // Deposco orderSource. For customer orders this carries the BC sales order's ProgramID
 // (THDMET / DI / WBB / CORP / …) so Deposco can see which programme an order belongs to.
@@ -587,7 +593,12 @@ async function postShipmentOnly(cfg: BcConfig, token: string, companyId: string,
   const row = (await authReq<{ value: Array<{ systemId: string }> }>('get',
     `${bmi}/bmiSalesOrders?$filter=${encodeURIComponent(`no eq '${odataStr(soNumber)}'`)}`, token)).value?.[0];
   if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.8.0.0 installed?`);
-  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.postShipment`, token, { data: {} });
+  // Deliberately NOT retried on timeout: a POST that timed out may well have posted, and firing
+  // it again would double-ship. Safe to let go — the next pass recomputes delta = deposcoQty −
+  // bcShippedQty, so a post that landed shows as delta 0 and one that didn't is retried from
+  // scratch. The loop is self-correcting; a blind retry is not. (Mirrors sync-to.ts.)
+  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.postShipment`, token,
+    { data: {}, timeout: POST_TIMEOUT_MS });
 }
 
 // The posted shipment this run created, identified by diffing the order's shipments around the
@@ -619,12 +630,24 @@ async function shipmentNosForOrder(cfg: BcConfig, token: string, companyId: stri
 
 interface ShipLine { lineId: string; label: string; quantity: number }
 
-async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, runId: number | null = null): Promise<void> {
+/**
+ * Why this reports an outcome instead of returning void.
+ *
+ * Every early return below is a legitimate "nothing to do" — but they were all SILENT, logged to
+ * stdout and nowhere else. That made two very different situations identical in sync_events:
+ * an order the sweep examined and correctly left alone, and an order the sweep never reached.
+ * On 2026-08-26 a day of unposted shipments looked exactly like a clean run for that reason.
+ * The sweep now tallies these and puts the tally on the run row, so "we looked at 412 orders and
+ * 9 of them weren't in Deposco" is visible without reading Railway stdout.
+ */
+type PullOutcome = 'posted' | 'nothing-to-post' | 'not-in-deposco' | 'no-bc-order' | 'no-bc-lines';
+
+async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, soNumber: string, runId: number | null = null): Promise<PullOutcome> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const orderId = await lookupCustomerOrderId(deposcoCfg, dToken, soNumber);
   if (orderId === null) {
     console.log(`[pull] ${soNumber}: not in Deposco yet, skipping shipment pull`);
-    return;
+    return 'not-in-deposco';
   }
 
   // Aggregate Deposco shipped qty by BC Line_No (externalLineNumber == Line_No).
@@ -655,14 +678,14 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
   const so = await getSalesOrderByNumber(base, bcToken, companyId, soNumber);
   if (!so) {
     console.log(`[pull] ${soNumber}: not found via BC v2.0 salesOrders, skipping`);
-    return;
+    return 'no-bc-order';
   }
   const bcLines = await getSalesLines(base, bcToken, companyId, so.id);
   const bcByLineNo = new Map(bcLines.map((l) => [l.sequence, l]));
   console.log(`[pull] ${soNumber}: Deposco CO ${orderId} | bc_lines=${bcLines.length} deposco_lines=${coLines.length}`);
   if (bcLines.length === 0) {
     console.warn(`[pull] ${soNumber}: ⚠ BC SO has 0 lines — nothing to ship against. Skipping.`);
-    return;
+    return 'no-bc-lines';
   }
 
   // Per-line plan: union of (Deposco shipped) and (BC lines), delta = deposco − bc.
@@ -694,7 +717,7 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     // write failing (or Deposco may have labelled it only afterwards). Without this, any
     // transient tracking failure would be permanent — the next tick sees delta=0 and stops.
     await writeTrackingBack(bcCfg, deposcoCfg, soNumber, null, orderId, runId);
-    return;
+    return 'nothing-to-post';
   }
 
   // NOTHING is written to the sales order header here. External Document No. is captioned
@@ -771,6 +794,7 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
 
   // Stamp Deposco tracking onto the shipment we just posted, matched on its number.
   await writeTrackingBack(bcCfg, deposcoCfg, soNumber, postedShipmentNo, orderId, runId);
+  return 'posted';
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -939,8 +963,10 @@ async function writeTrackingBack(
 // whether that one had shipped. ~3,800 calls a lap against an account-wide 4/sec ceiling, almost
 // all of them answered "no" — that is what was producing the 429s, and 429s were dropping pushes.
 //
-// Deposco can just list its shipments (see fetchOutboundShipments): 3 calls returns every
-// shipment it has, each linked to the fulfillment salesOrder, which carries the BC order number.
+// Deposco can just list its shipments (see fetchOutboundShipments): ~60 calls as of 2026-08-26
+// returns every shipment it has (it was 3 when this was written and the list grows — the read is
+// bounded by a page cap that now warns instead of silently truncating), each linked to the
+// fulfillment salesOrder, which carries the BC order number.
 // So we let Deposco name the orders that need posting and touch only those. Same executor
 // (pullShipmentsForSo) — only the SELECTION changed, so the delta/idempotency behaviour is
 // unchanged and this stays safe to re-run.
@@ -956,10 +982,13 @@ async function writeTrackingBack(
 // to an already-seen shipment is still picked up.
 const SHIPMENT_RECHECK = parseInt(process.env.SO_SHIPMENT_RECHECK ?? '100', 10);
 
-async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, runId: number | null): Promise<void> {
+interface SweepSummary { due: number; orders: number; failed: number; outcomes: Record<string, number>; chronic: number }
+
+async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, runId: number | null): Promise<SweepSummary> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const shipments = await fetchOutboundShipments(deposcoCfg, dToken);
-  if (shipments.length === 0) { console.log('[ship] Deposco reported no outbound shipments'); return; }
+  const empty: SweepSummary = { due: 0, orders: 0, failed: 0, outcomes: {}, chronic: 0 };
+  if (shipments.length === 0) { console.log('[ship] Deposco reported no outbound shipments'); return empty; }
 
   const cursorRaw = await readCursor('co', 'shipments');
   const cursor = Number(cursorRaw ?? 0) || 0;
@@ -983,37 +1012,132 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
     || (seenUpdatedAt !== null && s.updatedDate !== '' && s.updatedDate > seenUpdatedAt));
   const newestUpdated = shipments.reduce((m, s) => (s.updatedDate > m ? s.updatedDate : m), '');
   console.log(`[ship] ${shipments.length} shipment(s), highest #${highest}, cursor #${cursor}, updated-since ${seenUpdatedAt ?? '(none)'} → ${due.length} to check`);
-  if (due.length === 0) return;
+
+  // ALARM: the sweep is meant to be small. In the steady state `due` is the handful of shipments
+  // since the last tick plus the RECHECK window — tens, not hundreds. A due-set several times
+  // the recheck window means the cursor has stopped tracking reality, and the sweep is now doing
+  // hours of work per tick to re-examine shipments it settled days ago.
+  //
+  // This is the signal that was missing on 2026-08-14. The cursor froze at #598 and stayed there
+  // for twelve days while every run row said status=ok, because nothing anywhere compared the
+  // size of the work against the size it should have been. It is cheap to check and it is the
+  // difference between noticing in one tick and noticing when someone eyeballs a shipment report.
+  if (due.length > SHIPMENT_RECHECK * 3) {
+    const m = `shipment sweep is OVERSIZED: ${due.length} due vs a ~${SHIPMENT_RECHECK}-shipment steady state (cursor #${cursor}, highest #${highest}, ${highest - cursor} behind). The cursor is not advancing — every tick is re-checking settled shipments, and new ones wait behind them.`;
+    console.warn(`[ship] ⚠ ${m}`);
+    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'shipment', entityId: '(cursor)', action: 'list', status: 'desync', side: 'deposco', message: m,
+      detail: { due: due.length, cursor, highest, behind: highest - cursor, seenUpdatedAt },
+      dedupeKey: dailyDedupe('co-ship-cursor', 'cursor', String(Math.floor((highest - cursor) / 100))) });
+  }
+
+  if (due.length === 0) return empty;
 
   const byOrder = await resolveCustomerOrderNumbers(deposcoCfg, dToken, due.flatMap((s) => s.salesOrderIds));
-  const orderNos = [...new Set([...byOrder.values()])].sort();
-  if (orderNos.length === 0) { console.warn('[ship] no BC order numbers resolved from those shipments'); return; }
-  console.log(`[ship] ${orderNos.length} BC order(s) with shipment activity: ${orderNos.join(', ')}`);
 
-  let posted = 0, failed = 0;
+  // Orders that have been failing for more than a day. Two things are true of these at once and
+  // the sweep has to honour both: they still need retrying, and they must NOT be allowed to hold
+  // the watermarks — a permanent failure that holds a mark reproduces the original bug in slow
+  // motion (the mark parks on its stamp; "everything since" grows without bound). So they are
+  // swept explicitly, every tick, off to the side of the watermark logic entirely. This is the
+  // same discipline as the inv worker's dead-letter, which advances its cursor past a bad record
+  // rather than letting one unpostable adjustment block the batch.
+  const chronic = await chronicFailures('co', 'pull');
+  const dueOrders = new Set(byOrder.values());
+  const chronicRetries = [...chronic].filter((o) => !dueOrders.has(o));
+  const orderNos = [...new Set([...dueOrders, ...chronic])].sort();
+  if (orderNos.length === 0) { console.warn('[ship] no BC order numbers resolved from those shipments'); return { ...empty, due: due.length }; }
+  console.log(`[ship] ${orderNos.length} BC order(s) with shipment activity: ${orderNos.join(', ')}`);
+  if (chronic.size > 0) {
+    const m = `${chronic.size} order(s) have been failing for more than a day and are no longer holding the shipment cursor (${chronicRetries.length} of them are being retried outside the due window). These will NOT resolve on their own: ${[...chronic].join(', ')}`;
+    console.warn(`[ship] ⚠ ${m}`);
+    // Loudly, and once a day: the whole point is that the sweep has stopped waiting for these,
+    // so nothing else will raise its hand about them. Cross-check with reconcile-shipments.mjs.
+    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: '(chronic)', action: 'list', status: 'desync', side: 'bc', message: m,
+      detail: { chronic: [...chronic], retriedOutsideWindow: chronicRetries },
+      dedupeKey: dailyDedupe('co-ship-chronic', 'chronic', [...chronic].sort().join(',')) });
+  }
+
+  // Which shipments each BC order came from, so a failure can hold back JUST the shipments it
+  // actually covers instead of the whole watermark (see the cursor note below). Keeps the whole
+  // ref, not just the number: BOTH marks need holding back, and the updated-watermark needs the
+  // failed shipments' updatedDate.
+  const shipmentsByOrder = new Map<string, typeof due>();
+  for (const s of due) {
+    for (const id of s.salesOrderIds) {
+      const no = byOrder.get(id);
+      if (!no) continue;
+      const list = shipmentsByOrder.get(no);
+      if (list) list.push(s); else shipmentsByOrder.set(no, [s]);
+    }
+  }
+
+  // `processed` is orders that came back without throwing — NOT orders that posted. It used to
+  // be called `posted`, which read as "130 shipments posted" in the run log when the true number
+  // was often zero: almost every order in an oversized sweep is a no-op re-check.
+  let processed = 0, failed = 0;
+  const failedShipments: typeof due = [];
+  const outcomes: Record<string, number> = {};
   for (const soNumber of orderNos) {
     try {
-      await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
-      posted++;
+      const outcome = await pullShipmentsForSo(bcCfg, deposcoCfg, soNumber, runId);
+      outcomes[outcome] = (outcomes[outcome] ?? 0) + 1;
+      processed++;
     } catch (err) {
-      const e = err as AxiosError;
+      // A chronic failure is retried but never holds a mark back (see `chronic` above).
+      if (!chronic.has(soNumber)) failedShipments.push(...(shipmentsByOrder.get(soNumber) ?? []));
+      const e = err as AxiosError & { httpStatus?: number };
+      // authReq throws a wrapped Error with no .response, so `e.response?.status` was always
+      // undefined here and every failure logged "HTTP ?" — the status is on .httpStatus, and for
+      // a timeout there is no status at all because the request never came back.
       const body = JSON.stringify(e.response?.data ?? (err as Error).message);
-      const side = e.response?.status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
-      console.error(`[ship] ${soNumber} pull FAILED HTTP ${e.response?.status}: ${body.slice(0, 400)}`);
+      const status = e.response?.status ?? e.httpStatus;
+      const side = status === 429 || /EOM|not subscribed|deposco/i.test(body) ? 'deposco' : 'bc';
+      console.error(`[ship] ${soNumber} pull FAILED: ${body.slice(0, 400)}`);
       failed++;
-      const msg = `shipment-driven pull: HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`;
+      const msg = `shipment-driven pull: ${(err as Error).message.slice(0, 300)}`;
       await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-ship-pull', soNumber, msg) });
     }
   }
-  // Only advance past shipments whose orders all got a clean pass; a failure leaves both marks so
-  // the shipment is reconsidered next tick (the recheck window covers it either way).
+  // Advance BOTH marks to just below the OLDEST failure — not "only when nothing failed".
+  //
+  // This gate used to be `if (failed === 0)`, which sounds conservative and is actually a trap:
+  // one order failing anywhere in the sweep held the watermarks for the ENTIRE account. In
+  // practice at least one order failed every single day, so both marks sat frozen from
+  // 2026-08-14 to 2026-08-26. The number cursor stuck at #598 while Deposco climbed past #3100,
+  // and — the bigger half — the updated-watermark stuck at 2026-08-14, which by itself made 2424
+  // of 2970 shipments "touched since we last looked" on EVERY tick. The sweep ballooned to hours,
+  // so an order that failed waited hours for its retry, which made the next failure more likely.
+  // The failure pinned the cursors and the pinned cursors caused the failures.
+  //
+  // Holding back only to the oldest failure keeps the real guarantee — nothing unprocessed is
+  // ever skipped past — without letting one stuck order freeze everything newer than it. Both
+  // marks move together for the same reason: advancing one while the other stays pinned leaves
+  // the sweep just as oversized, since `due` is an OR across the two.
+  const oldestFailedNo = failedShipments.length ? Math.min(...failedShipments.map((s) => s.number)) : null;
+  const failedUpdated = failedShipments.map((s) => s.updatedDate).filter((d) => d !== '');
+  const oldestFailedUpdated = failedUpdated.length ? failedUpdated.reduce((m, d) => (d < m ? d : m)) : null;
+
+  // Never move backwards: the recheck window re-shows shipments below the cursor every tick, and
+  // one of those failing must not rewind a watermark already earned.
+  const nextCursor = Math.max(cursor, Math.min(oldestFailedNo !== null ? oldestFailedNo - 1 : highest, highest));
+  if (nextCursor > cursor) await writeCursor('co', 'shipments', String(nextCursor));
+
   // The updated-watermark is the newest updatedDate we SAW, not "now": Deposco stamps these, and
-  // using our own clock would skip anything updated during the sweep or across clock skew.
-  if (failed === 0) {
-    await writeCursor('co', 'shipments', String(highest));
-    if (newestUpdated) await writeCursor('co', 'shipments-updated', newestUpdated);
+  // using our own clock would skip anything updated during the sweep or across clock skew. When
+  // something failed, hold at the oldest failed stamp so that shipment is reconsidered next tick.
+  // Strings compare correctly here only because they are offset-normalised on the way in — the
+  // reduce above is a min over instants, not lexicographic luck, since Deposco emits a constant
+  // -05:00 offset for this account.
+  const nextUpdated = oldestFailedUpdated ?? newestUpdated;
+  if (nextUpdated && (seenUpdatedAt === null || nextUpdated > seenUpdatedAt)) {
+    await writeCursor('co', 'shipments-updated', nextUpdated);
   }
-  console.log(`[ship] done — ${posted} order(s) pulled, ${failed} failed, cursor ${failed === 0 ? `→ #${highest} / updated ${newestUpdated}` : `held at #${cursor}`}`);
+
+  console.log(`[ship] done — ${processed} order(s) checked (${outcomes.posted ?? 0} posted, ${outcomes['nothing-to-post'] ?? 0} already in sync, ${outcomes['not-in-deposco'] ?? 0} not in Deposco, ${outcomes['no-bc-order'] ?? 0} no BC order, ${outcomes['no-bc-lines'] ?? 0} no BC lines), ${failed} failed`
+    + `, cursor ${nextCursor > cursor ? `→ #${nextCursor}` : `held at #${cursor}`}`
+    + `, updated → ${nextUpdated || '(unchanged)'}`
+    + `${failed > 0 ? ` (oldest failure: shipment #${oldestFailedNo} @ ${oldestFailedUpdated ?? 'no stamp'})` : ''}`);
+  return { due: due.length, orders: orderNos.length, failed, outcomes, chronic: chronic.size };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1082,9 +1206,10 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   });
 
   // One shipment-driven pull for the whole tick, after the pushes.
+  let sweep: SweepSummary | null = null;
   if (PULL_ENABLED) {
     try {
-      await pullFromShipments(bcCfg, deposcoCfg, runId);
+      sweep = await pullFromShipments(bcCfg, deposcoCfg, runId);
     } catch (err) {
       const e = err as AxiosError;
       const body = JSON.stringify(e.response?.data ?? (err as Error).message);
@@ -1095,8 +1220,14 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
     }
   }
 
-  await finishRun(runId, fail > 0 || pullFail > 0 ? 'partial' : 'ok', { posted: ok, skipped: skip, failed: fail, pullFailed: pullFail });
-  console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} push-failed, ${pullFail} pull-failed`);
+  // The sweep's shape goes on the run row, not just stdout. A run that says {posted:0, failed:0}
+  // reads as "healthy, nothing to do"; the same run saying it checked 412 orders and posted none
+  // of them reads as "something is wrong" — which is the difference this whole incident turned on.
+  await finishRun(runId, fail > 0 || pullFail > 0 ? 'partial' : 'ok', {
+    posted: ok, skipped: skip, failed: fail, pullFailed: pullFail,
+    ...(sweep ? { shipDue: sweep.due, shipOrders: sweep.orders, shipPosted: sweep.outcomes.posted ?? 0, shipFailed: sweep.failed, shipChronic: sweep.chronic } : {}),
+  });
+  console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} push-failed, ${pullFail} pull-failed${sweep ? `, sweep ${sweep.orders} order(s) → ${sweep.outcomes.posted ?? 0} posted / ${sweep.failed} failed` : ''}`);
 }
 
 async function main(): Promise<void> {

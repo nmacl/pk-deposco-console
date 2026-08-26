@@ -389,11 +389,28 @@ export interface OutboundShipmentRef {
   updatedDate: string;
 }
 
-export async function fetchOutboundShipments(cfg: DeposcoConfig, token: string, maxPages = 20): Promise<OutboundShipmentRef[]> {
+/**
+ * Every outbound shipment Deposco knows about, newest first (DESCENDING by number, ~50 to a
+ * page — 2957 shipments = 60 pages as of 2026-08-26).
+ *
+ * The whole list is read on purpose. The sweep's "due" test includes `updatedDate > last sweep`,
+ * which is what catches a tracking number Deposco attaches to an OLD shipment hours later, so
+ * stopping early at the number watermark would quietly drop exactly the case that net exists for.
+ * ~60 calls at the ~3/s throttle is ~20s a tick; the expensive part of the sweep was never this
+ * read, it was the per-order pull that the shipment cursor governs.
+ *
+ * `maxPages` is a runaway backstop, NOT a natural end, so hitting it is logged loudly. It sat at
+ * 20 for weeks — silently capping the list at ~1000 of 2957 shipments. Descending order meant it
+ * dropped the oldest and so never lost new work, but nothing said it was happening. If this
+ * warning ever fires in normal running, the list has outgrown a full read and wants a
+ * server-side date filter rather than a bigger cap.
+ */
+export async function fetchOutboundShipments(cfg: DeposcoConfig, token: string, maxPages = 200): Promise<OutboundShipmentRef[]> {
   interface Row { number?: string | number; trackingNumber?: string; status?: string; updatedDate?: string; orderHeaders?: { data?: Array<{ id?: number }> } }
   interface Page { data?: Row[]; links?: Array<{ rel?: string; href?: string }>; complete?: boolean }
   const out: OutboundShipmentRef[] = [];
   let url = `${cfg.apiBase}/shipments/outboundShipments`;
+  let truncated = true;
   for (let page = 0; page < maxPages; page++) {
     const body = await authReq<Page>('get', url, token);
     for (const r of body.data ?? []) {
@@ -407,10 +424,13 @@ export async function fetchOutboundShipments(cfg: DeposcoConfig, token: string, 
         updatedDate: r.updatedDate ?? '',
       });
     }
-    if (body.complete) break;
+    if (body.complete) { truncated = false; break; }
     const next = body.links?.find((l) => l.rel === 'next')?.href;
-    if (!next) break;
+    if (!next) { truncated = false; break; }
     url = next;
+  }
+  if (truncated) {
+    console.warn(`[ship] ⚠ outboundShipments TRUNCATED at the ${maxPages}-page cap (${out.length} shipment(s) read, oldest #${Math.min(...out.map((s) => s.number))}). Older shipments were NOT read — raise maxPages if history is needed.`);
   }
   return out;
 }
