@@ -198,7 +198,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
 <header><h1>PK ↔ Deposco Sync Console &nbsp;<a href="/logs" style="font-size:12px;font-weight:500;color:#8957e5;">→ Sync Logs</a></h1>
-<div class="sub">Type one or more BC order #s — space/comma separated (TRFO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
+<div class="sub">Type one or more BC order #s — space/comma separated (TRFO / SRTO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
 <div class="bar">
   <input id="order" placeholder="WSOD139248, WSOD139249 TEST0001" autocomplete="off" spellcheck="false"/>
   <span id="type" class="chip">enter an order</span>
@@ -212,7 +212,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
 <script>
 const $=(id)=>document.getElementById(id);
 const order=$('order'), type=$('type'), log=$('log');
-const kinds=[['TRFO','transfer'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
+const kinds=[['TRFO','transfer'],['SRTO','sales return'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
 function parseOrders(v){ return [...new Set(v.split(/[\\s,]+/).map(s=>s.trim().toUpperCase()).filter(Boolean))]; }
 function detectOne(o){ const m=kinds.find(([p])=>o.startsWith(p)); return m?m[1]:null; }
 function refresh(){
