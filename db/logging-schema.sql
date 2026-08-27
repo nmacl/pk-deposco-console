@@ -52,3 +52,10 @@ alter table sync_runs    enable row level security;
 alter table sync_events  enable row level security;
 alter table sync_cursors enable row level security;
 revoke all on table sync_runs, sync_events, sync_cursors from anon, authenticated;
+
+-- 2026-08-27: a repeated failure (same dedupe_key) now bumps the existing row instead of being
+-- dropped, so "how many times / how recently" is a column. `ts` stays first-seen. The workers pace
+-- chronic retries off `last_ts` (see chronicDue in src/sync/db-log.ts) and fall back to `ts` when
+-- these columns are missing — apply this before deploying that code or every repeat is a new attempt.
+alter table sync_events add column if not exists hits    integer not null default 1;
+alter table sync_events add column if not exists last_ts timestamptz;

@@ -2,12 +2,13 @@
   "name": "pk-deposco-console",
   "version": "1.0.0",
   "private": true,
-  "description": "PK ↔ Deposco manual sync console (one-off web UI, Railway-deployable)",
+  "description": "PK \u2194 Deposco manual sync console (one-off web UI, Railway-deployable)",
   "type": "module",
   "scripts": {
     "build": "tsc",
     "start": "node server.mjs",
-    "dev": "npm run build && node server.mjs"
+    "dev": "npm run build && node server.mjs",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "engines": {
     "node": ">=20"

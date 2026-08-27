@@ -206,6 +206,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   <button class="post" id="btnPost" disabled>② Ship / Receive → BC</button>
   <span class="sep"></span>
   <button class="inv" id="btnInvPull">Inventory Pull (Deposco → BC)</button>
+  <button class="inv" id="btnRetryChronic" title="Orders whose BC post-back has failed 2+ days are only retried hourly. After fixing them in BC, click to retry all of them on the next scheduled tick.">Retry chronic now</button>
   <button class="clear" id="btnClear">Clear log</button>
 </div>
 <div id="log"></div>
@@ -249,6 +250,17 @@ function runInvPull(){
   es.onerror=()=>{ line('▸ stream closed','dim'); stop(); };
 }
 $('btnInvPull').onclick=runInvPull;
+function retryChronic(){
+  const b=$('btnRetryChronic'); b.disabled=true;
+  line('\n──────── RETRY CHRONIC  '+new Date().toLocaleTimeString()+' ────────','run');
+  fetch('/retry-chronic',{method:'POST'}).then(r=>r.json()).then(d=>{
+    if(d.error){ line('error: '+d.error,'err'); return; }
+    line('▸ flush requested — every chronic order gets a fresh BC attempt on its worker\'s next scheduled tick (≤5 min)','ok');
+    line('  sales orders ('+d.co.length+'): '+(d.co.join(', ')||'none'));
+    line('  transfer orders ('+d.to.length+'): '+(d.to.join(', ')||'none'));
+  }).catch(e=>line('error: '+e.message,'err')).finally(()=>{ b.disabled=false; });
+}
+$('btnRetryChronic').onclick=retryChronic;
 $('btnClear').onclick=()=>log.innerHTML='';
 order.addEventListener('keydown',(e)=>{ if(e.key==='Enter'&&!$('btnPush').disabled) run('push'); });
 refresh(); order.focus();
@@ -309,10 +321,10 @@ function load(){
     document.getElementById('pageind').textContent='page '+((d.page||0)+1);
     document.getElementById('prev').disabled=(d.page||0)<=0;
     document.getElementById('next').disabled=!d.hasMore;
-    document.getElementById('runs').innerHTML=d.runs.map(function(r){ var c=r.counts||{}; return '<div class="run"><b>'+esc(r.worker)+'</b> '+esc(r.trigger)+' · '+esc(r.status||'…')+' <span class="dim">'+fmt(r.finished_at||r.started_at)+'</span><br>'+(c.posted||0)+' posted · '+(c.failed||0)+' fail · '+(c.floored||0)+' floor · '+(c.skipped||0)+' skip</div>'; }).join('');
+    document.getElementById('runs').innerHTML=d.runs.map(function(r){ var c=r.counts||{}; return '<div class="run"><b>'+esc(r.worker)+'</b> '+esc(r.trigger)+' · '+esc(r.status||'…')+' <span class="dim">'+fmt(r.finished_at||r.started_at)+'</span><br>'+(c.posted||0)+' posted · '+(c.failed||0)+' fail · '+(c.floored||0)+' floor · '+(c.skipped||0)+' skip'+((c.deferred||c.shipDeferred)?' · '+(c.deferred||c.shipDeferred)+' chronic deferred':'')+'</div>'; }).join('');
     document.getElementById('rows').innerHTML=d.events.map(function(e){
       var detail=e.detail? JSON.stringify(e.detail,null,1):'';
-      return '<tr class="ev"><td class="dim mono">'+fmt(e.ts)+'</td><td>'+esc(e.worker)+'</td><td class="mono">'+esc(e.entity_id||'')+(e.side?' <span class="side">'+esc(e.side)+'</span>':'')+'</td><td>'+badge(e.status)+'</td><td>'+esc(e.message||'')+'</td></tr>'
+      return '<tr class="ev"><td class="dim mono">'+fmt(e.ts)+'</td><td>'+esc(e.worker)+'</td><td class="mono">'+esc(e.entity_id||'')+(e.side?' <span class="side">'+esc(e.side)+'</span>':'')+'</td><td>'+badge(e.status)+'</td><td>'+esc(e.message||'')+(e.hits>1?' <span class="dim">×'+esc(e.hits)+' · last '+fmt(e.last_ts)+'</span>':'')+'</td></tr>'
         +'<tr><td colspan="5" style="padding:0 8px 6px;"><div class="detail">'+esc(detail)+'</div></td></tr>';
     }).join('')||'<tr><td colspan="5" class="dim">no events</td></tr>';
   }).catch(function(e){ document.getElementById('status').textContent='fetch error: '+e.message; });
@@ -355,7 +367,7 @@ const server = createServer((req, res) => {
     const where = filter === 'fail' ? "where status = 'fail'"
       : filter === 'issues' ? "where status in ('fail','desync','floor')" : '';
     // fetch PAGE_SIZE+1 to know if there's a next page without a count query
-    p.query(`select id,ts,worker,direction,entity_type,entity_id,action,status,side,message,detail from sync_events ${where} order by id desc limit $1 offset $2`, [PAGE_SIZE + 1, page * PAGE_SIZE])
+    p.query(`select * from sync_events ${where} order by id desc limit $1 offset $2`, [PAGE_SIZE + 1, page * PAGE_SIZE])
       .then((ev) => {
         const hasMore = ev.rows.length > PAGE_SIZE;
         const events = ev.rows.slice(0, PAGE_SIZE);
@@ -363,6 +375,28 @@ const server = createServer((req, res) => {
           .then((runs) => res.end(JSON.stringify({ configured: true, events, runs: runs.rows, page, hasMore })));
       })
       .catch((e) => res.end(JSON.stringify({ configured: true, error: e.message })));
+    return;
+  }
+  // "Retry chronic now": stamp a flush for both workers that pace chronic retries. Each worker
+  // compares the stamp against a chronic order's last attempt (chronicDue) — anything attempted
+  // before the stamp gets one fresh BC attempt on its next scheduled tick, then goes back to hourly.
+  if (url.pathname === '/retry-chronic' && req.method === 'POST') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    const p = db();
+    if (!p) { res.end(JSON.stringify({ error: 'logging DB not configured (no DATABASE_URL)' })); return; }
+    const stamp = (worker) => p.query(
+      `insert into sync_cursors(worker,key,last_synced,updated_at)
+       values($1,'chronic-flush',to_char(now() at time zone 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),now())
+       on conflict (worker,key) do update set last_synced=excluded.last_synced, updated_at=now()`, [worker]);
+    // Same definition as chronicFailures() in db-log.ts: failing on 2+ distinct days in the last week.
+    const list = (worker, action) => p.query(
+      `select entity_id from sync_events
+        where worker=$1 and action=$2 and status='fail' and entity_id is not null and ts > now() - interval '7 days'
+        group by entity_id having count(distinct (ts at time zone 'UTC')::date) >= 2 order by entity_id`, [worker, action])
+      .then((r) => r.rows.map((x) => x.entity_id));
+    Promise.all([stamp('co'), stamp('to'), list('co', 'pull'), list('to', 'post')])
+      .then(([, , co, to]) => { console.log(`[web] retry-chronic flush: ${co.length} SO, ${to.length} TO`); res.end(JSON.stringify({ ok: true, co, to })); })
+      .catch((e) => res.end(JSON.stringify({ error: e.message })));
     return;
   }
   if (url.pathname === '/sync') {

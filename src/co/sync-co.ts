@@ -40,7 +40,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, bcGetAll, pick, numOf, getCompanyId, authReq, mapWithConcurrency, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, ensureItemsExist, type DeposcoTracking } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor, chronicFailures } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor, chronicFailures, lastAttempts, chronicDue } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -946,12 +946,14 @@ async function writeTrackingBack(
     }
   } catch (err) {
     const e = err as AxiosError;
-    const body = JSON.stringify(e.response?.data ?? (err as Error).message).slice(0, 300);
-    console.error(`[track] ${soNumber}: FAILED (shipment itself DID post) HTTP ${e.response?.status}: ${body}`);
+    const body = JSON.stringify(e.response?.data ?? (err as Error).message);
+    console.error(`[track] ${soNumber}: FAILED (shipment itself DID post) HTTP ${e.response?.status}: ${body.slice(0, 300)}`);
     // Which side failed: reading Deposco, or writing BC's bmiShipmentTrackings.
     const side = /deposco\.com/i.test(String(e.config?.url ?? '')) ? 'deposco' : 'bc';
+    // The message is a headline; the BC error text lives in detail.body (the URL alone used to eat
+    // the whole 180-char message, leaving 8 tracking failures in /logs with no error at all).
     await logTrack('fail', `HTTP ${e.response?.status ?? e.code ?? '?'}: ${body.slice(0, 180)}`,
-                   { url: e.config?.url, postedShipmentNo }, side);
+                   { url: e.config?.url, postedShipmentNo, body: body.slice(0, 4000) }, side);
   }
 }
 
@@ -981,13 +983,17 @@ async function writeTrackingBack(
 // else). RECHECK re-reads the newest few regardless, so a tracking number or extra quantity added
 // to an already-seen shipment is still picked up.
 const SHIPMENT_RECHECK = parseInt(process.env.SO_SHIPMENT_RECHECK ?? '100', 10);
+// How often a CHRONIC order (failing 2+ days) gets another BC postShipment attempt. Every tick was
+// ~10 doomed BC writes per 10 minutes for the same 28 orders; hourly still catches a fix within
+// the hour, and the console's "Retry chronic now" flush overrides it on demand.
+const CHRONIC_RETRY_MS = parseInt(process.env.SO_CHRONIC_RETRY_MS ?? '3600000', 10);
 
-interface SweepSummary { due: number; orders: number; failed: number; outcomes: Record<string, number>; chronic: number }
+interface SweepSummary { due: number; orders: number; failed: number; outcomes: Record<string, number>; chronic: number; deferred: number }
 
 async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, runId: number | null): Promise<SweepSummary> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const shipments = await fetchOutboundShipments(deposcoCfg, dToken);
-  const empty: SweepSummary = { due: 0, orders: 0, failed: 0, outcomes: {}, chronic: 0 };
+  const empty: SweepSummary = { due: 0, orders: 0, failed: 0, outcomes: {}, chronic: 0, deferred: 0 };
   if (shipments.length === 0) { console.log('[ship] Deposco reported no outbound shipments'); return empty; }
 
   const cursorRaw = await readCursor('co', 'shipments');
@@ -1043,12 +1049,27 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
   // rather than letting one unpostable adjustment block the batch.
   const chronic = await chronicFailures('co', 'pull');
   const dueOrders = new Set(byOrder.values());
-  const chronicRetries = [...chronic].filter((o) => !dueOrders.has(o));
-  const orderNos = [...new Set([...dueOrders, ...chronic])].sort();
-  if (orderNos.length === 0) { console.warn('[ship] no BC order numbers resolved from those shipments'); return { ...empty, due: due.length }; }
+  // Pacing: a chronic order is retried once per CHRONIC_RETRY_MS, or right away after a flush
+  // (console "Retry chronic now" writes sync_cursors co/chronic-flush). This applies whether or
+  // not its shipment is in the due window — the RECHECK window re-shows the newest shipments every
+  // tick, which is how 5 of the 28 chronic orders were getting a BC write every 10 minutes anyway.
+  // Deferring one never holds a watermark (a chronic order never did), so this is pure savings.
+  const lastAttempt = chronic.size > 0 ? await lastAttempts('co', 'pull') : new Map<string, Date>();
+  const flushRaw = chronic.size > 0 ? await readCursor('co', 'chronic-flush') : null;
+  const flushAt = flushRaw ? new Date(flushRaw) : null;
+  const now = new Date();
+  const deferred = [...chronic].filter((o) => !chronicDue({ lastAttempt: lastAttempt.get(o) ?? null, flushAt, now, intervalMs: CHRONIC_RETRY_MS })).sort();
+  const deferredSet = new Set(deferred);
+  const chronicRetries = [...chronic].filter((o) => !dueOrders.has(o) && !deferredSet.has(o));
+  const orderNos = [...new Set([...dueOrders, ...chronic])].filter((o) => !deferredSet.has(o)).sort();
+  if (deferred.length > 0) console.log(`[ship] ${deferred.length} chronic order(s) deferred (last attempt < ${Math.round(CHRONIC_RETRY_MS / 60000)} min ago, no flush since): ${deferred.join(', ')}`);
+  if (orderNos.length === 0) {
+    if (dueOrders.size === 0) console.warn('[ship] no BC order numbers resolved from those shipments');
+    return { ...empty, due: due.length, chronic: chronic.size, deferred: deferred.length };
+  }
   console.log(`[ship] ${orderNos.length} BC order(s) with shipment activity: ${orderNos.join(', ')}`);
   if (chronic.size > 0) {
-    const m = `${chronic.size} order(s) have been failing for more than a day and are no longer holding the shipment cursor (${chronicRetries.length} of them are being retried outside the due window). These will NOT resolve on their own: ${[...chronic].join(', ')}`;
+    const m = `${chronic.size} order(s) have been failing for more than a day and are no longer holding the shipment cursor (${chronicRetries.length} retried outside the due window this tick, ${deferred.length} deferred — chronic orders retry every ${Math.round(CHRONIC_RETRY_MS / 60000)} min or on "Retry chronic now"). These will NOT resolve on their own: ${[...chronic].join(', ')}`;
     console.warn(`[ship] ⚠ ${m}`);
     // Loudly, and once a day: the whole point is that the sweep has stopped waiting for these,
     // so nothing else will raise its hand about them. Cross-check with reconcile-shipments.mjs.
@@ -1137,7 +1158,7 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
     + `, cursor ${nextCursor > cursor ? `→ #${nextCursor}` : `held at #${cursor}`}`
     + `, updated → ${nextUpdated || '(unchanged)'}`
     + `${failed > 0 ? ` (oldest failure: shipment #${oldestFailedNo} @ ${oldestFailedUpdated ?? 'no stamp'})` : ''}`);
-  return { due: due.length, orders: orderNos.length, failed, outcomes, chronic: chronic.size };
+  return { due: due.length, orders: orderNos.length, failed, outcomes, chronic: chronic.size, deferred: deferred.length };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1225,7 +1246,7 @@ async function tick(bcCfg: BcConfig, deposcoCfg: DeposcoConfig): Promise<void> {
   // of them reads as "something is wrong" — which is the difference this whole incident turned on.
   await finishRun(runId, fail > 0 || pullFail > 0 ? 'partial' : 'ok', {
     posted: ok, skipped: skip, failed: fail, pullFailed: pullFail,
-    ...(sweep ? { shipDue: sweep.due, shipOrders: sweep.orders, shipPosted: sweep.outcomes.posted ?? 0, shipFailed: sweep.failed, shipChronic: sweep.chronic } : {}),
+    ...(sweep ? { shipDue: sweep.due, shipOrders: sweep.orders, shipPosted: sweep.outcomes.posted ?? 0, shipFailed: sweep.failed, shipChronic: sweep.chronic, shipDeferred: sweep.deferred } : {}),
   });
   console.log(`[tick] done — ${ok} pushed, ${skip} skipped, ${fail} push-failed, ${pullFail} pull-failed${sweep ? `, sweep ${sweep.orders} order(s) → ${sweep.outcomes.posted ?? 0} posted / ${sweep.failed} failed` : ''}`);
 }

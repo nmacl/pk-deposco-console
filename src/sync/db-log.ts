@@ -56,17 +56,36 @@ export interface SyncEvent {
   dedupeKey?: string;
 }
 
+// A repeat of an already-logged event (same dedupe_key) bumps `hits` and `last_ts` on the existing
+// row instead of inserting: the row keeps its first-seen `ts`, and "how often / how recently" is a
+// column, not a count(*). Those two columns were added 2026-08-27 (see the schema file); if the
+// migration hasn't been applied yet we fall back to the original insert-or-ignore so logging keeps
+// working and say so once.
+let legacyEvents = false;
+const MISSING_COL = /column "?(hits|last_ts)"? .*does not exist/i;
+
 export async function logEvent(ev: SyncEvent): Promise<void> {
   const p = getPool();
   if (!p) return;
+  const params = [ev.runId ?? null, ev.worker, ev.direction ?? null, ev.entityType ?? null, ev.entityId ?? null,
+    ev.action ?? null, ev.status, ev.side ?? null, ev.message ?? null,
+    ev.detail != null ? JSON.stringify(ev.detail) : null, ev.dedupeKey ?? null];
+  const cols = 'run_id, worker, direction, entity_type, entity_id, action, status, side, message, detail, dedupe_key';
+  const vals = '$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11';
   try {
-    await p.query(
-      `insert into sync_events(run_id, worker, direction, entity_type, entity_id, action, status, side, message, detail, dedupe_key)
-       values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       on conflict (dedupe_key) do nothing`,
-      [ev.runId ?? null, ev.worker, ev.direction ?? null, ev.entityType ?? null, ev.entityId ?? null,
-       ev.action ?? null, ev.status, ev.side ?? null, ev.message ?? null,
-       ev.detail != null ? JSON.stringify(ev.detail) : null, ev.dedupeKey ?? null]);
+    if (!legacyEvents) {
+      await p.query(
+        `insert into sync_events(${cols}) values(${vals})
+         on conflict (dedupe_key) do update set hits = sync_events.hits + 1, last_ts = now()`, params);
+      return;
+    }
+  } catch (e) {
+    if (!MISSING_COL.test((e as Error).message)) { console.warn(`[db-log] logEvent: ${(e as Error).message}`); return; }
+    legacyEvents = true;
+    console.warn('[db-log] sync_events has no hits/last_ts columns — apply the 2026-08-27 migration in db/logging-schema.sql. Falling back to insert-or-ignore.');
+  }
+  try {
+    await p.query(`insert into sync_events(${cols}) values(${vals}) on conflict (dedupe_key) do nothing`, params);
   } catch (e) { console.warn(`[db-log] logEvent: ${(e as Error).message}`); }
 }
 
@@ -108,6 +127,45 @@ export async function chronicFailures(
   } catch (e) { console.warn(`[db-log] chronicFailures: ${(e as Error).message}`); return new Set(); }
 }
 
+/**
+ * When each entity last FAILED at this worker/action — the "last attempt" a chronic retry is
+ * paced against. Uses last_ts (bumped on every deduped repeat) and falls back to ts if the
+ * migration isn't applied. Only failures count: a success removes the entity from the chronic
+ * set by itself, so it never needs pacing.
+ */
+export async function lastAttempts(worker: string, action: string, lookbackDays = 7): Promise<Map<string, Date>> {
+  const p = getPool();
+  if (!p) return new Map();
+  const run = (expr: string) => p.query(
+    `select entity_id, max(${expr}) as last
+       from sync_events
+      where worker = $1 and action = $2 and status = 'fail' and entity_id is not null
+        and ts > now() - ($3 || ' days')::interval
+      group by entity_id`,
+    [worker, action, String(lookbackDays)]);
+  try {
+    let r;
+    try { r = await run('coalesce(last_ts, ts)'); }
+    catch (e) { if (!MISSING_COL.test((e as Error).message)) throw e; r = await run('ts'); }
+    return new Map(r.rows.map((row) => [row.entity_id as string, new Date(row.last as string)]));
+  } catch (e) { console.warn(`[db-log] lastAttempts: ${(e as Error).message}`); return new Map(); }
+}
+
+/**
+ * Should a chronic entity be retried this tick? Deliberately dumb: a chronic failure is one BC
+ * has rejected for 2+ days, and what fixes it (a receipt landing, a PO vouched, a dimension
+ * combination unblocked) usually never touches the order itself — so there is no change stamp to
+ * watch. Instead: retry every `intervalMs` (hourly by default), or straight away if someone asked
+ * for a flush more recently than the last attempt (console "Retry chronic now"). Never attempted
+ * → due.
+ */
+export function chronicDue(args: { lastAttempt: Date | null; flushAt: Date | null; now: Date; intervalMs: number }): boolean {
+  const { lastAttempt, flushAt, now, intervalMs } = args;
+  if (!lastAttempt || Number.isNaN(lastAttempt.getTime())) return true;
+  if (flushAt && !Number.isNaN(flushAt.getTime()) && flushAt.getTime() > lastAttempt.getTime()) return true;
+  return now.getTime() - lastAttempt.getTime() >= intervalMs;
+}
+
 // ── Cursors (sync_cursors) ─────────────────────────────────────────────────
 // High-water marks live in the DB so they survive Railway restarts / redeploys (the old
 // .inv-state.json file is ephemeral there). Returns null when no DB or no row yet.
@@ -141,10 +199,26 @@ export function hashKey(s: string): string {
   return (h >>> 0).toString(36);
 }
 
+/**
+ * Strip the per-request noise out of an error message before it is hashed into a dedupe key.
+ * Every BC error carries `CorrelationId: <guid>` and the bmi URLs carry record GUIDs — both are
+ * different on every attempt, which is why dailyDedupe never actually deduped a BC failure
+ * (WSOD305290: 124 rows, 124 distinct keys, one day). Only the KEY is normalised; the message
+ * that lands in the row is untouched so the CorrelationId is still there for a BC support ticket.
+ */
+const GUID = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi;
+export function normalizeForDedupe(message: string): string {
+  return message
+    .replace(/CorrelationId:\s*[0-9a-f-]+\.?/gi, '')
+    .replace(GUID, '<guid>')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 /** Dedupe key that collapses a recurring failure to one row per day per distinct message —
  *  verbose enough to see it, not spammy enough to bury the failures list. */
 export function dailyDedupe(worker: string, entityId: string, message: string): string {
-  return `${worker}:${entityId}:${new Date().toISOString().slice(0, 10)}:${hashKey(message)}`;
+  return `${worker}:${entityId}:${new Date().toISOString().slice(0, 10)}:${hashKey(normalizeForDedupe(message))}`;
 }
 
 /** Must be called at worker exit so a --once process can terminate (open pool keeps it alive). */

@@ -30,7 +30,7 @@ import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment, ensureItemsExist } from '../sync/orders.js';
-import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
+import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, chronicFailures, lastAttempts, chronicDue } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
 const PREFIX = process.env.TO_PREFIX ?? 'TRFO';
@@ -42,6 +42,10 @@ const PER_TICK = parseInt(process.env.TO_PER_TICK ?? '250', 10);
 // BC transfer posting is a heavyweight operation (item ledger + reservation entries) and blows
 // past the 30s default on larger orders — seen live as ECONNABORTED on TRFO001688.
 const POST_TIMEOUT_MS = parseInt(process.env.TO_POST_TIMEOUT_MS ?? '180000', 10);
+// A transfer whose post-back BC has rejected for 2+ days (chronic) is re-attempted once per this
+// interval instead of every tick, or immediately after a console "Retry chronic now" flush.
+// Its push side is unaffected. See chronicDue in db-log.ts for the reasoning.
+const CHRONIC_RETRY_MS = parseInt(process.env.TO_CHRONIC_RETRY_MS ?? '3600000', 10);
 const PUSH_ENABLED = (process.env.TO_PUSH_ENABLED ?? 'false').toLowerCase() === 'true';
 const POST_ENABLED = (process.env.TO_POST_ENABLED ?? 'false').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
@@ -497,14 +501,24 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
     return;
   }
   console.log(`[tick] ${orders.length} transfer order(s)`);
+  // Chronic post-back failures (TRFO001929 / TRFO001963 were 300 doomed BC posts in two days) are
+  // paced, not skipped: retried hourly, or on flush. Only the post half is deferred.
+  const chronic = POST_ENABLED ? await chronicFailures('to', 'post') : new Set<string>();
+  const lastAttempt = chronic.size > 0 ? await lastAttempts('to', 'post') : new Map<string, Date>();
+  const flushRaw = chronic.size > 0 ? await readCursor('to', 'chronic-flush') : null;
+  const flushAt = flushRaw ? new Date(flushRaw) : null;
+  const now = new Date();
   // push/post re-run every tick (upsert / post-what's-outstanding), so log FAILURES only;
   // the run row carries the processed/failed counts.
-  let processed = 0, failed = 0, desynced = 0;
+  let processed = 0, failed = 0, desynced = 0, deferred = 0, postedOrders = 0;
   for (const header of orders) {
     processed++;
     const no = pick(header, 'No');
     try {
-      const { plan, push, posted, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED });
+      const defer = chronic.has(no) && !chronicDue({ lastAttempt: lastAttempt.get(no) ?? null, flushAt, now, intervalMs: CHRONIC_RETRY_MS });
+      if (defer) { deferred++; console.log(`[to] ${no}: chronic post-back failure — deferred (retries every ${Math.round(CHRONIC_RETRY_MS / 60000)} min or on flush)`); }
+      const { plan, push, posted, postError } = await syncOne(cfg, deposcoCfg, companyId, header, { push: PUSH_ENABLED, post: POST_ENABLED && !defer });
+      if (posted && posted.length > 0) postedOrders++;
       if (postError) {
         failed++;
         const pmsg = `post-back to BC: HTTP ${postError.status ?? '?'}: ${postError.body.slice(0, 300)}`;
@@ -545,7 +559,9 @@ async function tick(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig): Promise<void>
       await logEvent({ runId, worker: 'to', direction: 'bc->deposco', entityType: 'order', entityId: pick(header, 'No'), action: 'sync', status: 'fail', side, message: tmsg, dedupeKey: dailyDedupe('to', pick(header, 'No'), tmsg) });
     }
   }
-  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { posted: processed - failed - desynced, failed, desync: desynced });
+  // `posted` is orders that actually posted a BC document this tick — it used to be processed-minus-
+  // failures, which read as "104 posted" on ticks where the true number was zero.
+  await finishRun(runId, failed > 0 ? 'partial' : 'ok', { processed, posted: postedOrders, failed, desync: desynced, deferred });
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
