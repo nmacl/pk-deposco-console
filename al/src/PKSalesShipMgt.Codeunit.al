@@ -26,7 +26,8 @@ codeunit 60223 "PK Sales Ship Mgt"
                   tabledata "Sales Line" = RIM,
                   tabledata "Sales Shipment Header" = RIM,
                   tabledata "Sales Shipment Line" = RIM,
-                  tabledata "Stockkeeping Unit" = RIM;
+                  tabledata "Stockkeeping Unit" = RIM,
+                  tabledata "Reservation Entry" = RIMD;
 
     /// <summary>
     /// Posts SalesHeader as a shipment only. Whatever is staged in Qty. to Ship on each line is
@@ -69,5 +70,35 @@ codeunit 60223 "PK Sales Ship Mgt"
         SalesLine.SetRange("Document No.", SalesHeader."No.");
         SalesLine.SetFilter("Qty. to Ship", '<>%1', 0);
         exit(not SalesLine.IsEmpty());
+    end;
+
+    /// <summary>
+    /// Drops the reservation entries on every open item line of SalesHeader — same effect as the
+    /// "Cancel Reservation" ribbon action on the Sales Order page, called headlessly.
+    ///
+    /// Why: PostShipOnly fails hard when a line's Reservation Entry no longer matches reality —
+    /// "insufficient quantity" / "Reserved item ... is not on inventory" when the specific supply
+    /// it points at has since been consumed elsewhere, or "Location/Variant Code must equal ..."
+    /// when the entry was written against the wrong location or variant. In every one of these
+    /// cases Deposco has ALREADY physically shipped the order; BC's reservation is stale or wrong,
+    /// not the truth. Forcing negative inventory or floor-adjusting the item doesn't fix a bad
+    /// reservation — it just fixes on-hand while the mismatched entry is still there to fail again.
+    /// Cancelling it lets the retry consume general on-hand instead of that one specific (and
+    /// wrong) earmark. Caller decides when this is warranted by matching BC's error text — this
+    /// procedure does not judge, it just drops the reservation.
+    /// </summary>
+    procedure CancelReservations(var SalesHeader: Record "Sales Header")
+    var
+        SalesLine: Record "Sales Line";
+        SalesLineReserve: Codeunit "Sales Line-Reserve";
+    begin
+        SalesLine.SetRange("Document Type", SalesHeader."Document Type");
+        SalesLine.SetRange("Document No.", SalesHeader."No.");
+        SalesLine.SetRange(Type, SalesLine.Type::Item);
+        SalesLine.SetFilter("Outstanding Quantity", '<>%1', 0);
+        if SalesLine.FindSet() then
+            repeat
+                SalesLineReserve.DeleteLine(SalesLine);
+            until SalesLine.Next() = 0;
     end;
 }

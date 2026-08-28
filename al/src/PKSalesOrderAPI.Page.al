@@ -64,4 +64,23 @@ page 60209 "PK Sales Order API"
         if ShipmentNo = '' then
             Error('Sales order %1: posting reported success but no posted shipment was found.', SalesHeader."No.");
     end;
+
+    // Cancels the reservation entries on every open item line — see "PK Sales Ship Mgt" for why
+    // the middleware calls this before retrying a postShipment that failed on a stale/mismatched
+    // reservation. Same headless shape as postShipment: no request body, acts by SystemId.
+    //
+    //   POST .../bmiSalesOrders({systemId})/Microsoft.NAV.cancelReservation
+    [ServiceEnabled]
+    procedure cancelReservation(var ActionContext: WebServiceActionContext)
+    var
+        Mgt: Codeunit "PK Sales Ship Mgt";
+        SalesHeader: Record "Sales Header";
+    begin
+        SalesHeader.GetBySystemId(Rec.SystemId);
+        Mgt.CancelReservations(SalesHeader);
+        ActionContext.SetObjectType(ObjectType::Page);
+        ActionContext.SetObjectId(Page::"PK Sales Order API");
+        ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);
+        ActionContext.SetResultCode(WebServiceActionResultCode::Get);
+    end;
 }

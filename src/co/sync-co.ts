@@ -601,6 +601,28 @@ async function postShipmentOnly(cfg: BcConfig, token: string, companyId: string,
     { data: {}, timeout: POST_TIMEOUT_MS });
 }
 
+// BC error text that means "this shipment doesn't match the exact Reservation Entry BC has on
+// file for it" — the reservation points at supply that's since been consumed elsewhere, or was
+// written against the wrong location/variant. Deposco has, in every one of these cases, already
+// physically shipped the order; the reservation is stale or wrong, not the truth. See
+// cancelReservationsForOrder for why dropping it (not forcing negative inventory, not a floor
+// adjustment) is the fix.
+const STALE_RESERVATION = /insufficient quantity of item|reserved item .* is not on inventory|Location Code must be equal to|Variant Code must be equal to/i;
+function isStaleReservationError(message: string): boolean { return STALE_RESERVATION.test(message); }
+
+// Cancels the reservation entries on the order's open item lines (PK Sales Ship Mgt.CancelReservations
+// via the extension's cancelReservation action — see al/src/PKSalesOrderAPI.Page.al) so a retried
+// postShipment consumes general on-hand instead of one specific, mismatched earmark. Requires
+// extension >= 2.15.0.0.
+async function cancelReservationsForOrder(cfg: BcConfig, token: string, companyId: string, soNumber: string): Promise<void> {
+  const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
+  const row = (await authReq<{ value: Array<{ systemId: string }> }>('get',
+    `${bmi}/bmiSalesOrders?$filter=${encodeURIComponent(`no eq '${odataStr(soNumber)}'`)}`, token)).value?.[0];
+  if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.15.0.0 installed?`);
+  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.cancelReservation`, token,
+    { data: {}, timeout: POST_TIMEOUT_MS });
+}
+
 // The posted shipment this run created, identified by diffing the order's shipments around the
 // post rather than by pre-stamping a synthetic ref (see the External Document No. note below).
 // Returns the
@@ -759,13 +781,35 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     bcToken = await getBcToken(bcCfg);
     const afterErr = await shipmentNosForOrder(bcCfg, bcToken, companyId, soNumber);
     const madeIt = [...afterErr].filter((n) => !shipmentsBefore.has(n));
-    if (madeIt.length === 0) throw err;
-    const msg = `post returned HTTP ${e.response?.status ?? '?'} but BC posted ${madeIt.join(',')} anyway — treating as posted`;
-    console.warn(`[pull] ${soNumber}: ⚠ ${msg}`);
-    await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber,
-                     action: 'pull', status: 'desync', side: 'bc', message: msg,
-                     detail: JSON.stringify(e.response?.data ?? e.message).slice(0, 2000),
-                     dedupeKey: dailyDedupe('co-post-threw', soNumber, msg) });
+    if (madeIt.length === 0) {
+      // The order is genuinely stuck on a reservation BC can't fulfil — and in every one of these
+      // cases Deposco has already physically shipped it, so BC's earmark is stale or wrong, not
+      // the truth. Drop it and retry the post ONCE before giving up for this tick; a second failure
+      // (a real inventory shortage, say) falls through to the normal fail path below untouched.
+      if (isStaleReservationError((err as Error).message)) {
+        console.warn(`[pull] ${soNumber}: reservation-blocked post (${(err as Error).message.slice(0, 200)}) — cancelling reservations and retrying once`);
+        bcToken = await getBcToken(bcCfg);
+        await cancelReservationsForOrder(bcCfg, bcToken, companyId, soNumber);
+        bcToken = await getBcToken(bcCfg);
+        await postShipmentOnly(bcCfg, bcToken, companyId, soNumber);
+        const rmsg = `posted after cancelling a stale/mismatched reservation: ${(err as Error).message.slice(0, 200)}`;
+        console.warn(`[pull] ${soNumber}: ⚠ ${rmsg}`);
+        await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber,
+          action: 'pull', status: 'desync', side: 'bc', message: rmsg,
+          dedupeKey: dailyDedupe('co-ship-reserve-cancel', soNumber, rmsg) });
+        // Fall through — same as the "posted anyway" branch below — so post-state verification
+        // and tracking write-back run against the shipment this retry just created.
+      } else {
+        throw err;
+      }
+    } else {
+      const msg = `post returned HTTP ${e.response?.status ?? '?'} but BC posted ${madeIt.join(',')} anyway — treating as posted`;
+      console.warn(`[pull] ${soNumber}: ⚠ ${msg}`);
+      await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber,
+                       action: 'pull', status: 'desync', side: 'bc', message: msg,
+                       detail: JSON.stringify(e.response?.data ?? e.message).slice(0, 2000),
+                       dedupeKey: dailyDedupe('co-post-threw', soNumber, msg) });
+    }
   }
 
   // Verify BC advanced; warn loudly if we accidentally invoiced (would be a bug).
