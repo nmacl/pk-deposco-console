@@ -252,10 +252,10 @@ function runInvPull(){
 $('btnInvPull').onclick=runInvPull;
 function retryChronic(){
   const b=$('btnRetryChronic'); b.disabled=true;
-  line('\n──────── RETRY CHRONIC  '+new Date().toLocaleTimeString()+' ────────','run');
+  line('\\n──────── RETRY CHRONIC  '+new Date().toLocaleTimeString()+' ────────','run');
   fetch('/retry-chronic',{method:'POST'}).then(r=>r.json()).then(d=>{
     if(d.error){ line('error: '+d.error,'err'); return; }
-    line('▸ flush requested — every chronic order gets a fresh BC attempt on its worker\'s next scheduled tick (≤5 min)','ok');
+    line('▸ flush requested — every chronic order gets a fresh BC attempt on its worker\\'s next scheduled tick (≤5 min)','ok');
     line('  sales orders ('+d.co.length+'): '+(d.co.join(', ')||'none'));
     line('  transfer orders ('+d.to.length+'): '+(d.to.join(', ')||'none'));
   }).catch(e=>line('error: '+e.message,'err')).finally(()=>{ b.disabled=false; });
