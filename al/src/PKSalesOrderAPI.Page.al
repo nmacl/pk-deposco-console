@@ -83,4 +83,57 @@ page 60209 "PK Sales Order API"
         ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);
         ActionContext.SetResultCode(WebServiceActionResultCode::Get);
     end;
+
+    // Stamps "sent to Deposco" the first time only — the timestamp is meant to answer "when did
+    // this order first leave BC", so a later re-push (rare, but possible after a manual retry)
+    // must not overwrite it. False -> True is the only transition; already-true is a no-op.
+    //
+    //   POST .../bmiSalesOrders({systemId})/Microsoft.NAV.markSentToDeposco
+    [ServiceEnabled]
+    procedure markSentToDeposco(var ActionContext: WebServiceActionContext)
+    var
+        SalesHeader: Record "Sales Header";
+    begin
+        SalesHeader.GetBySystemId(Rec.SystemId);
+        if not SalesHeader."PK Sent to Deposco" then begin
+            SalesHeader."PK Sent to Deposco" := true;
+            SalesHeader."PK Sent to Deposco At" := CurrentDateTime();
+            SalesHeader.Modify(true);
+        end;
+        ActionContext.SetObjectType(ObjectType::Page);
+        ActionContext.SetObjectId(Page::"PK Sales Order API");
+        ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);
+        ActionContext.SetResultCode(WebServiceActionResultCode::Get);
+    end;
+
+    // Updates the live sync-health fields on every attempt, success or fail — a success clears
+    // the error, a failure records BC's own message so it's visible on the order itself without
+    // opening the console. `status` is one of "OK" / "Failed" / "Chronic" (case-insensitive);
+    // anything else clears the status back to blank.
+    //
+    //   POST .../bmiSalesOrders({systemId})/Microsoft.NAV.setSyncStatus  { status, errorMessage }
+    [ServiceEnabled]
+    procedure setSyncStatus(var ActionContext: WebServiceActionContext; status: Text[20]; errorMessage: Text[250])
+    var
+        SalesHeader: Record "Sales Header";
+    begin
+        SalesHeader.GetBySystemId(Rec.SystemId);
+        case UpperCase(status) of
+            'OK':
+                SalesHeader."PK Deposco Sync Status" := SalesHeader."PK Deposco Sync Status"::OK;
+            'FAILED':
+                SalesHeader."PK Deposco Sync Status" := SalesHeader."PK Deposco Sync Status"::Failed;
+            'CHRONIC':
+                SalesHeader."PK Deposco Sync Status" := SalesHeader."PK Deposco Sync Status"::Chronic;
+            else
+                SalesHeader."PK Deposco Sync Status" := SalesHeader."PK Deposco Sync Status"::" ";
+        end;
+        SalesHeader."PK Last Deposco Error" := errorMessage;
+        SalesHeader."PK Deposco Status At" := CurrentDateTime();
+        SalesHeader.Modify(true);
+        ActionContext.SetObjectType(ObjectType::Page);
+        ActionContext.SetObjectId(Page::"PK Sales Order API");
+        ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);
+        ActionContext.SetResultCode(WebServiceActionResultCode::Get);
+    end;
 }

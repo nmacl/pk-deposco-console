@@ -489,7 +489,17 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow,
   const preCreated = await ensureItemsExist(bcCfg, deposcoCfg, dToken, payload.customerOrder.coLines.data.map((l) => l.itemNumber));
   if (preCreated.length) console.log(`[push] ${soNumber}: pre-created ${preCreated.length} missing item(s): ${preCreated.join(', ')}`);
   const result = await postSo(bcCfg, deposcoCfg, soNumber, payload, `${lines.length} WMS line(s)${via ? `, via ${via}` : ''}${preCreated.length ? `, ${preCreated.length} item(s) pre-created` : ''}`);
-  if (result === 'ok') await auditPush(bcCfg, deposcoCfg, soNumber, payload, runId);
+  if (result === 'ok') {
+    await auditPush(bcCfg, deposcoCfg, soNumber, payload, runId);
+    // Best-effort: visibility on the BC document, never worth failing an already-successful push over.
+    try {
+      const markToken = await getBcToken(bcCfg);
+      const companyId = await getCompanyId(bcCfg, markToken);
+      await markSentToDeposco(bcCfg, markToken, companyId, soNumber);
+    } catch (e) {
+      console.warn(`[push] ${soNumber}: failed to stamp "sent to Deposco" on BC (non-fatal): ${(e as Error).message}`);
+    }
+  }
   return result;
 }
 
@@ -621,6 +631,30 @@ async function cancelReservationsForOrder(cfg: BcConfig, token: string, companyI
   if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.15.0.0 installed?`);
   await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.cancelReservation`, token,
     { data: {}, timeout: POST_TIMEOUT_MS });
+}
+
+// Visibility on the BC document itself — see al/src/PKSalesHeaderExt.TableExt.al. Both are
+// best-effort bookkeeping (callers wrap these and never let a failure here break a sync that
+// otherwise succeeded): markSentToDeposco stamps once on first successful push; setSyncStatus
+// records the outcome of every subsequent shipment-sync attempt so a chronic order is visible to
+// whoever opens it in BC, not just to whoever happens to check the console. Requires extension
+// >= 2.16.0.0.
+async function markSentToDeposco(cfg: BcConfig, token: string, companyId: string, soNumber: string): Promise<void> {
+  const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
+  const row = (await authReq<{ value: Array<{ systemId: string }> }>('get',
+    `${bmi}/bmiSalesOrders?$filter=${encodeURIComponent(`no eq '${odataStr(soNumber)}'`)}`, token)).value?.[0];
+  if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.16.0.0 installed?`);
+  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.markSentToDeposco`, token,
+    { data: {}, timeout: POST_TIMEOUT_MS });
+}
+
+async function setSyncStatus(cfg: BcConfig, token: string, companyId: string, soNumber: string, status: 'OK' | 'Failed' | 'Chronic', errorMessage: string): Promise<void> {
+  const bmi = `${bmiApiBase(cfg)}/companies(${companyId})`;
+  const row = (await authReq<{ value: Array<{ systemId: string }> }>('get',
+    `${bmi}/bmiSalesOrders?$filter=${encodeURIComponent(`no eq '${odataStr(soNumber)}'`)}`, token)).value?.[0];
+  if (!row) throw new Error(`SO ${soNumber} not found on bmiSalesOrders — is extension >= 2.16.0.0 installed?`);
+  await authReq('post', `${bmi}/bmiSalesOrders(${row.systemId})/Microsoft.NAV.setSyncStatus`, token,
+    { data: { status, errorMessage: errorMessage.slice(0, 250) }, timeout: POST_TIMEOUT_MS });
 }
 
 // The posted shipment this run created, identified by diffing the order's shipments around the
@@ -810,6 +844,16 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
                        detail: JSON.stringify(e.response?.data ?? e.message).slice(0, 2000),
                        dedupeKey: dailyDedupe('co-post-threw', soNumber, msg) });
     }
+  }
+
+  // A postShipment landed this tick (directly, "posted anyway", or after the reservation-cancel
+  // retry) — clear whatever failure status a previous tick left on the header. Best-effort: a
+  // status write is bookkeeping, never worth failing a shipment that already posted over.
+  try {
+    bcToken = await getBcToken(bcCfg);
+    await setSyncStatus(bcCfg, bcToken, companyId, soNumber, 'OK', '');
+  } catch (e) {
+    console.warn(`[pull] ${soNumber}: failed to clear sync status on BC (non-fatal): ${(e as Error).message}`);
   }
 
   // Verify BC advanced; warn loudly if we accidentally invoiced (would be a bug).
@@ -1161,6 +1205,15 @@ async function pullFromShipments(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, run
       failed++;
       const msg = `shipment-driven pull: ${(err as Error).message.slice(0, 300)}`;
       await logEvent({ runId, worker: 'co', direction: 'deposco->bc', entityType: 'order', entityId: soNumber, action: 'pull', status: 'fail', side, message: msg, detail: body.slice(0, 4000), dedupeKey: dailyDedupe('co-ship-pull', soNumber, msg) });
+      // Visibility on the BC document itself — see al/src/PKSalesHeaderExt.TableExt.al. Best-effort:
+      // a status write must never compound a sync failure with a second, unrelated one.
+      try {
+        const statusToken = await getBcToken(bcCfg);
+        const statusCompanyId = await getCompanyId(bcCfg, statusToken);
+        await setSyncStatus(bcCfg, statusToken, statusCompanyId, soNumber, chronic.has(soNumber) ? 'Chronic' : 'Failed', (err as Error).message);
+      } catch (statusErr) {
+        console.warn(`[ship] ${soNumber}: failed to write sync status to BC (non-fatal): ${(statusErr as Error).message}`);
+      }
     }
   }
   // Advance BOTH marks to just below the OLDEST failure — not "only when nothing failed".
