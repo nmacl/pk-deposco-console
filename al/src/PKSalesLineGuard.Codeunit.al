@@ -35,7 +35,7 @@ codeunit 60228 "PK Sales Line Guard"
         if not SalesHeader."PK Sent to Deposco" then
             exit;
 
-        if not Confirm('Sales order %1 was already sent to Deposco. Changing the Westerly location on line %2 can desync the shipment.\Continue anyway?', false, Rec."Document No.", Rec."Line No.") then
+        if not Confirm('Sales order %1 was already sent to Deposco. Changing the Westerly location on line %2 can desync the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', false, Rec."Document No.", Rec."Line No.") then
             Error('Location Code change cancelled.');
 
         LogEdit(Rec, 'Location Code changed', 'Location Code', xRec."Location Code", Rec."Location Code");
@@ -57,7 +57,7 @@ codeunit 60228 "PK Sales Line Guard"
         if not SalesHeader."PK Sent to Deposco" then
             exit;
 
-        if not Confirm('Sales order %1 was already sent to Deposco. A new item line added now may never reach the shipment.\Continue anyway?', false, Rec."Document No.") then
+        if not Confirm('Sales order %1 was already sent to Deposco. A new item line added now may never reach the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', false, Rec."Document No.") then
             Error('New line cancelled.');
 
         LogEdit(Rec, 'Item line added', 'Item No.', '', Rec."No.");
