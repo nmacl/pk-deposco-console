@@ -7,33 +7,42 @@
 // "Sync Status" answers "is it healthy right now" — updated on every subsequent sync attempt,
 // success or fail. Conflating them would make a transient post-send failure look like the order
 // was never sent at all.
+//
+// Field numbers start at 60300, NOT 60200: this app already has multiple table extensions
+// numbering their own fields from 60200 (PKSalesShipmentExt on Sales Shipment Header,
+// PKPurchHeaderExt/PKPurchRcptHeaderExt on Purchase Header/Purch. Rcpt. Header). Field IDs in
+// this app are NOT scoped per target table — BC's schema sync tracks them across the whole app,
+// and reusing 60200 here for an unrelated field/type on Sales Header broke deployment ("the
+// following fields must have the same type") until this range was moved clear of every existing
+// tableextension in al/src/*.TableExt.al. Check `grep -n "field(" al/src/*.TableExt.al` before
+// ever picking a table-extension field number in this app.
 tableextension 60235 "PK Sales Header Ext" extends "Sales Header"
 {
     fields
     {
-        field(60200; "PK Sent to Deposco"; Boolean)
+        field(60300; "PK Sent to Deposco"; Boolean)
         {
             Caption = 'Sent to Deposco';
             DataClassification = SystemMetadata;
         }
-        field(60201; "PK Sent to Deposco At"; DateTime)
+        field(60301; "PK Sent to Deposco At"; DateTime)
         {
             Caption = 'Sent to Deposco At';
             DataClassification = SystemMetadata;
         }
-        field(60202; "PK Deposco Sync Status"; Option)
+        field(60302; "PK Deposco Sync Status"; Option)
         {
             Caption = 'Deposco Sync Status';
             OptionMembers = " ",OK,Failed,Chronic;
             OptionCaption = ' ,OK,Failed,Chronic';
             DataClassification = SystemMetadata;
         }
-        field(60203; "PK Last Deposco Error"; Text[250])
+        field(60303; "PK Last Deposco Error"; Text[250])
         {
             Caption = 'Last Deposco Error';
             DataClassification = SystemMetadata;
         }
-        field(60204; "PK Deposco Status At"; DateTime)
+        field(60304; "PK Deposco Status At"; DateTime)
         {
             Caption = 'Deposco Status At';
             DataClassification = SystemMetadata;
