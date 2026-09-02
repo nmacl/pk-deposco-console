@@ -22,6 +22,8 @@ codeunit 60228 "PK Sales Line Guard"
     begin
         if not GuiAllowed() then
             exit;
+        if IsExemptUser() then
+            exit;
         if Rec."Document Type" <> Rec."Document Type"::Order then
             exit;
         if Rec.Type <> Rec.Type::Item then
@@ -48,6 +50,8 @@ codeunit 60228 "PK Sales Line Guard"
     begin
         if not GuiAllowed() then
             exit;
+        if IsExemptUser() then
+            exit;
         if Rec."Document Type" <> Rec."Document Type"::Order then
             exit;
         if Rec.Type <> Rec.Type::Item then
@@ -61,6 +65,20 @@ codeunit 60228 "PK Sales Line Guard"
             Error('New line cancelled.');
 
         LogEdit(Rec, 'Item line added', 'Item No.', '', Rec."No.");
+    end;
+
+    // Finance — posting dates, invoicing corrections, and the like on a sent order's lines, never
+    // the warehouse/location concerns this guard exists for. Exempted entirely, not just confirmed
+    // through: no popup, no log entry, nothing. Update this list directly when Finance's roster
+    // changes; there is no BC setup screen backing it.
+    local procedure IsExemptUser(): Boolean
+    begin
+        case UpperCase(UserId()) of
+            'ACCRECV', 'CBURNS', 'CKELLY', 'JOY', 'JPOWELL', 'LRICHARDSON', 'PETMC', 'SMAYBEN', 'SSAURO', 'STARTY', 'VSOLOMON', 'DCOOGAN':
+                exit(true);
+            else
+                exit(false);
+        end;
     end;
 
     local procedure LogEdit(var SalesLine: Record "Sales Line"; ChangeType: Text[50]; FieldName: Text[50]; OldValue: Text[250]; NewValue: Text[250])
