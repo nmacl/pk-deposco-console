@@ -30,6 +30,26 @@ function db() {
   return pgPool;
 }
 
+// Shared by /logs/data and /logs/export.csv so the file you download is exactly the list you were
+// looking at. The status filter keeps its fixed allowlist; worker and the free-text search are
+// bound parameters, never interpolated. The search also covers `detail` (the JSON column) so a
+// BC CorrelationId or an error body that got truncated out of `message` is still findable.
+function logsFilter(url) {
+  const filter = url.searchParams.get('filter') || 'issues';
+  const worker = (url.searchParams.get('worker') || '').trim();
+  const q = (url.searchParams.get('q') || '').trim();
+  const clauses = [];
+  const params = [];
+  if (filter === 'fail') clauses.push("status = 'fail'");
+  else if (filter === 'issues') clauses.push("status in ('fail','desync','floor')");
+  if (worker) { params.push(worker); clauses.push(`worker = $${params.length}`); }
+  if (q) {
+    params.push(`%${q}%`);
+    clauses.push(`(entity_id ilike $${params.length} or message ilike $${params.length} or detail::text ilike $${params.length})`);
+  }
+  return { where: clauses.length ? `where ${clauses.join(' and ')}` : '', params };
+}
+
 // Console-level logging for order piping — one sync_event per order (ok/fail + the error line),
 // so po/co/to runs show up in /logs uniformly without editing each worker. Never throws.
 async function logRunStart(worker, trigger) {
@@ -292,6 +312,8 @@ const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .side { font-size:10px; color:#8b949e; text-transform:uppercase; }
   .detail { display:none; white-space:pre-wrap; font:11px ui-monospace,Menlo,monospace; color:#8b949e; background:#010409; border:1px solid #21262d; border-radius:6px; padding:8px; margin-top:4px; }
   .mono { font:12px ui-monospace,Menlo,monospace; } .dim { color:#6e7681; }
+  input[type=search], select { padding:6px 10px; border-radius:6px; border:1px solid #30363d; background:#0d1117; color:#c9d1d9; font-size:12px; }
+  input[type=search] { width:300px; }
 </style></head><body>
 <header><h1>Sync Logs</h1><a href="/">← Console</a>
   <span class="sub" id="status">loading…</span>
@@ -300,7 +322,10 @@ const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   <button data-f="issues" class="on">Issues (fail / desync)</button>
   <button data-f="fail">Failures only</button>
   <button data-f="all">All events</button>
+  <select id="worker" title="Worker"><option value="">all workers</option></select>
+  <input type="search" id="q" placeholder="search order #, message, error text…" autocomplete="off"/>
   <span style="margin-left:auto;"></span>
+  <button id="export" title="Download every row matching the current filters (max 10,000) as CSV — opens in Excel">Export CSV</button>
   <button id="prev">← Newer</button>
   <span id="pageind" class="sub"></span>
   <button id="next">Older →</button>
@@ -308,16 +333,20 @@ const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
 <div class="runs" id="runs"></div>
 <table><thead><tr><th>Time</th><th>Worker</th><th>Entity</th><th>Status</th><th>Message</th></tr></thead><tbody id="rows"></tbody></table>
 <script>
-var filter='issues', timer=null, page=0;
+var filter='issues', timer=null, page=0, qTimer=null;
 function esc(s){ return String(s==null?'':s).replace(/[&<>]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c];}); }
 function fmt(ts){ return ts? new Date(ts).toLocaleString():''; }
 function badge(s){ return '<span class="badge s-'+esc(s)+'">'+esc(s)+'</span>'; }
+function qs(){ return 'filter='+encodeURIComponent(filter)+'&worker='+encodeURIComponent(document.getElementById('worker').value)+'&q='+encodeURIComponent(document.getElementById('q').value.trim()); }
 function load(){
-  fetch('/logs/data?filter='+filter+'&page='+page).then(function(r){return r.json();}).then(function(d){
+  fetch('/logs/data?'+qs()+'&page='+page).then(function(r){return r.json();}).then(function(d){
     var st=document.getElementById('status');
     if(!d.configured){ st.textContent='⚠ logging not configured (no DATABASE_URL on this deploy)'; return; }
     if(d.error){ st.textContent='DB error: '+d.error; return; }
-    st.textContent='updated '+new Date().toLocaleTimeString()+' · '+d.events.length+' event(s) shown';
+    var q=document.getElementById('q').value.trim();
+    st.textContent='updated '+new Date().toLocaleTimeString()+' · '+d.events.length+' event(s) shown'+(q?' · matching "'+q+'"':'');
+    var sel=document.getElementById('worker'), cur=sel.value;
+    if(d.workers){ sel.innerHTML='<option value="">all workers</option>'+d.workers.map(function(w){ return '<option value="'+esc(w)+'">'+esc(w)+'</option>'; }).join(''); sel.value=cur; }
     document.getElementById('pageind').textContent='page '+((d.page||0)+1);
     document.getElementById('prev').disabled=(d.page||0)<=0;
     document.getElementById('next').disabled=!d.hasMore;
@@ -334,6 +363,10 @@ Array.prototype.forEach.call(document.querySelectorAll('button[data-f]'),functio
 document.getElementById('prev').onclick=function(){ if(page>0){ page--; load(); } };
 document.getElementById('next').onclick=function(){ page++; load(); };
 document.getElementById('refresh').onclick=load;
+document.getElementById('worker').onchange=function(){ page=0; load(); };
+document.getElementById('q').addEventListener('input',function(){ clearTimeout(qTimer); qTimer=setTimeout(function(){ page=0; load(); },400); });
+document.getElementById('q').addEventListener('keydown',function(e){ if(e.key==='Enter'){ clearTimeout(qTimer); page=0; load(); } });
+document.getElementById('export').onclick=function(){ window.location='/logs/export.csv?'+qs(); };
 function schedule(){ if(timer)clearInterval(timer); if(document.getElementById('auto').checked) timer=setInterval(load,10000); }
 document.getElementById('auto').onchange=schedule;
 load(); schedule();
@@ -360,21 +393,53 @@ const server = createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     const p = db();
     if (!p) { res.end(JSON.stringify({ configured: false })); return; }
-    const filter = url.searchParams.get('filter') || 'issues';
     const PAGE_SIZE = 100;
     const page = Math.max(0, parseInt(url.searchParams.get('page') || '0', 10) || 0);
-    // fixed allowlist → no injection from the filter param
-    const where = filter === 'fail' ? "where status = 'fail'"
-      : filter === 'issues' ? "where status in ('fail','desync','floor')" : '';
+    const { where, params } = logsFilter(url);
     // fetch PAGE_SIZE+1 to know if there's a next page without a count query
-    p.query(`select * from sync_events ${where} order by id desc limit $1 offset $2`, [PAGE_SIZE + 1, page * PAGE_SIZE])
+    p.query(`select * from sync_events ${where} order by id desc limit $${params.length + 1} offset $${params.length + 2}`,
+      [...params, PAGE_SIZE + 1, page * PAGE_SIZE])
       .then((ev) => {
         const hasMore = ev.rows.length > PAGE_SIZE;
         const events = ev.rows.slice(0, PAGE_SIZE);
-        return p.query('select id,worker,trigger,started_at,finished_at,status,counts from sync_runs order by id desc limit 15')
-          .then((runs) => res.end(JSON.stringify({ configured: true, events, runs: runs.rows, page, hasMore })));
+        return Promise.all([
+          p.query('select id,worker,trigger,started_at,finished_at,status,counts from sync_runs order by id desc limit 15'),
+          p.query('select distinct worker from sync_events order by worker'),
+        ]).then(([runs, workers]) => res.end(JSON.stringify({
+          configured: true, events, runs: runs.rows, page, hasMore, workers: workers.rows.map((w) => w.worker),
+        })));
       })
       .catch((e) => res.end(JSON.stringify({ configured: true, error: e.message })));
+    return;
+  }
+  // Same filters as the page, every matching row (capped), as a file. CSV rather than XLSX on
+  // purpose: Excel opens it directly and it needs no dependency — the BOM up front is what stops
+  // Excel from mangling the ✓/⚠/→ characters the workers put in messages.
+  if (url.pathname === '/logs/export.csv') {
+    const p = db();
+    if (!p) { res.writeHead(503, { 'Content-Type': 'text/plain' }); res.end('logging DB not configured (no DATABASE_URL)'); return; }
+    const { where, params } = logsFilter(url);
+    const EXPORT_CAP = 10_000;
+    p.query(`select ts,worker,entity_type,entity_id,side,action,status,message,hits,last_ts,detail,run_id from sync_events ${where} order by id desc limit $${params.length + 1}`,
+      [...params, EXPORT_CAP])
+      .then((r) => {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        res.writeHead(200, {
+          'Content-Type': 'text/csv; charset=utf-8',
+          'Content-Disposition': `attachment; filename="sync-events-${stamp}.csv"`,
+        });
+        const cols = ['ts', 'worker', 'entity_type', 'entity_id', 'side', 'action', 'status', 'message', 'hits', 'last_ts', 'detail', 'run_id'];
+        const cell = (v) => {
+          if (v == null) return '';
+          const s = v instanceof Date ? v.toISOString() : typeof v === 'object' ? JSON.stringify(v) : String(v);
+          return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        };
+        res.write('﻿' + cols.join(',') + '\r\n');
+        for (const row of r.rows) res.write(cols.map((c) => cell(row[c])).join(',') + '\r\n');
+        if (r.rows.length === EXPORT_CAP) res.write(`# truncated at ${EXPORT_CAP} rows — narrow the filter or search to export the rest\r\n`);
+        res.end();
+      })
+      .catch((e) => { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end(`export failed: ${e.message}`); });
     return;
   }
   // "Retry chronic now": stamp a flush for both workers that pace chronic retries. Each worker
