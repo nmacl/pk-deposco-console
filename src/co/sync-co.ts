@@ -565,6 +565,8 @@ interface BcSalesOrderLine {
   quantity: number;
   shippedQuantity: number; // cumulative posted shipments (read-only)
   invoicedQuantity?: number;
+  shipQuantity?: number;   // Qty. to Ship as currently staged on the line
+  lineType?: string;       // 'Item' | 'Account' | 'Comment' | ...
 }
 
 async function getSalesOrderByNumber(base: string, token: string, companyId: string, soNumber: string): Promise<BcSalesOrder | null> {
@@ -790,6 +792,23 @@ async function pullShipmentsForSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, so
     const r = await patchSalesLine(base, bcToken, companyId, line.lineId, { shipQuantity: line.quantity });
     console.log(`  PATCHed ${soNumber} ${line.label}: pending shipQty=${r['shipQuantity']} invoiceQty=${r['invoiceQuantity']} (invoice qty left as-is)`);
   }
+  // And UN-stage every other item line. BC fills Qty. to Ship with the full remainder on every
+  // line by default and re-fills it whenever the order is reopened/released (which the API does
+  // around each PATCH above), and the ship-only post ships whatever is staged — so a DROPSHIP,
+  // PK or FEHIVE line that Deposco never saw rode along on every post. On DISO212787 that was a
+  // special-order line whose PO had nothing vouched, and Redefine's check refused the whole
+  // shipment; on an order with no such check it would simply have posted as shipped. Zero them
+  // here so only what Deposco shipped ships. BC re-defaults them again afterwards; harmless.
+  const shipping = new Set(toShip.map((l) => l.lineId));
+  bcToken = await getBcToken(bcCfg);
+  const freshLines = await getSalesLines(base, bcToken, companyId, so.id);
+  const toZero = freshLines.filter((l) => !shipping.has(l.id) && (l.lineType ?? 'Item') === 'Item' && (l.shipQuantity ?? 0) !== 0);
+  for (const l of toZero) {
+    bcToken = await getBcToken(bcCfg);
+    await patchSalesLine(base, bcToken, companyId, l.id, { shipQuantity: 0 });
+    console.log(`  zeroed Qty. to Ship on ${soNumber} line${l.sequence}/${l.lineObjectNumber} (was ${l.shipQuantity}) — not shipped by Deposco, must not post`);
+  }
+  if (toZero.length) console.log(`  ${toZero.length} non-Deposco line(s) un-staged before posting`);
 
   // Snapshot the order's posted shipments so the one this run creates can be identified by
   // difference — replaces matching on the synthetic External Document No. ref we no longer stamp.
