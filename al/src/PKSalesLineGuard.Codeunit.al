@@ -37,10 +37,24 @@ codeunit 60228 "PK Sales Line Guard"
         if not SalesHeader."PK Sent to Deposco" then
             exit;
 
-        if not Confirm('Sales order %1 was already sent to Deposco. Changing the Westerly location on line %2 can desync the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', false, Rec."Document No.", Rec."Line No.") then
-            Error('Location Code change cancelled.');
-
-        LogEdit(Rec, 'Location Code changed', 'Location Code', xRec."Location Code", Rec."Location Code");
+        // One answer can cover the whole order. Changing every line's location on a multi-line
+        // order meant one popup per line (Jordan, 2026-09-15); "Yes to all" remembers the order for
+        // the rest of this user's session, and every line changed under it is still logged.
+        if GuardState.IsApproved(Rec."Document No.") then begin
+            LogEdit(Rec, 'Location Code changed (yes to all)', 'Location Code', xRec."Location Code", Rec."Location Code");
+            exit;
+        end;
+        case StrMenu(ChoicesTxt, 3, StrSubstNo(LocationQst, Rec."Document No.", Rec."Line No.")) of
+            1:
+                LogEdit(Rec, 'Location Code changed', 'Location Code', xRec."Location Code", Rec."Location Code");
+            2:
+                begin
+                    GuardState.Approve(Rec."Document No.");
+                    LogEdit(Rec, 'Location Code changed (yes to all)', 'Location Code', xRec."Location Code", Rec."Location Code");
+                end;
+            else
+                Error('Location Code change cancelled.');
+        end;
     end;
 
     [EventSubscriber(ObjectType::Table, Database::"Sales Line", 'OnBeforeInsertEvent', '', false, false)]
@@ -80,6 +94,11 @@ codeunit 60228 "PK Sales Line Guard"
                 exit(false);
         end;
     end;
+
+    var
+        GuardState: Codeunit "PK Sales Line Guard State";
+        ChoicesTxt: Label 'Yes, this line,Yes to all lines on this order,No';
+        LocationQst: Label 'Sales order %1 was already sent to Deposco. Changing the Westerly location on line %2 can desync the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', Comment = '%1 = order no., %2 = line no.';
 
     local procedure LogEdit(var SalesLine: Record "Sales Line"; ChangeType: Text[50]; FieldName: Text[50]; OldValue: Text[250]; NewValue: Text[250])
     var
