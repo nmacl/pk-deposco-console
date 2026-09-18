@@ -20,6 +20,13 @@ codeunit 60228 "PK Sales Line Guard"
     var
         SalesHeader: Record "Sales Header";
     begin
+        // Table events fire for TEMPORARY records too. BC copies an order's lines into temp Sales
+        // Line buffers constantly — releasing, invoice-discount calc, posting-date flow, the
+        // Sales-Post pre-checks — and every temp copy of a Westerly item line looked to this guard
+        // like a brand-new line (DISO215972: one "new item line" prompt per line on a posting-date
+        // change, 2026-09-18). Nothing temporary is ever a real edit.
+        if Rec.IsTemporary() then
+            exit;
         if not GuiAllowed() then
             exit;
         if IsExemptUser() then
@@ -62,6 +69,13 @@ codeunit 60228 "PK Sales Line Guard"
     var
         SalesHeader: Record "Sales Header";
     begin
+        // Table events fire for TEMPORARY records too. BC copies an order's lines into temp Sales
+        // Line buffers constantly — releasing, invoice-discount calc, posting-date flow, the
+        // Sales-Post pre-checks — and every temp copy of a Westerly item line looked to this guard
+        // like a brand-new line (DISO215972: one "new item line" prompt per line on a posting-date
+        // change, 2026-09-18). Nothing temporary is ever a real edit.
+        if Rec.IsTemporary() then
+            exit;
         if not GuiAllowed() then
             exit;
         if IsExemptUser() then
