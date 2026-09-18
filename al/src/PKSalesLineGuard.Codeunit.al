@@ -75,10 +75,24 @@ codeunit 60228 "PK Sales Line Guard"
         if not SalesHeader."PK Sent to Deposco" then
             exit;
 
-        if not Confirm('Sales order %1 was already sent to Deposco. A new item line added now may never reach the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', false, Rec."Document No.") then
-            Error('New line cancelled.');
-
-        LogEdit(Rec, 'Item line added', 'Item No.', '', Rec."No.");
+        // Same session memory as the location guard: one "Yes to all" covers every further line
+        // on this order. Needed because a posting-date change on a sent order re-inserts its
+        // Westerly item lines (Jordan, DISO215972, 2026-09-18), and each re-insert asked again.
+        if GuardState.IsApproved(Rec."Document No.") then begin
+            LogEdit(Rec, 'Item line added (yes to all)', 'Item No.', '', Rec."No.");
+            exit;
+        end;
+        case StrMenu(ChoicesTxt, 3, StrSubstNo(NewLineQst, Rec."Document No.")) of
+            1:
+                LogEdit(Rec, 'Item line added', 'Item No.', '', Rec."No.");
+            2:
+                begin
+                    GuardState.Approve(Rec."Document No.");
+                    LogEdit(Rec, 'Item line added (yes to all)', 'Item No.', '', Rec."No.");
+                end;
+            else
+                Error('New line cancelled.');
+        end;
     end;
 
     // Finance — posting dates, invoicing corrections, and the like on a sent order's lines, never
@@ -98,6 +112,7 @@ codeunit 60228 "PK Sales Line Guard"
     var
         GuardState: Codeunit "PK Sales Line Guard State";
         ChoicesTxt: Label 'Yes, this line,Yes to all lines on this order,No';
+        NewLineQst: Label 'Sales order %1 was already sent to Deposco. A new item line added now may never reach the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', Comment = '%1 = order no.';
         LocationQst: Label 'Sales order %1 was already sent to Deposco. Changing the Westerly location on line %2 can desync the shipment.\Please submit a Wrike ticket before making this change.\Continue anyway?', Comment = '%1 = order no., %2 = line no.';
 
     local procedure LogEdit(var SalesLine: Record "Sales Line"; ChangeType: Text[50]; FieldName: Text[50]; OldValue: Text[250]; NewValue: Text[250])
