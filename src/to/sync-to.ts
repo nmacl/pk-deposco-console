@@ -426,7 +426,10 @@ async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action:
 interface BmiTransferShipment { systemId: string; no: string; transferOrderNo: string; fromCode: string; toCode: string; postingDate: string; deposcoTrackingNo: string }
 
 async function listUntrackedTransferShipments(cfg: SyncBcConfig, companyId: string, token: string, opts: { transferNo?: string; sinceDate?: string }): Promise<BmiTransferShipment[]> {
-  const clauses = ["deposcoTrackingNo eq ''"];
+  // "Never synced" = no Deposco ship via yet: every Deposco shipment has one, while shuttle /
+  // "Ship Outside System" shipments legitimately have no tracking number, so keying on the tracking
+  // field would make those re-walk Deposco on every tick/backfill forever.
+  const clauses = ["deposcoShipVia eq ''"];
   if (opts.transferNo) clauses.push(`transferOrderNo eq '${odataStr(opts.transferNo)}'`);
   if (opts.sinceDate) clauses.push(`postingDate ge ${opts.sinceDate}`);
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferShipments?$filter=${encodeURIComponent(clauses.join(' and '))}&$orderby=postingDate desc&$top=500`;
@@ -462,27 +465,30 @@ async function writeTransferTrackingBack(
     const dToken = await getDeposcoToken(deposcoCfg);
     const co = await authReq<{ customerOrder?: { fulfillmentOrders?: Array<{ id: number }> } }>('get', `${deposcoCfg.apiBase}/orders/customerOrders/${customerOrderId}`, dToken);
     const all: DeposcoTracking[] = [];
-    for (const fo of co.customerOrder?.fulfillmentOrders ?? []) all.push(...await fetchTrackingForSalesOrder(deposcoCfg, dToken, fo.id));
+    for (const fo of co.customerOrder?.fulfillmentOrders ?? []) all.push(...await fetchTrackingForSalesOrder(deposcoCfg, dToken, fo.id, { includeUntracked: true }));
     if (all.length === 0) {
-      console.log(`[track] ${no}: no tracking numbers in Deposco yet (${target} stays untracked)`);
-      await logTrack('skip', 'no tracking number on any Deposco outbound shipment yet', { target }, 'deposco');
+      console.log(`[track] ${no}: nothing shipped in Deposco yet (${target} stays unsynced)`);
+      await logTrack('skip', 'no Deposco outbound shipment yet', { target }, 'deposco');
       return 'skip';
     }
     const real = all.filter((t) => t.shippedUnits > 0);
     const used = real.length > 0 ? real : all;   // zero-qty labels: never primary, but keep if that's all there is
+    // Shuttle / "Ship Outside System" parcels carry no tracking number. Still worth stamping: the rep
+    // learns HOW and WHEN it left (ship via + ship date), which is the actual question.
+    const tracked = used.filter((t) => t.trackingNumber);
+    const noTracking = tracked.length === 0;
     const joinCapped = (vals: string[], max: number): string => {
       const kept: string[] = [];
       for (const v of vals) { if ([...kept, v].join(',').length > max) break; kept.push(v); }
       return kept.join(',');
     };
-    const primary = used[0];
+    const primary = (tracked[0] ?? used[0]);
     const payload = {
       shipmentNo: target,
       deposcoShipmentNo: joinCapped(used.map((t) => t.shipmentNo), 20),
       deposcoSalesOrderNo: primary.salesOrderNo,
-      trackingNo: joinCapped(used.map((t) => t.trackingNumber), 250),
-      trackingUrl: primary.trackingUrl,
-      carrier: primary.carrier,
+      ...(noTracking ? {} : { trackingNo: joinCapped(tracked.map((t) => t.trackingNumber), 250), trackingUrl: primary.trackingUrl }),
+      carrier: primary.carrier || (noTracking ? primary.shipVia : ''),
       shipVia: primary.shipVia,
       shipMethod: primary.shipMethod,
       containerLpn: primary.containerLpn,
@@ -494,8 +500,9 @@ async function writeTransferTrackingBack(
       'post', `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferShipmentTrackings`, bcToken,
       { data: payload, headers: { 'Content-Type': 'application/json' } });
     if (res.applied) {
-      console.log(`[track] ${no}: ✓ ${res.appliedTo} ← ${payload.carrier} ${payload.trackingNo}`);
-      await logTrack('ok', `${res.appliedTo}: ${payload.carrier} ${payload.trackingNo}`, { shipment: res.appliedTo, carrier: payload.carrier, trackingNo: payload.trackingNo, trackingUrl: payload.trackingUrl, parcels: used.length });
+      const what = noTracking ? `${payload.shipVia} (no carrier tracking)` : `${payload.carrier} ${payload.trackingNo}`;
+      console.log(`[track] ${no}: ✓ ${res.appliedTo} ← ${what}`);
+      await logTrack('ok', `${res.appliedTo}: ${what}`, { shipment: res.appliedTo, carrier: payload.carrier, shipVia: payload.shipVia, trackingNo: payload.trackingNo ?? '', trackingUrl: payload.trackingUrl ?? '', parcels: used.length, noTracking });
       return 'ok';
     }
     const m = `not applied: ${res.errorMessage ?? 'unknown'}`;
@@ -519,8 +526,9 @@ async function backfillTransferTracking(cfg: SyncBcConfig, deposcoCfg: DeposcoCo
   const companyId = await getCompanyId(cfg, token);
   const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
   const rows = (await listUntrackedTransferShipments(cfg, companyId, token, { sinceDate: since }))
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     .filter((r) => WMS_LOCATIONS.has((r.fromCode ?? '').toUpperCase()));
-  console.log(`[backfill] ${rows.length} untracked WMS-origin transfer shipment(s) since ${since}`);
+  console.log(`[backfill] ${rows.length} unsynced WMS-origin transfer shipment(s) since ${since} (shuttle shipments get ship via + date, carrier shipments get tracking)`);
   const dToken = await getDeposcoToken(deposcoCfg);
   let ok = 0, skip = 0, fail = 0;
   for (const r of rows) {

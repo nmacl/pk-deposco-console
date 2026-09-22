@@ -549,6 +549,10 @@ export async function fetchTrackingForSalesOrder(
   cfg: DeposcoConfig,
   token: string,
   salesOrderId: number,
+  /** includeUntracked: also return shipped parcels with NO tracking number (shuttle / "Ship Outside
+   *  System") so the caller can still stamp carrier, ship via and ship date. Default keeps the
+   *  original contract (tracked parcels only) for the sales-order write-back. */
+  opts: { includeUntracked?: boolean } = {},
 ): Promise<DeposcoTracking[]> {
   interface DsOrderLine { self?: { id?: number }; customerLineNumber?: string }
   interface DsSalesOrder { number?: string; shipments?: { data?: DsShipmentRef[] }; orderLines?: { data?: DsOrderLine[] } }
@@ -571,7 +575,7 @@ export async function fetchTrackingForSalesOrder(
       'get', `${cfg.apiBase}/shipments/outboundShipments/${ref.id}`, token);
     const s = d.outboundShipment ?? d;
     const num = (s.trackingNumber ?? '').trim();
-    if (!num) continue;                       // picked/packed but not yet labelled
+    if (!num && !opts.includeUntracked) continue;   // picked/packed but not yet labelled
     const baseUrl = (s.trackingUrl ?? '').trim();
     const lines: DeposcoTrackingLine[] = [];
     for (const sl of s.shipmentLines?.data ?? []) {

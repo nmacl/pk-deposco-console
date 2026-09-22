@@ -214,6 +214,8 @@ export function webhookBody(subject: string, text: string, alerts: Alert[], form
     const color = (k: AlertKind): string => k === 'inv-dead-letter' ? 'Attention' : k === 'inv-stuck' ? 'Warning' : 'Accent';
     return {
       type: 'message',
+      // Plain text too, so a hand-built Power Automate flow can just post triggerBody()?['text'].
+      text: `${subject}\n${text}`,
       attachments: [{
         contentType: 'application/vnd.microsoft.card.adaptive',
         contentUrl: null,
