@@ -526,7 +526,6 @@ async function backfillTransferTracking(cfg: SyncBcConfig, deposcoCfg: DeposcoCo
   const companyId = await getCompanyId(cfg, token);
   const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
   const rows = (await listUntrackedTransferShipments(cfg, companyId, token, { sinceDate: since }))
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
     .filter((r) => WMS_LOCATIONS.has((r.fromCode ?? '').toUpperCase()));
   console.log(`[backfill] ${rows.length} unsynced WMS-origin transfer shipment(s) since ${since} (shuttle shipments get ship via + date, carrier shipments get tracking)`);
   const dToken = await getDeposcoToken(deposcoCfg);
