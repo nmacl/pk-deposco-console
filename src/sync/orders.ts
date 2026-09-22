@@ -111,6 +111,30 @@ export interface DeposcoReceipt {
   receivedItem: { businessKey: { number: string } };
   receivedPackQuantity: number;
   orderLine: { businessKey: { lineNumber: string } };
+  /** When the warehouse actually received it (ISO with the site's offset, e.g.
+   *  "2026-09-22T10:01:02-05:00"). Receipts are created at receive time, so this IS the
+   *  received date — it feeds BC's receipt Posting Date. */
+  createdDate?: string;
+}
+
+/** Local calendar date ("YYYY-MM-DD") of a Deposco timestamp. Deposco returns wall-clock time
+ *  with the facility's offset, so the first 10 chars are the warehouse's own date — never
+ *  convert through UTC (a 7pm receipt would roll into tomorrow). */
+export const deposcoLocalDate = (iso: string | undefined | null): string | null => {
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(iso ?? '');
+  return m ? m[1] : null;
+};
+
+/** Newest local receipt date among the receipts on the given line numbers (BC line no. suffixes). */
+export function latestReceiptDate(receipts: DeposcoReceipt[], lineSeqs: Set<number>): string | null {
+  let best: string | null = null;
+  for (const r of receipts) {
+    const seq = parseInt((r.orderLine?.businessKey?.lineNumber ?? '').split('-').pop() ?? '', 10);
+    if (!lineSeqs.has(seq)) continue;
+    const d = deposcoLocalDate(r.createdDate);
+    if (d && (!best || d > best)) best = d;
+  }
+  return best;
 }
 interface DeposcoReceiptsPage { data?: DeposcoReceipt[]; links?: Array<{ rel?: string; href?: string }>; complete?: boolean }
 

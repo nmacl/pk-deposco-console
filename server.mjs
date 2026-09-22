@@ -20,6 +20,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import pg from 'pg';
+import { sweepAlerts, recentAlerts, channelsConfigured } from './dist/sync/alerts.js';
 
 // Lazy read-only pool for rendering the sync logs (sync_runs / sync_events). Null if
 // DATABASE_URL isn't set — the /logs view then shows "logging not configured".
@@ -217,7 +218,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .run { color:#58a6ff; font-weight:700; margin-top:10px; border-top:1px dashed #21262d; padding-top:8px; }
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
-<header><h1>PK ↔ Deposco Sync Console &nbsp;<a href="/logs" style="font-size:12px;font-weight:500;color:#8957e5;">→ Sync Logs</a></h1>
+<header><h1>PK ↔ Deposco Sync Console &nbsp;<a href="/logs" style="font-size:12px;font-weight:500;color:#8957e5;">→ Sync Logs</a> &nbsp;<a href="/alerts" style="font-size:12px;font-weight:500;color:#d29922;">→ Alerts</a></h1>
 <div class="sub">Type one or more BC order #s — space/comma separated (TRFO / SRTO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
 <div class="bar">
   <input id="order" placeholder="WSOD139248, WSOD139249 TEST0001" autocomplete="off" spellcheck="false"/>
@@ -315,7 +316,7 @@ const LOGS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   input[type=search], select { padding:6px 10px; border-radius:6px; border:1px solid #30363d; background:#0d1117; color:#c9d1d9; font-size:12px; }
   input[type=search] { width:300px; }
 </style></head><body>
-<header><h1>Sync Logs</h1><a href="/">← Console</a>
+<header><h1>Sync Logs</h1><a href="/">← Console</a> <a href="/alerts" style="color:#d29922">Alerts →</a>
   <span class="sub" id="status">loading…</span>
   <label class="sub" style="margin-left:auto;"><input type="checkbox" id="auto" checked/> auto-refresh 10s</label></header>
 <div class="bar">
@@ -372,6 +373,59 @@ document.getElementById('auto').onchange=schedule;
 load(); schedule();
 </script></body></html>`;
 
+// ── Permanent-failure alerts ────────────────────────────────────────────────
+// The sweep (src/sync/alerts.ts) turns dead-lettered / stuck inventory adjustments and chronic
+// order post-backs into sync_alerts rows and delivers each NEW one via webhook/email. Runs
+// in-process (it only needs the DB + HTTP), staggered after the workers so a tick's fresh
+// failures are picked up the same cycle. ALERT_SCHEDULE_MS=0 disables.
+const ALERT_SCHEDULE_MS = parseInt(process.env.ALERT_SCHEDULE_MS ?? '300000', 10);
+let alertsBusy = false;
+async function runScheduledAlerts() {
+  if (alertsBusy) return;
+  alertsBusy = true;
+  try {
+    const r = await sweepAlerts();
+    if (r.delivered > 0 || r.skipped) console.log(`[schedule] alerts sweep: scanned=${r.scanned} alerts=${r.alerts} new=${r.delivered}${r.skipped ? ` (${r.skipped})` : ''}`);
+  } finally { alertsBusy = false; }
+}
+
+const ALERTS_PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Alerts — PK ↔ Deposco</title>
+<style>
+  :root { color-scheme: dark; } * { box-sizing: border-box; }
+  body { margin:0; font:13px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:#0d1117; color:#c9d1d9; }
+  header { padding:14px 20px; border-bottom:1px solid #21262d; display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  h1 { margin:0; font-size:15px; font-weight:600; } a { color:#58a6ff; text-decoration:none; }
+  .sub { color:#8b949e; font-size:12px; }
+  .bar { display:flex; gap:8px; align-items:center; padding:12px 20px; flex-wrap:wrap; }
+  button { padding:6px 12px; border-radius:6px; border:1px solid #30363d; background:#161b22; color:#c9d1d9; cursor:pointer; font-size:12px; font-weight:600; }
+  table { width:calc(100% - 40px); margin:0 20px 20px; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #21262d; vertical-align:top; }
+  th { color:#8b949e; font-weight:600; position:sticky; top:0; background:#0d1117; }
+  .k { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; padding:2px 6px; border-radius:10px; border:1px solid #30363d; white-space:nowrap; }
+  .k.dead { color:#f85149; border-color:#8b2b25; } .k.stuck { color:#d29922; border-color:#9e6a03; } .k.chronic { color:#8957e5; border-color:#8957e5; }
+  .dim { color:#6e7681; } .err { color:#f85149; } .ok { color:#3fb950; }
+  pre { margin:4px 0 0; white-space:pre-wrap; color:#8b949e; font-size:11.5px; }
+</style></head><body>
+<header><h1>Alerts</h1><a href="/">← Console</a> <a href="/logs">Sync Logs</a>
+<span class="sub" id="chan"></span></header>
+<div class="bar"><button id="sweep">Run sweep now</button><span class="sub" id="status"></span></div>
+<table><thead><tr><th>When</th><th>Kind</th><th>Worker</th><th>Entity</th><th>Message</th><th>Delivered</th></tr></thead><tbody id="rows"></tbody></table>
+<script>
+const $=(id)=>document.getElementById(id);
+const cls=(k)=>k==='inv-dead-letter'?'dead':k==='inv-stuck'?'stuck':'chronic';
+function esc(s){ return String(s??'').replace(/[&<>]/g,(c)=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function load(){
+  fetch('/alerts/data').then(r=>r.json()).then(d=>{
+    $('chan').textContent = d.configured ? ('delivery: '+(d.channels.length?d.channels.join(', '):'console only — set ALERT_WEBHOOK_URL or ALERT_EMAIL_TO')) : 'logging not configured (DATABASE_URL)';
+    $('rows').innerHTML = (d.alerts||[]).map(a=>'<tr><td class="dim">'+new Date(a.ts).toLocaleString()+'</td><td><span class="k '+cls(a.kind)+'">'+esc(a.kind)+'</span></td><td>'+esc(a.worker)+'</td><td>'+esc(a.entity_id)+'</td><td>'+esc(a.message)+(a.detail?'<pre>'+esc(JSON.stringify(a.detail))+'</pre>':'')+'</td><td class="'+(a.error?'err':'ok')+'">'+esc(a.delivered_via||'—')+(a.error?'<pre>'+esc(a.error)+'</pre>':'')+'</td></tr>').join('') || '<tr><td colspan="6" class="dim">no alerts</td></tr>';
+  }).catch(e=>{ $('status').textContent='error: '+e.message; });
+}
+$('sweep').onclick=()=>{ $('sweep').disabled=true; $('status').textContent='sweeping…'; fetch('/alerts/sweep',{method:'POST'}).then(r=>r.json()).then(r=>{ $('status').textContent='scanned '+r.scanned+' failure row(s), '+r.alerts+' alert condition(s), '+r.delivered+' new'; load(); }).catch(e=>$('status').textContent='error: '+e.message).finally(()=>{ $('sweep').disabled=false; }); };
+load(); setInterval(load, 15000);
+</script></body></html>`;
+
 const server = createServer((req, res) => {
   if (!authOk(req)) {
     res.writeHead(401, { 'WWW-Authenticate': 'Basic realm="PK Deposco Console"' });
@@ -387,6 +441,21 @@ const server = createServer((req, res) => {
   if (url.pathname === '/logs') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(LOGS_PAGE);
+    return;
+  }
+  if (url.pathname === '/alerts') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(ALERTS_PAGE); return;
+  }
+  if (url.pathname === '/alerts/data') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    if (!db()) { res.end(JSON.stringify({ configured: false, alerts: [], channels: [] })); return; }
+    recentAlerts(100).then((alerts) => res.end(JSON.stringify({ configured: true, alerts, channels: channelsConfigured() })))
+      .catch((e) => res.end(JSON.stringify({ configured: true, error: e.message, alerts: [], channels: channelsConfigured() })));
+    return;
+  }
+  if (url.pathname === '/alerts/sweep' && req.method === 'POST') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    sweepAlerts().then((r) => res.end(JSON.stringify(r))).catch((e) => res.end(JSON.stringify({ error: e.message })));
     return;
   }
   if (url.pathname === '/logs/data') {
@@ -587,4 +656,5 @@ server.listen(PORT, () => {
   startScheduler('PO sync', runScheduledPoSync, PO_SCHEDULE_MS, 95_000);
   startScheduler('TO sync', runScheduledToSync, TO_SCHEDULE_MS, 140_000);
   startScheduler('RO sync (returns)', runScheduledRoSync, RO_SCHEDULE_MS, 185_000);
+  startScheduler('alerts sweep', runScheduledAlerts, ALERT_SCHEDULE_MS, 230_000);
 });

@@ -50,6 +50,21 @@ page 60212 "PK Sales Return Order API"
     // for the posted document number (same convention as bmiSalesOrders/postShipment).
     [ServiceEnabled]
     procedure postReceipt(var ActionContext: WebServiceActionContext)
+    begin
+        PostOn(ActionContext, 0D);
+    end;
+
+    // Same, posted on `postingDate` (the day Deposco received the return) instead of the header's
+    // Posting Date. Separate action so existing callers of postReceipt keep their empty body.
+    //
+    //   POST .../bmiSalesReturnOrders({systemId})/Microsoft.NAV.postReceiptOn  { "postingDate": "2026-09-22" }
+    [ServiceEnabled]
+    procedure postReceiptOn(var ActionContext: WebServiceActionContext; postingDate: Date)
+    begin
+        PostOn(ActionContext, postingDate);
+    end;
+
+    local procedure PostOn(var ActionContext: WebServiceActionContext; PostingDate: Date)
     var
         Mgt: Codeunit "PK Sales Return Rcpt Mgt";
         SalesHeader: Record "Sales Header";
@@ -57,7 +72,7 @@ page 60212 "PK Sales Return Order API"
     begin
         // Re-read under the codeunit so posting runs against a clean, committed record.
         SalesHeader.GetBySystemId(Rec.SystemId);
-        ReceiptNo := Mgt.PostReceiveOnly(SalesHeader);
+        ReceiptNo := Mgt.PostReceiveOnlyOn(SalesHeader, PostingDate);
         ActionContext.SetObjectType(ObjectType::Page);
         ActionContext.SetObjectId(Page::"PK Sales Return Order API");
         ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);

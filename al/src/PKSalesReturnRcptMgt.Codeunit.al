@@ -25,6 +25,15 @@ codeunit 60224 "PK Sales Return Rcpt Mgt"
     /// sees BC's own message.
     /// </summary>
     procedure PostReceiveOnly(var SalesHeader: Record "Sales Header"): Code[20]
+    begin
+        exit(PostReceiveOnlyOn(SalesHeader, 0D));
+    end;
+
+    /// <summary>
+    /// Same as PostReceiveOnly, but posts on PostingDate (the day Deposco actually received the
+    /// return) instead of the order header's Posting Date. 0D = header date, unchanged.
+    /// </summary>
+    procedure PostReceiveOnlyOn(var SalesHeader: Record "Sales Header"; PostingDate: Date): Code[20]
     var
         SalesPost: Codeunit "Sales-Post";
         ReturnRcptHeader: Record "Return Receipt Header";
@@ -34,6 +43,12 @@ codeunit 60224 "PK Sales Return Rcpt Mgt"
 
         if not HasQtyToReceive(SalesHeader) then
             Error('Return order %1 has no line with a Return Qty. to Receive — nothing to post.', SalesHeader."No.");
+
+        if PostingDate <> 0D then begin
+            SalesHeader.SetHideValidationDialog(true);
+            SalesHeader.Validate("Posting Date", PostingDate);
+            SalesHeader.Modify(true);
+        end;
 
         SalesHeader.Receive := true;
         SalesHeader.Invoice := false;   // <- the whole point of this codeunit

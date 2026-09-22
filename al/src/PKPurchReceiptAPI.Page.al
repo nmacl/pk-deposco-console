@@ -5,7 +5,9 @@
 //
 //   POST .../api/bmi/pk/v1.0/companies({companyId})/bmiPurchaseReceipts
 //   { "orderNo": "PO12345", "deposcoReceiptRef": "RCPT-PO12345-1755791234567",
-//     "lines": "10000:5,30000:2" }
+//     "lines": "10000:5,30000:2", "postingDate": "2026-09-22" }
+//   postingDate is optional: when supplied the receipt (and its item ledger entries) post on that
+//   date instead of the order header's Posting Date.
 page 60215 "PK Purch Receipt API"
 {
     PageType = API;
@@ -34,6 +36,7 @@ page 60215 "PK Purch Receipt API"
                 field(orderNo; Rec."Order No.") { }
                 field(deposcoReceiptRef; Rec."Deposco Receipt Ref") { }
                 field(lines; Rec.Lines) { }
+                field(postingDate; Rec."Posting Date") { }
                 field(postedReceiptNo; Rec."Posted Receipt No.") { Editable = false; }
                 field(linesReceived; Rec."Lines Received") { Editable = false; }
                 field(alreadyPosted; Rec."Already Posted") { Editable = false; }

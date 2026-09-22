@@ -22,6 +22,11 @@ table 60215 "PK Purch Receipt"
         // "lineNo:qty" pairs, comma-separated (e.g. "10000:5,30000:2"). Lines not named
         // receive 0 this posting.
         field(12; Lines; Text[2048]) { Caption = 'Lines'; }
+        // Posting date for the receipt = the day Deposco actually received the goods (the
+        // worker sends the Deposco receipt's createdDate). 0D = leave the order header's own
+        // Posting Date alone (the pre-2.18 behaviour, which stamped the ORDER date on receipts
+        // posted weeks later — the "received Aug 1st" item-ledger complaint).
+        field(13; "Posting Date"; Date) { Caption = 'Posting Date'; }
         field(20; "Posted Receipt No."; Code[20]) { Caption = 'Posted Receipt No.'; Editable = false; }
         field(21; "Lines Received"; Integer) { Caption = 'Lines Received'; Editable = false; }
         field(22; "Already Posted"; Boolean) { Caption = 'Already Posted'; Editable = false; }

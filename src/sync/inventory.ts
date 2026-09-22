@@ -116,7 +116,7 @@ export async function postBcAdjustment(
   cfg: SyncBcConfig,
   companyId: string,
   token: string,
-  row: { itemNo: string; variantCode: string; locationCode: string; quantity: number; reasonCode?: string; externalAdjustmentId?: string },
+  row: { itemNo: string; variantCode: string; locationCode: string; quantity: number; reasonCode?: string; externalAdjustmentId?: string; postingDate?: string | null },
 ): Promise<BcAdjustmentResult> {
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiInventoryAdjustments`;
   return authReq<BcAdjustmentResult>('post', url, token, {
@@ -127,6 +127,8 @@ export async function postBcAdjustment(
       quantity: row.quantity, // signed; the codeunit picks Positive/Negative Adjmt.
       ...(row.reasonCode ? { reasonCode: row.reasonCode } : {}),
       ...(row.externalAdjustmentId ? { externalAdjustmentId: row.externalAdjustmentId } : {}),
+      // Optional: post on Deposco's adjustment date instead of WorkDate (INV_POSTING_DATE=deposco).
+      ...(row.postingDate ? { postingDate: row.postingDate } : {}),
     },
   });
 }

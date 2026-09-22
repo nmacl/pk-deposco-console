@@ -17,6 +17,8 @@
  *   node dist/to/sync-to.js --once                   one tick (Released transfers only)
  *   node dist/to/sync-to.js --order TRFO001397       sync one TO (push + post) — the
  *                                                    single-order handler the web-UI button calls
+ *   node dist/to/sync-to.js --backfill-tracking 30   stamp Deposco tracking onto untracked posted
+ *                                                    WMS transfer shipments from the last 30 days
  * Gates: TO_PUSH_ENABLED (push to Deposco), TO_POST_ENABLED (post shipment/receipt in BC).
  * A --order run forces both on for that one order.
  *
@@ -29,7 +31,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcOdataBase, bmiApiBase, odataStr, bcGet, pick, numOf, getCompanyId, authReq, type BcRow } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment, ensureItemsExist } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchShippedFromFulfillment, ensureItemsExist, fetchTrackingForSalesOrder, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, chronicFailures, lastAttempts, chronicDue } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.TO_SYNC_INTERVAL_MS ?? '60000', 10);
@@ -48,6 +50,10 @@ const POST_TIMEOUT_MS = parseInt(process.env.TO_POST_TIMEOUT_MS ?? '180000', 10)
 const CHRONIC_RETRY_MS = parseInt(process.env.TO_CHRONIC_RETRY_MS ?? '3600000', 10);
 const PUSH_ENABLED = (process.env.TO_PUSH_ENABLED ?? 'false').toLowerCase() === 'true';
 const POST_ENABLED = (process.env.TO_POST_ENABLED ?? 'false').toLowerCase() === 'true';
+// Deposco tracking → posted TRANSFER shipment (Tech x Ops 2026-09-22: reps want transfer tracking
+// without digging through Posted Transfer Shipments by hand). Needs AL >= 2.18 (bmiTransferShipments
+// + bmiTransferShipmentTrackings). Twin of the CO worker's writeTrackingBack.
+const TRACKING_ENABLED = (process.env.TO_TRACKING_ENABLED ?? 'true').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
 const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
@@ -410,6 +416,122 @@ async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action:
   return { action, staged, doc };
 }
 
+// ── Tracking write-back: Deposco outbound shipment → BC posted transfer shipment ─────────────
+//
+// Transfer Shipment Header has NO standard tracking field (unlike Sales Shipment Header's
+// "Package Tracking No."), so everything lands in our own PK Deposco fields (tableextension 60237)
+// via the bmiTransferShipmentTrackings buffer page — a page over the posted table would Modify
+// under the caller's rights and 403 on the S2S license. Never fatal: tracking is an annotation on
+// a shipment that already posted.
+interface BmiTransferShipment { systemId: string; no: string; transferOrderNo: string; fromCode: string; toCode: string; postingDate: string; deposcoTrackingNo: string }
+
+async function listUntrackedTransferShipments(cfg: SyncBcConfig, companyId: string, token: string, opts: { transferNo?: string; sinceDate?: string }): Promise<BmiTransferShipment[]> {
+  const clauses = ["deposcoTrackingNo eq ''"];
+  if (opts.transferNo) clauses.push(`transferOrderNo eq '${odataStr(opts.transferNo)}'`);
+  if (opts.sinceDate) clauses.push(`postingDate ge ${opts.sinceDate}`);
+  const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferShipments?$filter=${encodeURIComponent(clauses.join(' and '))}&$orderby=postingDate desc&$top=500`;
+  return (await authReq<{ value?: BmiTransferShipment[] }>('get', url, token)).value ?? [];
+}
+
+async function writeTransferTrackingBack(
+  cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, no: string,
+  /** The posted transfer shipment this run created (postShipment's return value), or null to
+   *  backfill the single untracked shipment of this transfer order. */
+  postedShipmentNo: string | null, customerOrderId: number, runId: number | null = null,
+): Promise<'ok' | 'skip' | 'fail'> {
+  const logTrack = (status: 'ok' | 'skip' | 'fail', message: string, detail?: unknown, side: 'bc' | 'deposco' = 'bc') =>
+    logEvent({ runId, worker: 'to', direction: 'deposco->bc', entityType: 'shipment', entityId: no, action: 'tracking', status, side, message, detail,
+               dedupeKey: dailyDedupe('to-track', `${no}:${postedShipmentNo ?? 'backfill'}`, message) });
+  if (!TRACKING_ENABLED) return 'skip';
+  try {
+    const bcToken = await getBcToken(cfg);
+    // Target first (cheap BC read) so a fully-tracked transfer costs no Deposco calls at all.
+    let target = postedShipmentNo;
+    if (!target) {
+      const rows = await listUntrackedTransferShipments(cfg, companyId, bcToken, { transferNo: no });
+      if (rows.length === 0) return 'skip';
+      if (rows.length > 1) {
+        const m = `${rows.length} posted transfer shipments lack tracking — ambiguous, skipping (${rows.map((r) => r.no).join(', ')})`;
+        console.warn(`[track] ${no}: ⚠ ${m}`);
+        await logTrack('skip', m, { candidates: rows.map((r) => r.no) });
+        return 'skip';
+      }
+      target = rows[0].no;
+    }
+
+    const dToken = await getDeposcoToken(deposcoCfg);
+    const co = await authReq<{ customerOrder?: { fulfillmentOrders?: Array<{ id: number }> } }>('get', `${deposcoCfg.apiBase}/orders/customerOrders/${customerOrderId}`, dToken);
+    const all: DeposcoTracking[] = [];
+    for (const fo of co.customerOrder?.fulfillmentOrders ?? []) all.push(...await fetchTrackingForSalesOrder(deposcoCfg, dToken, fo.id));
+    if (all.length === 0) {
+      console.log(`[track] ${no}: no tracking numbers in Deposco yet (${target} stays untracked)`);
+      await logTrack('skip', 'no tracking number on any Deposco outbound shipment yet', { target }, 'deposco');
+      return 'skip';
+    }
+    const real = all.filter((t) => t.shippedUnits > 0);
+    const used = real.length > 0 ? real : all;   // zero-qty labels: never primary, but keep if that's all there is
+    const joinCapped = (vals: string[], max: number): string => {
+      const kept: string[] = [];
+      for (const v of vals) { if ([...kept, v].join(',').length > max) break; kept.push(v); }
+      return kept.join(',');
+    };
+    const primary = used[0];
+    const payload = {
+      shipmentNo: target,
+      deposcoShipmentNo: joinCapped(used.map((t) => t.shipmentNo), 20),
+      deposcoSalesOrderNo: primary.salesOrderNo,
+      trackingNo: joinCapped(used.map((t) => t.trackingNumber), 250),
+      trackingUrl: primary.trackingUrl,
+      carrier: primary.carrier,
+      shipVia: primary.shipVia,
+      shipMethod: primary.shipMethod,
+      containerLpn: primary.containerLpn,
+      totalPackages: used.reduce((s, t) => s + t.totalPackages, 0),
+      totalWeight: used.reduce((s, t) => s + t.totalWeight, 0),
+      ...(primary.actualShipDate ? { actualShipDate: primary.actualShipDate } : {}),
+    };
+    const res = await authReq<{ applied?: boolean; appliedTo?: string; errorMessage?: string }>(
+      'post', `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferShipmentTrackings`, bcToken,
+      { data: payload, headers: { 'Content-Type': 'application/json' } });
+    if (res.applied) {
+      console.log(`[track] ${no}: ✓ ${res.appliedTo} ← ${payload.carrier} ${payload.trackingNo}`);
+      await logTrack('ok', `${res.appliedTo}: ${payload.carrier} ${payload.trackingNo}`, { shipment: res.appliedTo, carrier: payload.carrier, trackingNo: payload.trackingNo, trackingUrl: payload.trackingUrl, parcels: used.length });
+      return 'ok';
+    }
+    const m = `not applied: ${res.errorMessage ?? 'unknown'}`;
+    console.warn(`[track] ${no}: ⚠ ${m}`);
+    await logTrack('fail', m, { payload });
+    return 'fail';
+  } catch (err) {
+    const e = err as AxiosError;
+    const body = JSON.stringify(e.response?.data ?? (err as Error).message);
+    const side = /deposco\.com/i.test(String(e.config?.url ?? '')) ? 'deposco' : 'bc';
+    console.error(`[track] ${no}: FAILED (shipment itself DID post) HTTP ${e.response?.status ?? '?'}: ${body.slice(0, 300)}`);
+    await logTrack('fail', `HTTP ${e.response?.status ?? e.code ?? '?'}: ${body.slice(0, 180)}`, { url: e.config?.url, postedShipmentNo, body: body.slice(0, 4000) }, side);
+    return 'fail';
+  }
+}
+
+/** --backfill-tracking [days]: stamp tracking onto every WMS-origin posted transfer shipment from
+ *  the last N days (default 30) that has none yet. Safe to re-run; skips anything already tracked. */
+async function backfillTransferTracking(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, days: number): Promise<void> {
+  const token = await getBcToken(cfg);
+  const companyId = await getCompanyId(cfg, token);
+  const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+  const rows = (await listUntrackedTransferShipments(cfg, companyId, token, { sinceDate: since }))
+    .filter((r) => WMS_LOCATIONS.has((r.fromCode ?? '').toUpperCase()));
+  console.log(`[backfill] ${rows.length} untracked WMS-origin transfer shipment(s) since ${since}`);
+  const dToken = await getDeposcoToken(deposcoCfg);
+  let ok = 0, skip = 0, fail = 0;
+  for (const r of rows) {
+    const coId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/customerOrders', { externalOrderNumber: r.transferOrderNo });
+    if (coId === null) { console.log(`[backfill] ${r.no} (${r.transferOrderNo}): no Deposco customerOrder — skip`); skip++; continue; }
+    const res = await writeTransferTrackingBack(cfg, deposcoCfg, companyId, r.transferOrderNo, r.no, coId);
+    if (res === 'ok') ok++; else if (res === 'skip') skip++; else fail++;
+  }
+  console.log(`[backfill] done — tracked=${ok} skipped=${skip} failed=${fail}`);
+}
+
 async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan, direct: boolean): Promise<PostedLeg[]> {
   const no = pick(header, 'No');
   const dToken = await getDeposcoToken(deposcoCfg);
@@ -441,6 +563,9 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
     console.log(`[pull] ${no}: SHIP — Deposco shipped ${[...shipped].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}${direct ? ' (direct → ship+receive)' : ''}`);
     const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', shipped, direct);
     if (shipLeg) legs.push(shipLeg);
+    // Stamp Deposco tracking onto the shipment just posted (or, if nothing posted this tick, onto
+    // this order's single still-untracked shipment — covers a label that arrived after the post).
+    await writeTransferTrackingBack(cfg, deposcoCfg, companyId, no, shipLeg?.doc || null, coId);
     if (direct) {
       const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', shipped, direct);
       if (recvLeg) legs.push(recvLeg);
@@ -588,6 +713,14 @@ async function main(): Promise<void> {
     // pull() no longer throws out of syncOne, so exit non-zero here or the console button would
     // report a failed post-back as a green "ok".
     if (postError) { console.error(`[to] ${orderArg}: post-back failed — HTTP ${postError.status ?? '?'}`); process.exit(1); }
+    return;
+  }
+
+  const bfIdx = process.argv.indexOf('--backfill-tracking');
+  if (bfIdx >= 0) {
+    const days = parseInt(process.argv[bfIdx + 1] ?? '', 10);
+    await backfillTransferTracking(cfg, deposcoCfg, Number.isFinite(days) ? days : 30);
+    await closeDb();
     return;
   }
 

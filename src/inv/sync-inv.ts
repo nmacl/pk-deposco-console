@@ -106,6 +106,7 @@ async function saveState(s: State): Promise<void> {
 // Adjustments that can't post (unmappable item, or a net that BC still rejects) are appended
 // here rather than blocking the batch — surfaced for manual resolution / re-drive.
 const DEADLETTER_FILE = process.env.INV_DEADLETTER_FILE || '.inv-failed.jsonl';
+const INV_POSTING_DATE = (process.env.INV_POSTING_DATE ?? 'workdate').toLowerCase();
 async function deadLetter(entry: Record<string, unknown>): Promise<void> {
   if (DRY_RUN) return;
   const at = new Date().toISOString();
@@ -158,6 +159,8 @@ async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: str
 
       const res = await postBcAdjustment(cfg, companyId, bToken, {
         itemNo: ref.itemNo, variantCode: ref.variantCode, locationCode: location, quantity: a.quantity, externalAdjustmentId: String(id),
+        // INV_POSTING_DATE=deposco → post on Deposco's adjustment date (default: BC WorkDate, unchanged).
+        postingDate: INV_POSTING_DATE === 'deposco' ? (/^(\d{4}-\d{2}-\d{2})/.exec(a.createdDate ?? '')?.[1] ?? null) : null,
       });
       const evDetail = { item: `${ref.itemNo}/${ref.variantCode}`, location, requested: a.quantity, posted: res.postedQuantity ?? a.quantity, ile: res.itemLedgerEntryNo };
       if (res.errorMessage) {

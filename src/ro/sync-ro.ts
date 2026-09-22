@@ -32,7 +32,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchDeposcoReceipts, latestReceiptDate } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.RO_SYNC_INTERVAL_MS ?? '60000', 10);
@@ -41,6 +41,9 @@ const PER_TICK = parseInt(process.env.RO_PER_TICK ?? '250', 10);
 // Receipt posting writes item ledger + (customization) SKU auto-create — same heavyweight class
 // as transfer posting, which blew the 30s default live. Give it the same room.
 const POST_TIMEOUT_MS = parseInt(process.env.RO_POST_TIMEOUT_MS ?? '180000', 10);
+// Return-receipt posting date: 'received' = the day Deposco received the goods; 'header' (default
+// until accounting confirms — purchase orders went first) = the pre-2.18 behaviour.
+const RECEIPT_POSTING_DATE = (process.env.RO_RECEIPT_POSTING_DATE ?? 'header').toLowerCase();
 const PUSH_ENABLED = (process.env.RO_PUSH_ENABLED ?? 'false').toLowerCase() === 'true';
 const POST_ENABLED = (process.env.RO_POST_ENABLED ?? 'false').toLowerCase() === 'true';
 const BU = process.env.DEPOSCO_COMPANY || 'HIVE';
@@ -172,9 +175,31 @@ async function pullReturn(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, bmi: str
     staged += toPost;
   }
   if (staged === 0) { console.log(`[pull] ${h.no}: nothing to post (in sync)`); return null; }
-  console.log(`[pull] ${h.no}: postReceipt — staged ${staged} unit(s)`);
-  await authReq('post', `${bmi}/bmiSalesReturnOrders(${h.systemId})/Microsoft.NAV.postReceipt`, token,
-    { data: {}, timeout: POST_TIMEOUT_MS });
+  // Posting date = the day Deposco received (RO_RECEIPT_POSTING_DATE=received). Same fallback
+  // shape as the PO worker: a closed-period rejection re-posts on the header date, visibly.
+  let postingDate: string | null = null;
+  if (RECEIPT_POSTING_DATE === 'received') {
+    try {
+      const receipts = await fetchDeposcoReceipts(deposcoCfg, dToken, poId);
+      postingDate = latestReceiptDate(receipts, new Set(lines.filter((l) => (byLine.get(l.lineNo) ?? 0) > (l.returnQtyReceived ?? 0)).map((l) => l.lineNo)));
+    } catch (e) { console.warn(`[pull] ${h.no}: could not read Deposco receipt dates (${(e as Error).message}) — posting on the header date`); }
+  }
+  console.log(`[pull] ${h.no}: postReceipt — staged ${staged} unit(s)${postingDate ? ` on ${postingDate} (Deposco received date)` : ''}`);
+  const action = postingDate ? 'postReceiptOn' : 'postReceipt';
+  try {
+    await authReq('post', `${bmi}/bmiSalesReturnOrders(${h.systemId})/Microsoft.NAV.${action}`, token,
+      { data: postingDate ? { postingDate } : {}, timeout: POST_TIMEOUT_MS });
+  } catch (err) {
+    const body = JSON.stringify((err as AxiosError).response?.data ?? (err as Error).message);
+    const closedPeriod = /allowed posting dates|not within your range/i.test(body);
+    const noAction = /postReceiptOn/i.test(body) && /not found|does not exist|Unknown|could not find/i.test(body);
+    if (!postingDate || !(closedPeriod || noAction)) throw err;
+    const why = closedPeriod ? `posting date ${postingDate} is outside BC's allowed posting range` : 'BC extension has no postReceiptOn yet (AL < 2.18)';
+    console.warn(`[pull] ${h.no}: ⚠ ${why} — re-posting with the order header's Posting Date`);
+    await logEvent({ worker: 'ro', direction: 'deposco->bc', entityType: 'order', entityId: h.no, action: 'post', status: 'desync', side: 'bc',
+      message: `return receipt posted WITHOUT the received date (${postingDate}): ${why}`, detail: body.slice(0, 2000), dedupeKey: dailyDedupe('ro-postdate', h.no, why) });
+    await authReq('post', `${bmi}/bmiSalesReturnOrders(${h.systemId})/Microsoft.NAV.postReceipt`, token, { data: {}, timeout: POST_TIMEOUT_MS });
+  }
   const after = await getReturnOrder(bmi, token, h.no);
   const receiptNo = after?.lastReturnReceiptNo ?? '';
   console.log(`[pull] ${h.no}: ✅ postReceipt → BC return receipt ${receiptNo || '(unknown)'}`);

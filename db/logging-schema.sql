@@ -59,3 +59,23 @@ revoke all on table sync_runs, sync_events, sync_cursors from anon, authenticate
 -- these columns are missing — apply this before deploying that code or every repeat is a new attempt.
 alter table sync_events add column if not exists hits    integer not null default 1;
 alter table sync_events add column if not exists last_ts timestamptz;
+
+-- 2026-09-22: permanent-failure alerts (src/sync/alerts.ts). One row per alert; dedupe_key makes a
+-- dead letter alert exactly once, a stuck transient once per ALERT_STUCK_HITS ticks, a chronic order
+-- once a day. delivered_via records which channels took it (console/webhook/email). The module
+-- creates this table itself on first sweep, so this is documentation + a manual fallback.
+create table if not exists sync_alerts (
+  id            bigint generated always as identity primary key,
+  ts            timestamptz not null default now(),
+  kind          text not null,                     -- inv-dead-letter | inv-stuck | chronic-order
+  worker        text not null,
+  entity_id     text,
+  message       text not null,
+  detail        jsonb,
+  dedupe_key    text unique,
+  delivered_via text,
+  delivered_at  timestamptz,
+  error         text
+);
+alter table sync_alerts enable row level security;
+revoke all on table sync_alerts from anon, authenticated;

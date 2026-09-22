@@ -26,7 +26,15 @@ plus the inventory-adjustment write path (item-journal post).
 | `PKShipTrackingMgt.Codeunit` (60222) | Codeunit | Applies a buffer row onto the posted shipment. Holds `Permissions = tabledata "Sales Shipment Header" = RM` — a page modifying it directly runs under the CALLER's rights and 403s on the S2S license. Also mirrors the carrier into UPG's `PackageCarrier` (50130) and handles `clearTracking`. |
 | `PKPostedSalesShipmentAPI.Page` (60207) | API page | `bmiShipmentTrackings` — POST tracking, applied-on-insert. Match by `shipmentNo` or `externalDocumentNo` (the `SHIP-{soNo}-{epoch}` ref sync-co.ts stamps before posting). |
 | `PKIPaymentFix.Table` (60214) / `PKIPaymentFixAPI.Page` (60214) / `PKIPaymentFixMgt.Codeunit` (60226) | Table / API page / Codeunit | **One-off ops tool** (`bmiIPaymentFixes`, execute-on-insert): LIST/DELETE rows of iSolutions' iPayments Customer Setup table 70437044 via RecordRef (no dependency) + guarded customer RENAME. Added for the "customer S → CTDI003931" fix (Aug 2026); remove once obsolete. |
+| `PKTransferShipmentExt.TableExt` (60237) / `PKPostedTransferShipmentPageExt.PageExt` (60237) / `PKPostedTransferShipmentsListPageExt.PageExt` (60238) | Table ext / Page exts | **2.18** Deposco tracking fields (60400–60411) on Transfer Shipment Header + the same "Deposco" group Posted Sales Shipment has, plus Tracking No./Carrier columns on the list. |
+| `PKTransferShipTracking.Table` (60217) / `PKTransferShipTrackingMgt.Codeunit` (60230) / `PKTransferShipTrackingAPI.Page` (60217) | Table / Codeunit / API page | **2.18** `bmiTransferShipmentTrackings` — twin of the sales tracking write path for posted TRANSFER shipments (elevated Modify on Transfer Shipment Header). Match by `shipmentNo` or `transferOrderNo`. |
+| `PKTransferShipmentRead.Page` (60218) | API page | **2.18** `bmiTransferShipments` — read posted transfer shipments incl. the Deposco fields (the TO worker's "untracked?" check + backfill source). |
+| `PKSalespersonAPI.Page` (60219) | API page | **2.18** `bmiSalespersons` — Salesperson/Purchaser code → name (CO push → Deposco customAttribute5). |
 | `PKDeposcoReadAPI.PermissionSet` | PermissionSet | Grants all pages/codeunits/tabledata. |
+
+**2.18 also changed:** `bmiPurchaseReceipts` accepts an optional `postingDate` (receipt posts on the
+Deposco received date; `PK Purch Receive Mgt` validates it onto the header with dialogs hidden), and
+`bmiSalesReturnOrders` gained `Microsoft.NAV.postReceiptOn { postingDate }` next to `postReceipt`.
 
 ## Build (headless, macOS)
 
@@ -37,8 +45,10 @@ Symbols live in `.alpackages/` (gitignored — pull them from BC once, then reus
 #    (VS Code "AL: Download Symbols", or the /dev/packages endpoint)
 
 # 2. compile with the bundled AL compiler (path tracks the installed AL extension version)
-ALC=~/.vscode/extensions/ms-dynamics-smb.al-*/bin/darwin/alc
-$ALC /project:"$(pwd)" /packagecachepath:"$(pwd)/.alpackages" /out:PK_Deposco_ReadAPI.app
+# AL extension v18+ ships alc as a .NET 10 assembly (no native darwin/alc any more) — run it with a
+# .NET 10 runtime (~/.dotnet via `curl -sSL https://dot.net/v1/dotnet-install.sh | bash -s -- --runtime dotnet --channel 10.0 --install-dir ~/.dotnet`)
+ALC_DLL=$(ls -d ~/.vscode/extensions/ms-dynamics-smb.al-*/bin/alc.dll | tail -1)
+~/.dotnet/dotnet "$ALC_DLL" /project:"$(pwd)" /packagecachepath:"$(pwd)/.alpackages" /out:"$(pwd)/PK_Deposco_ReadAPI.app"
 ```
 
 Produces `PK_Deposco_ReadAPI.app` (committed here as the last-known-good artifact).

@@ -37,6 +37,16 @@ codeunit 60227 "PK Purch Receive Mgt"
 
         PurchHeader.Get(PurchHeader."Document Type"::Order, Req."Order No.");
         PurchHeader."PK Deposco Receipt Ref" := Req."Deposco Receipt Ref";
+        // Post on the day Deposco received, not the day the order was raised. Validate (not
+        // assign) so BC cascades to VAT Reporting Date / Document Date (when linked) / currency
+        // factor exactly as the UI would; HideValidationDialog keeps the currency-factor and
+        // deferral confirms from erroring in this headless session. A date outside the allowed
+        // posting range fails in Purch.-Post with BC's own message — the worker catches that
+        // and re-posts without a date.
+        if Req."Posting Date" <> 0D then begin
+            PurchHeader.SetHideValidationDialog(true);
+            PurchHeader.Validate("Posting Date", Req."Posting Date");
+        end;
         PurchHeader.Modify();
 
         PurchLine.SetRange("Document Type", PurchLine."Document Type"::Order);

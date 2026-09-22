@@ -21,7 +21,8 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, type PostResult } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, latestReceiptDate, type PostResult } from '../sync/orders.js';
+import { ensureTradingPartner, partnerRef } from '../sync/partners.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 // local alias kept so existing signatures below read unchanged
@@ -38,6 +39,14 @@ const MAX_PO_LINES = parseInt(process.env.MAX_PO_LINES ?? '100', 10);
 // integration's "BusinessCentral". Override via env once we confirm Deposco
 // accepts a custom value (it may be a validated set).
 const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline';
+// Vendor name → Deposco "Consignee Partner" on the PO (Tech x Ops 2026-09-22, Nicholas). The field
+// is a trading-partner reference, so the partner is find-or-created by vendor name first.
+const CONSIGNEE_PARTNER_ENABLED = (process.env.PO_CONSIGNEE_PARTNER_ENABLED ?? 'true').toLowerCase() === 'true';
+// Receipt posting date: 'received' = the day Deposco received the goods (the Deposco receipt's
+// createdDate, newest across the lines being posted) — what accounting asked for; 'header' = the
+// pre-2.18 behaviour (BC uses the order header's Posting Date, i.e. the order date, which made a
+// September receipt show up in the item ledger as August 1st).
+const RECEIPT_POSTING_DATE = (process.env.PO_RECEIPT_POSTING_DATE ?? 'received').toLowerCase();
 // Only push PO lines stocked at a WMS-tracked warehouse (default WMS only). Non-WMS
 // lines (PK / dropship / decoration / on-demand) are skipped — Deposco doesn't fulfill
 // them. Mirrors co/sync-co.ts SO_WMS_LOCATIONS. Fail-closed: a line whose location can't
@@ -170,6 +179,8 @@ interface DeposcoPurchaseOrderPayload {
   shipToFacility: { businessKey: { number: string } };
   orderStatus?: string;
   orderSource?: string;
+  // Trading-partner EntityRef (NOT free text) — see src/sync/partners.ts.
+  consigneePartner?: { businessKey: { code: string; 'businessUnit.code': string } };
   orderLines: { data: DeposcoLine[] };
 }
 
@@ -180,6 +191,7 @@ function buildDeposcoPayload(
   po: BcPurchaseOrder,
   lines: BmiPoLine[],
   includeStatus: boolean,
+  consigneePartnerCode: string | null = null,
 ): DeposcoPurchaseOrderPayload {
   const earliestExpected = lines
     .map((l) => l.expectedReceiptDate)
@@ -195,6 +207,7 @@ function buildDeposcoPayload(
     shipToFacility: { businessKey: { number: 'HIVE' } },
     ...(includeStatus ? { orderStatus: 'New' } : {}),
     orderSource: ORDER_SOURCE,
+    ...(consigneePartnerCode ? { consigneePartner: partnerRef(consigneePartnerCode, 'HIVE') } : {}),
     orderLines: {
       data: lines.map((l) => ({
         lineNumber: `${po.number}-${l.lineNo}`,
@@ -271,8 +284,21 @@ async function pushPo(
   }
   const multi = chunks.length > 1;
 
+  // Vendor → consignee partner. Best-effort: a partner-creation failure must never block the PO
+  // from reaching the warehouse, so on error the PO pushes without it (and says so).
+  let consignee: string | null = null;
+  if (CONSIGNEE_PARTNER_ENABLED && po.vendorName?.trim()) {
+    try {
+      consignee = await ensureTradingPartner(deposcoCfg, deposcoToken, po.vendorName);
+      if (consignee) console.log(`[push] ${po.number}: consigneePartner = "${consignee}"`);
+    } catch (err) {
+      const e = err as AxiosError;
+      console.warn(`[push] ${po.number}: ⚠ could not ensure trading partner for vendor "${po.vendorName}" (HTTP ${e.response?.status ?? '?'}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 200)}) — pushing without consigneePartner`);
+    }
+  }
+
   for (let ci = 0; ci < chunks.length; ci++) {
-    const payload = buildDeposcoPayload(po, chunks[ci], isCreate && ci === 0);
+    const payload = buildDeposcoPayload(po, chunks[ci], isCreate && ci === 0, consignee);
     const verb = isCreate && ci === 0 ? 'created' : 'updated';
     const label = multi
       ? `chunk ${ci + 1}/${chunks.length} (${chunks[ci].length} lines, ${verb})`
@@ -311,17 +337,37 @@ async function postReceiveOnly(
   companyId: string,
   po: BcPurchaseOrder,
   lines: ReceiveLine[],
+  postingDate: string | null = null,
 ): Promise<void> {
   const receiptRef = `RCPT-${po.number}-${Date.now()}`;
   const linesSpec = lines.map((l) => `${l.lineNo}:${l.quantity}`).join(',');
-  console.log(`[pull] ${po.number}: POST bmiPurchaseReceipts ref=${receiptRef} lines=${linesSpec}`);
+  console.log(`[pull] ${po.number}: POST bmiPurchaseReceipts ref=${receiptRef} lines=${linesSpec}${postingDate ? ` postingDate=${postingDate}` : ''}`);
 
   const token = await getBcToken(bcCfg);
-  const row = await authReq<BmiPurchaseReceiptRow>('post',
+  const post = (date: string | null) => authReq<BmiPurchaseReceiptRow>('post',
     `${bmiApiBase(bcCfg)}/companies(${companyId})/bmiPurchaseReceipts`, token, {
-      data: { orderNo: po.number, deposcoReceiptRef: receiptRef, lines: linesSpec },
+      data: { orderNo: po.number, deposcoReceiptRef: receiptRef, lines: linesSpec, ...(date ? { postingDate: date } : {}) },
       timeout: 120_000,
     });
+  let row: BmiPurchaseReceiptRow;
+  try {
+    row = await post(postingDate);
+  } catch (err) {
+    const e = err as AxiosError & { httpStatus?: number };
+    const body = JSON.stringify(e.response?.data ?? e.message);
+    // Two reasons a dated post can fail that a dateless one won't: the received date falls in a
+    // period accounting has closed ("Posting Date is not within your range of allowed posting
+    // dates"), or the AL on this environment predates 2.18 and doesn't know the field. Neither
+    // should hold up the receipt — fall back to the header date and make the fallback visible.
+    const closedPeriod = /allowed posting dates|not within your range/i.test(body);
+    const unknownField = /postingDate/i.test(body) && /does not exist|not found|Unknown|Could not find a property/i.test(body);
+    if (!postingDate || !(closedPeriod || unknownField)) throw err;
+    const why = closedPeriod ? `posting date ${postingDate} is outside BC's allowed posting range` : 'BC extension does not accept postingDate yet (AL < 2.18)';
+    console.warn(`[pull] ${po.number}: ⚠ ${why} — re-posting with the order header's Posting Date`);
+    await logEvent({ worker: 'po', direction: 'deposco->bc', entityType: 'order', entityId: po.number, action: 'post', status: 'desync', side: 'bc',
+      message: `receipt posted WITHOUT the received date (${postingDate}): ${why}`, detail: body.slice(0, 2000), dedupeKey: dailyDedupe('po-postdate', po.number, why) });
+    row = await post(null);
+  }
 
   if (row.alreadyPosted) {
     console.log(`[pull] ${po.number}: ref ${receiptRef} was already posted as ${row.postedReceiptNo} — no-op`);
@@ -427,8 +473,14 @@ async function pullReceiptsForPo(
     return;
   }
   const total = toReceive.reduce((s, l) => s + l.quantity, 0);
-  console.log(`[pull] ${po.number}: posting ${total} units across ${toReceive.length} line(s)`);
-  await postReceiveOnly(bcCfg, companyId, po, toReceive);
+  // Posting date = the newest Deposco receipt date among the lines being posted (one BC receipt
+  // covers this whole delta, so it can only carry one date; newest is the honest choice when a
+  // delta spans two warehouse days).
+  const postingDate = RECEIPT_POSTING_DATE === 'received'
+    ? latestReceiptDate(receipts, new Set(toReceive.map((l) => l.lineNo)))
+    : null;
+  console.log(`[pull] ${po.number}: posting ${total} units across ${toReceive.length} line(s)${postingDate ? ` on ${postingDate} (Deposco received date)` : ''}`);
+  await postReceiveOnly(bcCfg, companyId, po, toReceive, postingDate);
 }
 
 // ────────────────────────────────────────────────────────────────────────────

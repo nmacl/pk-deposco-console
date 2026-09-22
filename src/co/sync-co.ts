@@ -41,6 +41,7 @@ import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/conf
 import { bcApiBase, bcOdataBase, bmiApiBase, odataStr, bcGet, bcGetAll, pick, numOf, getCompanyId, authReq, mapWithConcurrency, type BcRow } from '../sync/bc-client.js';
 import { postDeposcoOrder, lookupDeposcoOrderId, fetchShippedFromFulfillment, fetchTrackingForSalesOrder, auditPushedCustomerOrder, fetchOutboundShipments, resolveCustomerOrderNumbers, fetchAllCustomerOrderNumbers, ensureItemsExist, type DeposcoTracking } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe, readCursor, writeCursor, chronicFailures, lastAttempts, chronicDue } from '../sync/db-log.js';
+import { salespersonName } from '../sync/salespersons.js';
 
 // local alias kept so existing signatures below read unchanged
 type BcConfig = SyncBcConfig;
@@ -76,6 +77,9 @@ const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline'
 const ORDER_SOURCE_FROM_PROGRAM = (process.env.SO_ORDER_SOURCE_FROM_PROGRAM ?? 'true').toLowerCase() === 'true';
 // Deposco trading partner all COs attach to (hardcoded for now; per-customer mapping later).
 const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
+// Sales rep NAME → Deposco customAttribute5 (Parker @ Deposco via Jack, Tech x Ops 2026-09-22).
+// The BC header only carries the Salesperson_Code; the name comes from bmiSalespersons (AL 2.18).
+const SALES_REP_ENABLED = (process.env.SO_SALES_REP_ENABLED ?? 'true').toLowerCase() === 'true';
 // Only push SO lines whose BC Location_Code is a WMS-tracked warehouse (default WMS only).
 // Non-WMS lines (PK / DROPSHIP / decoration / on-demand like ODENTIRE, ODTAGSWAG) are
 // skipped — Deposco doesn't fulfill them.
@@ -316,9 +320,30 @@ interface DeposcoCustomerOrderPayload {
     freightBillToAccount?: string;
     freightBillToContact?: DeposcoFreightBillToContact;
     shipToContact: DeposcoShipToContact;
+    // Sales rep name (customAttribute5 is where Deposco wants it; salesRepContact is the CO's own
+    // typed slot for the same person — both are sent so it shows wherever Deposco surfaces either).
+    customAttribute5?: string;
+    salesRepContact?: { name: string; firstName: string; lastName: string };
     channels: unknown[];
     coLines: { data: DeposcoCoLine[] };
   };
+}
+
+/** Resolve the rep name for a BC sales header, or null (blank code / unknown / disabled). Never throws. */
+async function salesRepFor(bcCfg: BcConfig, header: BcRow): Promise<string | null> {
+  if (!SALES_REP_ENABLED) return null;
+  const code = pick(header, 'Salesperson_Code');
+  if (!code) return null;
+  try {
+    const token = await getBcToken(bcCfg);
+    const companyId = await getCompanyId(bcCfg, token);
+    const name = await salespersonName(bcCfg, companyId, token, code);
+    if (!name) console.warn(`[co] ${pick(header, 'No')}: salesperson code '${code}' has no name in BC — customAttribute5 left blank`);
+    return name;
+  } catch (e) {
+    console.warn(`[co] ${pick(header, 'No')}: salesperson lookup failed (non-fatal): ${(e as Error).message}`);
+    return null;
+  }
 }
 
 // Ship-via comes straight off the SO header (unlike TO, which borrows it from a source SO).
@@ -368,7 +393,7 @@ function thirdPartyShipVia(service: string): string | null {
   return service ? (THIRD_PARTY_SHIP_VIA[normSvc(service)] ?? null) : null;
 }
 
-function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOrderPayload {
+function buildCustomerOrder(header: BcRow, rawLines: BcRow[], extras: { salesRep?: string | null } = {}): DeposcoCustomerOrderPayload {
   const soNumber = pick(header, 'No');
   const ship = headerShipping(header);
   // Third-party freight billing: when the SO bills freight to a third party, add the account #
@@ -409,6 +434,10 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[]): DeposcoCustomerOr
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       ...freight,
       shipToContact: shipToContact(header, soNumber),
+      ...(extras.salesRep ? {
+        customAttribute5: extras.salesRep,
+        salesRepContact: (() => { const p = extras.salesRep.trim().split(/\s+/); return { name: extras.salesRep, firstName: capName(p[0]), lastName: capName(p.slice(1).join(' ') || p[0]) }; })(),
+      } : {}),
       channels: [],
       coLines: { data },
     },
@@ -480,7 +509,9 @@ async function pushSo(bcCfg: BcConfig, deposcoCfg: DeposcoConfig, header: BcRow,
     console.log(`[push] ${soNumber}: already in Deposco (CO id ${existing}) — skipping create (no upsert yet)`);
     return 'skip';
   }
-  const payload = buildCustomerOrder(header, lines);
+  const salesRep = await salesRepFor(bcCfg, header);
+  const payload = buildCustomerOrder(header, lines, { salesRep });
+  if (salesRep) console.log(`[push] ${soNumber}: sales rep → customAttribute5 = "${salesRep}"`);
   const via = payload.customerOrder.shipVia;
   if (!via) console.warn(`[push] ${soNumber}: ⚠ no ship-via on SO header — CO may land in review`);
   // Pre-flight: a CO created with an unknown item gets an unrepairable unlinked line, so make
@@ -1391,7 +1422,7 @@ async function main(): Promise<void> {
     // necessarily byte-identical to what was sent historically if the payload has changed since.
     if (process.argv.includes('--print-payload')) {
       const lines = await getSoLines(odata, token, orderArg);
-      const payload = buildCustomerOrder(header, lines);
+      const payload = buildCustomerOrder(header, lines, { salesRep: await salesRepFor(bcCfg, header) });
       console.log(`POST ${deposcoCfg.apiBase}/orders/customerOrders`);
       console.log('Content-Type: application/json');
       console.log('Authorization: Bearer <redacted>\n');
