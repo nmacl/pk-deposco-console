@@ -80,6 +80,11 @@ const TRADING_PARTNER = process.env.DEPOSCO_TRADING_PARTNER || 'CTPK068417';
 // Sales rep NAME → Deposco customAttribute5 (Parker @ Deposco via Jack, Tech x Ops 2026-09-22).
 // The BC header only carries the Salesperson_Code; the name comes from bmiSalespersons (AL 2.18).
 const SALES_REP_ENABLED = (process.env.SO_SALES_REP_ENABLED ?? 'true').toLowerCase() === 'true';
+// What goes in customAttribute5. 'createdby' (default, per Nolan 2026-10-01) = the BC user who
+// entered the order (Assigned User ID / User_Name, e.g. CCROPPER) — DI orders carry no salesperson
+// at all (0 of 200 Released DI orders, none of their customers), so the rep code left them blank.
+// Falls back to the salesperson NAME when the user field is blank. 'salesperson' = rep name only.
+const SALES_REP_SOURCE = (process.env.SO_SALES_REP_SOURCE ?? 'createdby').toLowerCase();
 // Only push SO lines whose BC Location_Code is a WMS-tracked warehouse (default WMS only).
 // Non-WMS lines (PK / DROPSHIP / decoration / on-demand like ODENTIRE, ODTAGSWAG) are
 // skipped — Deposco doesn't fulfill them.
@@ -332,6 +337,10 @@ interface DeposcoCustomerOrderPayload {
 /** Resolve the rep name for a BC sales header, or null (blank code / unknown / disabled). Never throws. */
 async function salesRepFor(bcCfg: BcConfig, header: BcRow): Promise<string | null> {
   if (!SALES_REP_ENABLED) return null;
+  if (SALES_REP_SOURCE === 'createdby') {
+    const user = pick(header, 'Assigned_User_ID', 'User_Name').trim();
+    if (user) return user;
+  }
   const code = pick(header, 'Salesperson_Code');
   if (!code) return null;
   try {

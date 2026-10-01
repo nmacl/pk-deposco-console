@@ -67,5 +67,5 @@ Delivery channels (either/both; nothing set = console + `/alerts` only):
 | `PO_RECEIPT_POSTING_DATE` | `received` | Purchase receipts post on the Deposco received date; `header` = old behaviour. Closed-period → falls back to header date + logs a desync |
 | `RO_RECEIPT_POSTING_DATE` | `header` | Same for return receipts (flip to `received` once accounting confirms) |
 | `INV_POSTING_DATE` | `workdate` | `deposco` posts inventory adjustments on Deposco's adjustment date |
-| `SO_SALES_REP_ENABLED` | `true` | Salesperson name → CO `customAttribute5` + `salesRepContact` |
+| `SO_SALES_REP_ENABLED` / `SO_SALES_REP_SOURCE` | `true` / `createdby` | CO `customAttribute5` = BC entry user (Assigned User ID), falling back to the salesperson name; `salesperson` = rep name only |
 | `TO_TRACKING_ENABLED` | `true` | Deposco tracking → posted transfer shipment (`node dist/to/sync-to.js --backfill-tracking 30` for history) |
