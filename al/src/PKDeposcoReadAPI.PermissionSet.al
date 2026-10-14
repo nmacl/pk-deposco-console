@@ -25,6 +25,13 @@ permissionset 60200 "PK Deposco Read API"
         tabledata "PK Transfer Ship Tracking" = RIMD,
         tabledata "Transfer Shipment Header" = RM,
         tabledata "Salesperson/Purchaser" = R,
+        // 2.19: production orders (read-only) + transfer carrier/derived-line fields.
+        page "PK Production Order API" = X,
+        page "PK Production Order Line API" = X,
+        page "PK Prod. Order Component API" = X,
+        tabledata "Production Order" = R,
+        tabledata "Prod. Order Line" = R,
+        tabledata "Prod. Order Component" = R,
         codeunit "PK Inv Adjustment Mgt" = X,
         codeunit "PK Ship Tracking Mgt" = X,
         codeunit "PK Optional Field" = X,

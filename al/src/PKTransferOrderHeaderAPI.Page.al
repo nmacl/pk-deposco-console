@@ -42,7 +42,27 @@ page 60206 "PK Transfer Order Header API"
                 field(toPostCode; Rec."Transfer-to Post Code") { }
                 field(toContact; Rec."Transfer-to Contact") { }
                 field(toCountry; Rec."Trsf.-to Country/Region Code") { }
+                // 2.19: the transfer's OWN carrier — ship via must come from here, not the source SO.
+                field(shippingAgentCode; Rec."Shipping Agent Code") { }
+                field(shippingAgentServiceCode; Rec."Shipping Agent Service Code") { }
+                field(shipmentMethodCode; Rec."Shipment Method Code") { }
+                // Lanham E-Ship's "E-Ship Agent Service" on the transfer header, found by field NAME
+                // at runtime (their field number isn't known here and we take no dependency). Blank
+                // when the field doesn't exist.
+                field(eShipAgentService; EShipAgentService) { }
             }
         }
     }
+
+    var
+        EShipAgentService: Text[100];
+
+    trigger OnAfterGetRecord()
+    var
+        OptField: Codeunit "PK Optional Field";
+        RecRef: RecordRef;
+    begin
+        RecRef.GetTable(Rec);
+        EShipAgentService := CopyStr(OptField.FindTextByName(RecRef, 'E-Ship Agent Service'), 1, MaxStrLen(EShipAgentService));
+    end;
 }

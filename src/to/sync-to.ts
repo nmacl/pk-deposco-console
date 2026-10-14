@@ -91,9 +91,13 @@ interface BmiTransferHeader {
   postingDate: string; receiptDate: string; shipmentDate: string;
   toName: string; toAddress: string; toAddress2: string; toCity: string; toCounty: string;
   toPostCode: string; toContact: string; toCountry: string;
+  // 2.19 (AL): the transfer's own carrier. Absent on older AL → undefined → blank.
+  shippingAgentCode?: string; shippingAgentServiceCode?: string; shipmentMethodCode?: string; eShipAgentService?: string;
 }
 function adaptTransferHeader(h: BmiTransferHeader): BcRow {
   return {
+    Shipping_Agent_Code: h.shippingAgentCode ?? '', Shipping_Agent_Service_Code: h.shippingAgentServiceCode ?? '',
+    Shipment_Method_Code: h.shipmentMethodCode ?? '', LAX_E_Ship_Agent_Service: h.eShipAgentService ?? '',
     No: h.no, Status: h.status, Direct_Transfer: String(h.directTransfer),
     Transfer_from_Code: h.fromCode, Transfer_to_Code: h.toCode,
     Posting_Date: h.postingDate, Receipt_Date: h.receiptDate, Shipment_Date: h.shipmentDate,
@@ -132,12 +136,17 @@ async function getTransferLines(odata: string, token: string, toNumber: string):
 }
 
 // Flattened lines from our sibling extension (webshopVariantCode in one GET) — for the Deposco push.
-interface BmiToLine { lineNo: number; itemNo: string; variantCode: string; webshopVariantCode: string; quantity: number; }
+interface BmiToLine { lineNo: number; itemNo: string; variantCode: string; webshopVariantCode: string; quantity: number; derivedFromLineNo?: number }
 async function getBmiTransferLines(cfg: SyncBcConfig, companyId: string, toNumber: string): Promise<BmiToLine[]> {
   const token = await getBcToken(cfg);
   const filter = encodeURIComponent(`documentNo eq '${odataStr(toNumber)}'`);
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferOrderLines?$filter=${filter}`;
-  const lines = (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+  const raw = (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+  // When the origin ships, BC adds an in-transit copy of each line ("Derived From Line No." set,
+  // same item + qty). Pushing those as PO lines doubled every receive-side transfer in Deposco
+  // (TRFO003067: 2×150, TRFO003603: 2×1). Only the original lines describe the order.
+  const lines = raw.filter((l) => !(Number(l.derivedFromLineNo ?? 0) > 0));
+  if (lines.length < raw.length) console.log(`[to] ${toNumber}: ignoring ${raw.length - lines.length} derived in-transit line(s)`);
   // UPG's PK_BC18_TAB populates WebshopVariantCode on purchase/sales lines but NOT on transfer
   // lines (field 50201 comes back blank — e.g. TRFO001523). The mapping still exists at the
   // Item Variant level, so when a line has a BC variantCode but no webshop code, resolve it from
@@ -213,16 +222,23 @@ async function sourceOrderShipping(odata: string, token: string, sourceNo: strin
   if (!sourceNo) return null;
   const so = (await bcGet<{ value: BcRow[] }>(`${odata}/Sales_Order?$filter=${encodeURIComponent(`No eq '${odataStr(sourceNo)}'`)}`, token)).value?.[0];
   if (!so) return null;
-  const agent = pick(so, 'Shipping_Agent_Code');
-  const service = pick(so, 'Shipping_Agent_Service_Code');
-  // A mapped shuttle code becomes its Deposco name and carries no vendor (shuttles have none);
-  // anything else keeps the raw "AGENT SERVICE" form Deposco already accepts for carriers.
+  const ship = shippingFrom(so);
+  return { ...(ship ?? { shipVia: '', shipVendor: '', freightTermsType: 'Prepaid' }), programId: pick(so, 'ProgramID', 'ProgramId').trim() };
+}
+
+// Ship-via off a header row (transfer header or sales order), the way the CO push does it: the
+// E-Ship Agent Service (e.g. FEDEX_GROUND) is the ship via, the agent code the vendor. Without
+// it, transfers went over as just "FEDEX" (TRFO003575 → CO8092) because only the bare agent code
+// was read. A mapped shuttle agent becomes its Deposco name with no vendor.
+function shippingFrom(h: BcRow): Omit<ShipInfo, 'programId'> | null {
+  const agent = pick(h, 'LAX_Shipping_Agent_Code', 'Shipping_Agent_Code');
+  const service = pick(h, 'LAX_E_Ship_Agent_Service') || pick(h, 'Shipping_Agent_Service_Code');
+  if (!agent && !service) return null;
   const mapped = SHIPVIA_MAP.get(agent.toUpperCase());
   return {
     shipVendor: mapped ? '' : agent,
-    shipVia: mapped ?? [agent, service].filter(Boolean).join(' '),
-    freightTermsType: pick(so, 'LAX_Shipping_Payment_Type') || 'Prepaid',
-    programId: pick(so, 'ProgramID', 'ProgramId').trim(),
+    shipVia: mapped ?? (service || agent),
+    freightTermsType: pick(h, 'LAX_Shipping_Payment_Type') || 'Prepaid',
   };
 }
 
@@ -338,8 +354,13 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
       // carry no mapped agent, and is always the only source of programId.
       const sourceNo = pick(header, 'PKSourceNo', 'Transfer_to_Contact');
       const soShip = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
-      const lineShip = await transferLineShipping(bcOdataBase(cfg), await getBcToken(cfg), no);
-      const ship = lineShip ? { ...lineShip, programId: soShip?.programId ?? '' } : soShip;
+      // The transfer's OWN carrier (header E-Ship Agent Service / agent, AL >= 2.19) wins; then a
+      // mapped shuttle on its lines; the source SO is the fallback and the only source of programId.
+      const headShip = shippingFrom(header);
+      const lineShip = headShip ? null : await transferLineShipping(bcOdataBase(cfg), await getBcToken(cfg), no);
+      const own = headShip ?? lineShip;
+      const ship = own ? { ...own, programId: soShip?.programId ?? '' } : soShip;
+      if (headShip) console.log(`[push] ${no}: ship via from transfer header: ${headShip.shipVia}${headShip.shipVendor ? ` (${headShip.shipVendor})` : ''}`);
       if (!ship) console.warn(`[push] ${no}: no source SO shipping and no mapped line agent (source=${sourceNo || 'none'}) — CO may land in review`);
       // Pre-flight: CO creates with unknown items land unlinked and unrepairable (see ensureItemsExist).
       const preCreated = await ensureItemsExist(cfg, deposcoCfg, await getDeposcoToken(deposcoCfg), lines.map((l) => l.webshopVariantCode));

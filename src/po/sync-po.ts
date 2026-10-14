@@ -21,7 +21,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, latestReceiptDate, type PostResult } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, latestReceiptDate, todayLocal, type PostResult } from '../sync/orders.js';
 import { ensureTradingPartner, partnerRef } from '../sync/partners.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
@@ -42,11 +42,11 @@ const ORDER_SOURCE = process.env.DEPOSCO_ORDER_SOURCE ?? 'BusinessCentralOnline'
 // Vendor name → Deposco "Consignee Partner" on the PO (Tech x Ops 2026-09-22, Nicholas). The field
 // is a trading-partner reference, so the partner is find-or-created by vendor name first.
 const CONSIGNEE_PARTNER_ENABLED = (process.env.PO_CONSIGNEE_PARTNER_ENABLED ?? 'true').toLowerCase() === 'true';
-// Receipt posting date: 'received' = the day Deposco received the goods (the Deposco receipt's
-// createdDate, newest across the lines being posted) — what accounting asked for; 'header' = the
-// pre-2.18 behaviour (BC uses the order header's Posting Date, i.e. the order date, which made a
-// September receipt show up in the item ledger as August 1st).
-const RECEIPT_POSTING_DATE = (process.env.PO_RECEIPT_POSTING_DATE ?? 'received').toLowerCase();
+// Receipt posting date (and Document Date): 'today' = the day the receipt posts in BC, local time
+// (Jack, 2026-10-14: "set it equal to the system created at"); 'received' = the Deposco receipt's
+// createdDate, newest across the lines being posted; 'header' = the pre-2.18 behaviour (the order
+// header's Posting Date, i.e. the order date — a September receipt in the ledger as August 1st).
+const RECEIPT_POSTING_DATE = (process.env.PO_RECEIPT_POSTING_DATE ?? 'today').toLowerCase();
 // Only push PO lines stocked at a WMS-tracked warehouse (default WMS only). Non-WMS
 // lines (PK / dropship / decoration / on-demand) are skipped — Deposco doesn't fulfill
 // them. Mirrors co/sync-co.ts SO_WMS_LOCATIONS. Fail-closed: a line whose location can't
@@ -476,10 +476,10 @@ async function pullReceiptsForPo(
   // Posting date = the newest Deposco receipt date among the lines being posted (one BC receipt
   // covers this whole delta, so it can only carry one date; newest is the honest choice when a
   // delta spans two warehouse days).
-  const postingDate = RECEIPT_POSTING_DATE === 'received'
-    ? latestReceiptDate(receipts, new Set(toReceive.map((l) => l.lineNo)))
+  const postingDate = RECEIPT_POSTING_DATE === 'today' ? todayLocal()
+    : RECEIPT_POSTING_DATE === 'received' ? latestReceiptDate(receipts, new Set(toReceive.map((l) => l.lineNo)))
     : null;
-  console.log(`[pull] ${po.number}: posting ${total} units across ${toReceive.length} line(s)${postingDate ? ` on ${postingDate} (Deposco received date)` : ''}`);
+  console.log(`[pull] ${po.number}: posting ${total} units across ${toReceive.length} line(s)${postingDate ? ` on ${postingDate} (${RECEIPT_POSTING_DATE})` : ''}`);
   await postReceiveOnly(bcCfg, companyId, po, toReceive, postingDate);
 }
 

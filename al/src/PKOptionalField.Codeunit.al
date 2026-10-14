@@ -7,6 +7,22 @@
 // upload (which is exactly what a hard dependency did on 2026-07-15).
 codeunit 60221 "PK Optional Field"
 {
+    /// First field whose NAME contains NamePart (case-insensitive), as text; '' if none. For
+    /// another publisher's field when its number is unknown (e.g. Lanham E-Ship on Transfer Header).
+    procedure FindTextByName(RecRef: RecordRef; NamePart: Text): Text
+    var
+        FRef: FieldRef;
+        i: Integer;
+    begin
+        for i := 1 to RecRef.FieldCount() do begin
+            FRef := RecRef.FieldIndex(i);
+            if StrPos(UpperCase(FRef.Name), UpperCase(NamePart)) > 0 then
+                if FRef.Class = FieldClass::Normal then
+                    exit(Format(FRef.Value));
+        end;
+        exit('');
+    end;
+
     procedure AsCode(RecRef: RecordRef; FieldNo: Integer): Code[50]
     var
         FldRef: FieldRef;

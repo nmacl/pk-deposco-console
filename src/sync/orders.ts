@@ -125,6 +125,11 @@ export const deposcoLocalDate = (iso: string | undefined | null): string | null 
   return m ? m[1] : null;
 };
 
+/** Today's calendar date in the business's time zone (BC "system created at" day). The sync can
+ *  post a receipt after midnight UTC while it is still the same working day in Rhode Island. */
+export const todayLocal = (tz = process.env.BUSINESS_TZ ?? 'America/New_York'): string =>
+  new Date().toLocaleDateString('en-CA', { timeZone: tz });
+
 /** Newest local receipt date among the receipts on the given line numbers (BC line no. suffixes). */
 export function latestReceiptDate(receipts: DeposcoReceipt[], lineSeqs: Set<number>): string | null {
   let best: string | null = null;

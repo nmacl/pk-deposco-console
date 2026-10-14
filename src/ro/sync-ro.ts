@@ -32,7 +32,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchDeposcoReceipts, latestReceiptDate } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, fetchReceivedFromPurchaseOrder, fetchDeposcoReceipts, latestReceiptDate, todayLocal } from '../sync/orders.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
 const INTERVAL_MS = parseInt(process.env.RO_SYNC_INTERVAL_MS ?? '60000', 10);
@@ -178,7 +178,8 @@ async function pullReturn(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, bmi: str
   // Posting date = the day Deposco received (RO_RECEIPT_POSTING_DATE=received). Same fallback
   // shape as the PO worker: a closed-period rejection re-posts on the header date, visibly.
   let postingDate: string | null = null;
-  if (RECEIPT_POSTING_DATE === 'received') {
+  if (RECEIPT_POSTING_DATE === 'today') postingDate = todayLocal();
+  else if (RECEIPT_POSTING_DATE === 'received') {
     try {
       const receipts = await fetchDeposcoReceipts(deposcoCfg, dToken, poId);
       postingDate = latestReceiptDate(receipts, new Set(lines.filter((l) => (byLine.get(l.lineNo) ?? 0) > (l.returnQtyReceived ?? 0)).map((l) => l.lineNo)));

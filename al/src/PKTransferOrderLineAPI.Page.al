@@ -37,6 +37,11 @@ page 60200 "PK Transfer Order Line API"
                 field(quantityShipped; Rec."Quantity Shipped") { }
                 field(qtyToReceive; Rec."Qty. to Receive") { }
                 field(quantityReceived; Rec."Quantity Received") { }
+                // 2.19: non-zero on the in-transit copy BC derives when the origin ships. The
+                // middleware must skip those or a receive-side PO gets every line twice (TRFO003067).
+                field(derivedFromLineNo; Rec."Derived From Line No.") { }
+                field(shippingAgentCode; Rec."Shipping Agent Code") { }
+                field(shippingAgentServiceCode; Rec."Shipping Agent Service Code") { }
             }
         }
     }

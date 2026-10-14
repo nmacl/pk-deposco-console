@@ -64,7 +64,7 @@ Delivery channels (either/both; nothing set = console + `/alerts` only):
 | Env | Default | What |
 |---|---|---|
 | `PO_CONSIGNEE_PARTNER_ENABLED` | `true` | BC vendor name → Deposco PO `consigneePartner` (trading partner find-or-create by name) |
-| `PO_RECEIPT_POSTING_DATE` | `received` | Purchase receipts post on the Deposco received date; `header` = old behaviour. Closed-period → falls back to header date + logs a desync |
+| `PO_RECEIPT_POSTING_DATE` | `today` | Purchase receipt Posting + Document Date = day it posts in BC (`BUSINESS_TZ`, default America/New_York); `received` = Deposco receive date; `header` = old behaviour. Closed-period → falls back to header date + logs a desync |
 | `RO_RECEIPT_POSTING_DATE` | `header` | Same for return receipts (flip to `received` once accounting confirms) |
 | `INV_POSTING_DATE` | `workdate` | `deposco` posts inventory adjustments on Deposco's adjustment date |
 | `SO_SALES_REP_ENABLED` / `SO_SALES_REP_SOURCE` | `true` / `createdby` | CO `customAttribute5` = BC entry user (Assigned User ID), falling back to the salesperson name; `salesperson` = rep name only |
