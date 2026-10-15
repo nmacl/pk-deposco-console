@@ -46,10 +46,8 @@ codeunit 60227 "PK Purch Receive Mgt"
         if Req."Posting Date" <> 0D then begin
             PurchHeader.SetHideValidationDialog(true);
             PurchHeader.Validate("Posting Date", Req."Posting Date");
-            // Document Date does NOT follow Posting Date unless "Link Doc. Date To Posting Date" is
-            // on (it isn't) — receipts showed 2/3 (order date) next to a 10/6 posting date
-            // (WSP30255). A hand-posted receipt gets the receive date in both; match that.
-            PurchHeader.Validate("Document Date", Req."Posting Date");
+            // Posting Date ONLY. Document Date was briefly validated too (2.19–2.21) and reverted
+            // 2026-10-15 at Jack's request (WSP34848): accounting wants the document date untouched.
         end;
         PurchHeader.Modify();
 
