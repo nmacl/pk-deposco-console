@@ -32,6 +32,12 @@ permissionset 60200 "PK Deposco Read API"
         tabledata "Production Order" = R,
         tabledata "Prod. Order Line" = R,
         tabledata "Prod. Order Component" = R,
+        // 2.20: purchase return orders (PROD…, return to vendor), read-only for now.
+        page "PK Purchase Return Order API" = X,
+        page "PK Purchase Return Line API" = X,
+        codeunit "PK Purch Return Ship Mgt" = X,
+        tabledata "Purchase Header" = RM,
+        tabledata "Return Shipment Header" = R,
         codeunit "PK Inv Adjustment Mgt" = X,
         codeunit "PK Ship Tracking Mgt" = X,
         codeunit "PK Optional Field" = X,
@@ -49,7 +55,8 @@ permissionset 60200 "PK Deposco Read API"
         tabledata "PK Purch Receipt" = RIMD,
         tabledata "Purch. Rcpt. Header" = R,
         tabledata "Transfer Line" = R,
-        tabledata "Purchase Line" = R,
+        // RM: the pro worker PATCHes "Return Qty. to Ship" through bmiPurchaseReturnLines.
+        tabledata "Purchase Line" = RM,
         // Ship-only posting stages nothing itself, but Sales-Post reads/updates both the header
         // and the lines it posts, so R alone is not enough here. The elevated writes that posting
         // needs beyond this (shipment header/line, SKU auto-create) live on "PK Sales Ship Mgt".

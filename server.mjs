@@ -164,6 +164,20 @@ function runScheduledRoSync() {
   child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); roBusy = false; });
 }
 
+// Scheduled PRO sync (purchase return orders → Deposco CO ship flow). Same gating as RO.
+const PRO_SCHEDULE_MS = parseInt(process.env.PRO_SCHEDULE_MS ?? '300000', 10);
+let proBusy = false;
+function runScheduledProSync() {
+  if (proBusy) { console.log('[schedule] PRO sync skipped — previous run still running'); return; }
+  proBusy = true;
+  console.log(`[schedule] PRO sync tick @ ${new Date().toISOString()}`);
+  const child = spawn('node', [resolve(ROOT, 'dist/pro/sync-pro.js'), '--once'], { cwd: ROOT, env: { ...process.env, SYNC_TRIGGER: 'schedule', PRO_PUSH_ENABLED: process.env.PRO_PUSH_ENABLED ?? 'true' } });
+  child.stdout.on('data', (d) => process.stdout.write('[pro] ' + d));
+  child.stderr.on('data', (d) => process.stdout.write('[pro] ' + d));
+  child.on('close', () => { proBusy = false; });
+  child.on('error', (e) => { console.log('[schedule] spawn error:', e.message); proBusy = false; });
+}
+
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PORT = parseInt(process.env.PORT ?? process.env.WEB_PORT ?? '8787', 10);
 
@@ -185,6 +199,7 @@ function workerFor(order) {
   const u = order.toUpperCase();
   if (u.startsWith('TRFO')) return { script: 'dist/to/sync-to.js', kind: 'transfer' };
   if (u.startsWith('SRTO')) return { script: 'dist/ro/sync-ro.js', kind: 'sales return' };
+  if (u.startsWith('PROD')) return { script: 'dist/pro/sync-pro.js', kind: 'purchase return' };
   if (u.startsWith('WSP')) return { script: 'dist/po/sync-po.js', kind: 'purchase order' };
   if (/^(PKSO|WSOD|HDSO|DISO|TEST)/.test(u)) return { script: 'dist/co/sync-co.js', kind: 'sales order' };
   return null;
@@ -219,7 +234,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
   .err { color:#f85149; } .warn { color:#d29922; } .ok { color:#3fb950; } .dim { color:#6e7681; }
 </style></head><body>
 <header><h1>PK ↔ Deposco Sync Console &nbsp;<a href="/logs" style="font-size:12px;font-weight:500;color:#8957e5;">→ Sync Logs</a> &nbsp;<a href="/alerts" style="font-size:12px;font-weight:500;color:#d29922;">→ Alerts</a></h1>
-<div class="sub">Type one or more BC order #s — space/comma separated (TRFO / SRTO / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
+<div class="sub">Type one or more BC order #s — space/comma separated (TRFO / SRTO / PROD / WSP / PKSO / WSOD / HDSO / DISO / TEST). ① pushes to Deposco. ② posts the Deposco ship/receive back to BC. Runs sequentially.</div></header>
 <div class="bar">
   <input id="order" placeholder="WSOD139248, WSOD139249 TEST0001" autocomplete="off" spellcheck="false"/>
   <span id="type" class="chip">enter an order</span>
@@ -234,7 +249,7 @@ const PAGE = /* html */ `<!doctype html><html><head><meta charset="utf-8"/>
 <script>
 const $=(id)=>document.getElementById(id);
 const order=$('order'), type=$('type'), log=$('log');
-const kinds=[['TRFO','transfer'],['SRTO','sales return'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
+const kinds=[['TRFO','transfer'],['SRTO','sales return'],['PROD','purchase return'],['WSP','purchase order'],['PKSO','sales order'],['WSOD','sales order'],['HDSO','sales order'],['DISO','sales order'],['TEST','sales order']];
 function parseOrders(v){ return [...new Set(v.split(/[\\s,]+/).map(s=>s.trim().toUpperCase()).filter(Boolean))]; }
 function detectOne(o){ const m=kinds.find(([p])=>o.startsWith(p)); return m?m[1]:null; }
 function refresh(){
@@ -656,5 +671,6 @@ server.listen(PORT, () => {
   startScheduler('PO sync', runScheduledPoSync, PO_SCHEDULE_MS, 95_000);
   startScheduler('TO sync', runScheduledToSync, TO_SCHEDULE_MS, 140_000);
   startScheduler('RO sync (returns)', runScheduledRoSync, RO_SCHEDULE_MS, 185_000);
+  startScheduler('PRO sync (vendor returns)', runScheduledProSync, PRO_SCHEDULE_MS, 215_000);
   startScheduler('alerts sweep', runScheduledAlerts, ALERT_SCHEDULE_MS, 230_000);
 });

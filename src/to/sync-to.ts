@@ -352,7 +352,11 @@ async function pushTransfer(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, compan
       // the SO's FEDEX has been hand-corrected to "… Shuttle" in Deposco (the whole completed
       // EPDEC batch, TRFO001759/001806). The source SO still supplies ship-via when the lines
       // carry no mapped agent, and is always the only source of programId.
-      const sourceNo = pick(header, 'PKSourceNo', 'Transfer_to_Contact');
+      // Only a value shaped like a BC order number may be used as the source SO. Transfer_to_Contact
+      // is often a NAME ("Common Threads Embroidery"), and feeding that into a Sales_Order No. filter
+      // 400'd TRFO003157 on every tick for days (231 failures/day in /logs).
+      const looksLikeOrderNo = (v: string): boolean => /^[A-Z]{2,6}\d{3,}$/i.test(v.trim()) && v.trim().length <= 20;
+      const sourceNo = [pick(header, 'PKSourceNo'), pick(header, 'Transfer_to_Contact')].find(looksLikeOrderNo) ?? '';
       const soShip = await sourceOrderShipping(bcOdataBase(cfg), await getBcToken(cfg), sourceNo);
       // The transfer's OWN carrier (header E-Ship Agent Service / agent, AL >= 2.19) wins; then a
       // mapped shuttle on its lines; the source SO is the fallback and the only source of programId.
