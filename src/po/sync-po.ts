@@ -253,7 +253,10 @@ async function pushPo(
   // Create gets orderStatus='New'; update omits orderStatus (Deposco rejects downgrades).
   // Both paths POST to the same upsert endpoint.
   const deposcoToken = await getDeposcoToken(deposcoCfg);
-  const existing = await lookupDeposcoOrderId(deposcoCfg, deposcoToken, '/orders/purchaseOrders', { number: po.number });
+  // liveOnly: a PO whose only Deposco copy is Canceled must count as absent, so the re-push sends
+  // orderStatus 'New' and reopens it. Without it the update path is taken and Deposco 400s with
+  // "cannot be updated while in the status of Canceled" forever (WSP35045, 2026-10-16).
+  const existing = await lookupDeposcoOrderId(deposcoCfg, deposcoToken, '/orders/purchaseOrders', { number: po.number }, { liveOnly: true });
   const isCreate = existing === null;
 
   // ONE GET: lines already flattened with location + webshopVariantCode + qty + cost + date.
