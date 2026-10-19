@@ -221,6 +221,9 @@ export interface ShippedResult {
   /** Fulfillment orders whose line list Deposco truncated (see nestedTruncated). Non-empty means
    *  some shipped lines are UNREADABLE, so posting only what we saw under-ships BC. */
   truncatedOrders: string[];
+  /** Deposco `orderStatus` of each fulfillment salesOrder (New / Picking / Back Ordered / Ship
+   *  Complete …) — the "Current Status" column on Deposco's Order List. */
+  statuses: string[];
 }
 
 export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: string, customerOrderId: number): Promise<ShippedResult> {
@@ -229,7 +232,13 @@ export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: str
     `${cfg.apiBase}/orders/customerOrders/${customerOrderId}`, token)).customerOrder;
   const lines: DeposcoCoLineShip[] = [];
   const truncatedOrders: string[] = [];
+  const statuses: string[] = [];
   for (const fo of co?.fulfillmentOrders ?? []) {
+    try {
+      const so = await authReq<{ orderStatus?: string; salesOrder?: { orderStatus?: string } }>('get', `${cfg.apiBase}/orders/salesOrders/${fo.id}`, token);
+      const st = so.orderStatus ?? so.salesOrder?.orderStatus;
+      if (st) statuses.push(st);
+    } catch { /* status is informational — never block the shipped-qty read */ }
     // Read the lines from the SUB-RESOURCE, walked to the end — not from the order detail's
     // nested `orderLines`. The nested copy is capped at 10 rows with no reachable page 2 (see
     // nestedTruncated), which silently under-reports any order over 10 lines: SO320 showed 10
@@ -259,7 +268,7 @@ export async function fetchShippedFromFulfillment(cfg: DeposcoConfig, token: str
       console.warn(`[deposco] fulfillment ${label}: only ${rows.length} line(s) readable and the set is incomplete — the rest are UNREADABLE via the API`);
     }
   }
-  return { lines, truncatedOrders };
+  return { lines, truncatedOrders, statuses };
 }
 
 /**

@@ -93,9 +93,12 @@ interface BmiTransferHeader {
   toPostCode: string; toContact: string; toCountry: string;
   // 2.19 (AL): the transfer's own carrier. Absent on older AL → undefined → blank.
   shippingAgentCode?: string; shippingAgentServiceCode?: string; shipmentMethodCode?: string; eShipAgentService?: string;
+  // 2.23 (AL): Deposco "Current Status" mirrored onto the header; systemId keys the bound action.
+  systemId?: string; deposcoStatus?: string;
 }
 function adaptTransferHeader(h: BmiTransferHeader): BcRow {
   return {
+    SystemId: h.systemId ?? '', PK_Deposco_Status: h.deposcoStatus ?? '',
     Shipping_Agent_Code: h.shippingAgentCode ?? '', Shipping_Agent_Service_Code: h.shippingAgentServiceCode ?? '',
     Shipment_Method_Code: h.shipmentMethodCode ?? '', LAX_E_Ship_Agent_Service: h.eShipAgentService ?? '',
     No: h.no, Status: h.status, Direct_Transfer: String(h.directTransfer),
@@ -137,11 +140,37 @@ async function getTransferLines(odata: string, token: string, toNumber: string):
 
 // Flattened lines from our sibling extension (webshopVariantCode in one GET) — for the Deposco push.
 interface BmiToLine { lineNo: number; itemNo: string; variantCode: string; webshopVariantCode: string; quantity: number; derivedFromLineNo?: number }
-async function getBmiTransferLines(cfg: SyncBcConfig, companyId: string, toNumber: string): Promise<BmiToLine[]> {
-  const token = await getBcToken(cfg);
+async function getRawBmiTransferLines(cfg: SyncBcConfig, companyId: string, token: string, toNumber: string): Promise<BmiToLine[]> {
   const filter = encodeURIComponent(`documentNo eq '${odataStr(toNumber)}'`);
   const url = `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferOrderLines?$filter=${filter}`;
-  const raw = (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+  return (await authReq<{ value: BmiToLine[] }>('get', url, token)).value ?? [];
+}
+// derived in-transit line no. → the origin line it was derived from. The OData TransferOrderLines
+// page (used for the posting PATCH) does not expose "Derived From Line No.", so this is the only
+// place the worker can tell the two apart.
+async function derivedLineMap(cfg: SyncBcConfig, companyId: string, token: string, toNumber: string): Promise<Map<number, number>> {
+  const m = new Map<number, number>();
+  for (const l of await getRawBmiTransferLines(cfg, companyId, token, toNumber)) {
+    const from = Number(l.derivedFromLineNo ?? 0);
+    if (from > 0) m.set(Number(l.lineNo), from);
+  }
+  return m;
+}
+// Deposco quantities keyed on a derived line fold back onto the origin line. Deposco POs pushed
+// before 2.19 carry the derived copies as real lines (TRFO003603-20000), and the warehouse
+// received against those — BC can only post on the origin line.
+function foldDerived(confirmed: Map<number, number>, derived: Map<number, number>, no: string): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const [ln, qty] of confirmed) {
+    const target = derived.get(ln) ?? ln;
+    if (target !== ln) console.log(`[pull] ${no}: Deposco L${ln} is a derived in-transit line → counting ${qty} on origin L${target}`);
+    out.set(target, (out.get(target) ?? 0) + qty);
+  }
+  return out;
+}
+async function getBmiTransferLines(cfg: SyncBcConfig, companyId: string, toNumber: string): Promise<BmiToLine[]> {
+  const token = await getBcToken(cfg);
+  const raw = await getRawBmiTransferLines(cfg, companyId, token, toNumber);
   // When the origin ships, BC adds an in-transit copy of each line ("Derived From Line No." set,
   // same item + qty). Pushing those as PO lines doubled every receive-side transfer in Deposco
   // (TRFO003067: 2×150, TRFO003603: 2×1). Only the original lines describe the order.
@@ -411,13 +440,17 @@ interface PostedLeg { action: 'postShipment' | 'postReceipt'; staged: number; do
 
 // Post one leg: PATCH each line's qty up to the Deposco-confirmed target, then fire the action.
 // Returns the posted leg, or null when nothing was outstanding (in sync — the common case).
-async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', qtyField: 'Qty_to_Ship' | 'Qty_to_Receive', postedField: 'Quantity_Shipped' | 'Quantity_Received', confirmed: Map<number, number>, direct: boolean): Promise<PostedLeg | null> {
+async function postLeg(cfg: SyncBcConfig, companyId: string, no: string, action: 'postShipment' | 'postReceipt', qtyField: 'Qty_to_Ship' | 'Qty_to_Receive', postedField: 'Quantity_Shipped' | 'Quantity_Received', confirmed: Map<number, number>, direct: boolean, derived: Map<number, number>): Promise<PostedLeg | null> {
   const odata = bcOdataBase(cfg);
   const token = await getBcToken(cfg);
   const lines = await getTransferLines(odata, token, no);
   let staged = 0;
   for (const l of lines) {
     const ln = numOf(l, 'Line_No');
+    // Derived in-transit lines are not postable: BC's ship/receive posting filters them out, so a
+    // PATCHed Qty. to Ship on one yields "There is nothing to post because the document does not
+    // contain a quantity or amount" (TRFO003603, 2026-10-19).
+    if (derived.has(ln)) continue;
     const dep = confirmed.get(ln) ?? 0;
     const posted = numOf(l, postedField);
     const qty = numOf(l, 'Quantity');
@@ -564,42 +597,66 @@ async function backfillTransferTracking(cfg: SyncBcConfig, deposcoCfg: DeposcoCo
   console.log(`[backfill] done — tracked=${ok} skipped=${skip} failed=${fail}`);
 }
 
+// Mirror Deposco's "Current Status" onto the open Transfer Header (AL 2.23 field, shown on the
+// Transfer Order card + list). Best-effort: a stamp failure never blocks the posting legs.
+async function stampDeposcoStatus(cfg: SyncBcConfig, companyId: string, header: BcRow, status: string): Promise<void> {
+  const no = pick(header, 'No');
+  const systemId = pick(header, 'SystemId');
+  if (!status || !systemId || status === pick(header, 'PK_Deposco_Status')) return;
+  try {
+    const token = await getBcToken(cfg);
+    await authReq('post', `${bmiApiBase(cfg)}/companies(${companyId})/bmiTransferHeaders(${systemId})/Microsoft.NAV.setDeposcoStatus`, token, { data: { status: status.slice(0, 30) } });
+    console.log(`[to] ${no}: Deposco status → "${status}"`);
+  } catch (err) {
+    const e = err as AxiosError;
+    console.warn(`[to] ${no}: could not stamp Deposco status "${status}" (HTTP ${e.response?.status ?? '?'}) — AL 2.23 not published?`);
+  }
+}
+
 async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, header: BcRow, plan: TransferPlan, direct: boolean): Promise<PostedLeg[]> {
   const no = pick(header, 'No');
   const dToken = await getDeposcoToken(deposcoCfg);
   const legs: PostedLeg[] = [];
+  const derived = await derivedLineMap(cfg, companyId, await getBcToken(cfg), no);
 
   if (plan === 'receive' || plan === 'both') {
     const poId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/purchaseOrders', { number: no });
     if (poId === null) { console.log(`[pull] ${no}: not in Deposco (purchaseOrder) yet — skip receive`); return legs; }
-    const recv = new Map<number, number>();
+    try {
+      const po = await authReq<{ orderStatus?: string; purchaseOrder?: { orderStatus?: string } }>('get', `${deposcoCfg.apiBase}/orders/purchaseOrders/${poId}`, dToken);
+      await stampDeposcoStatus(cfg, companyId, header, po.orderStatus ?? po.purchaseOrder?.orderStatus ?? '');
+    } catch { /* informational */ }
+    let recv = new Map<number, number>();
     const received = await fetchReceivedFromPurchaseOrder(deposcoCfg, dToken, poId);
     if (received.truncated) console.error(`[pull] ${no}: ❌ Deposco truncated the PO line list (>10 lines) — received qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
     for (const r of received.lines) recv.set(r.line, (recv.get(r.line) ?? 0) + r.quantity);
+    recv = foldDerived(recv, derived, no);
     console.log(`[pull] ${no}: RECEIVE — Deposco received ${[...recv].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}`);
     // Origin doesn't post its own shipment, so post it (→ in transit) then receive — both to the received qty.
-    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', recv, direct);
+    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', recv, direct, derived);
     if (shipLeg) legs.push(shipLeg);
-    const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', recv, direct);
+    const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', recv, direct, derived);
     if (recvLeg) legs.push(recvLeg);
   } else if (plan === 'ship') {
     const coId = await lookupDeposcoOrderId(deposcoCfg, dToken, '/orders/customerOrders', { externalOrderNumber: no });
     if (coId === null) { console.log(`[pull] ${no}: not in Deposco (customerOrder) yet — skip ship`); return legs; }
-    const shipped = new Map<number, number>();
+    let shipped = new Map<number, number>();
     const ship = await fetchShippedFromFulfillment(deposcoCfg, dToken, coId);
+    await stampDeposcoStatus(cfg, companyId, header, [...new Set(ship.statuses)].join(' / '));
     if (ship.truncatedOrders.length > 0) console.error(`[pull] ${no}: ❌ Deposco truncated the line list on ${ship.truncatedOrders.join(', ')} (>10 lines) — shipped qty beyond the first page is unreadable and will NOT post. Post the remainder manually.`);
     for (const l of ship.lines) {
       const ln = parseInt(l.externalLineNumber ?? '', 10);
       if (Number.isFinite(ln)) shipped.set(ln, (shipped.get(ln) ?? 0) + Number(l.shippedQuantity ?? 0));
     }
+    shipped = foldDerived(shipped, derived, no);
     console.log(`[pull] ${no}: SHIP — Deposco shipped ${[...shipped].map(([k, v]) => `L${k}=${v}`).join(' ') || '(none)'}${direct ? ' (direct → ship+receive)' : ''}`);
-    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', shipped, direct);
+    const shipLeg = await postLeg(cfg, companyId, no, 'postShipment', 'Qty_to_Ship', 'Quantity_Shipped', shipped, direct, derived);
     if (shipLeg) legs.push(shipLeg);
     // Stamp Deposco tracking onto the shipment just posted (or, if nothing posted this tick, onto
     // this order's single still-untracked shipment — covers a label that arrived after the post).
     await writeTransferTrackingBack(cfg, deposcoCfg, companyId, no, shipLeg?.doc || null, coId);
     if (direct) {
-      const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', shipped, direct);
+      const recvLeg = await postLeg(cfg, companyId, no, 'postReceipt', 'Qty_to_Receive', 'Quantity_Received', shipped, direct, derived);
       if (recvLeg) legs.push(recvLeg);
     }
   }

@@ -22,6 +22,7 @@ permissionset 60200 "PK Deposco Read API"
         page "PK Transfer Shipment Read API" = X,
         page "PK Salesperson API" = X,
         codeunit "PK Transfer Ship Tracking Mgt" = X,
+        codeunit "PK Transfer Deposco Status Mgt" = X,
         tabledata "PK Transfer Ship Tracking" = RIMD,
         tabledata "Transfer Shipment Header" = RM,
         tabledata "Salesperson/Purchaser" = R,
@@ -71,7 +72,8 @@ permissionset 60200 "PK Deposco Read API"
         tabledata "Item" = R,
         tabledata "Item Variant" = R,
         tabledata "Location" = R,
-        tabledata "Transfer Header" = R,
+        // RM: the Deposco status stamp (setDeposcoStatus → "PK Transfer Deposco Status Mgt").
+        tabledata "Transfer Header" = RM,
         // Tracking write-back: buffer/audit table + annotate an already-posted sales
         // shipment (no insert/delete). The elevated Modify runs in "PK Ship Tracking Mgt".
         tabledata "PK Ship Tracking" = RIMD,

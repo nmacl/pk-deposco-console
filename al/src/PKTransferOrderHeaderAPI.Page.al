@@ -50,12 +50,31 @@ page 60206 "PK Transfer Order Header API"
                 // at runtime (their field number isn't known here and we take no dependency). Blank
                 // when the field doesn't exist.
                 field(eShipAgentService; EShipAgentService) { }
+                // 2.23: Deposco "Current Status" mirrored onto the open transfer (see the tableextension).
+                field(deposcoStatus; Rec."PK Deposco Status") { }
+                field(deposcoStatusAt; Rec."PK Deposco Status At") { }
             }
         }
     }
 
     var
         EShipAgentService: Text[100];
+
+    // Write the Deposco status onto the header. Bound action so the page itself stays read-only:
+    //   POST .../bmiTransferHeaders({systemId})/Microsoft.NAV.setDeposcoStatus  { "status": "Picking" }
+    [ServiceEnabled]
+    procedure setDeposcoStatus(var ActionContext: WebServiceActionContext; status: Text[30])
+    var
+        Mgt: Codeunit "PK Transfer Deposco Status Mgt";
+        TransferHeader: Record "Transfer Header";
+    begin
+        TransferHeader.GetBySystemId(Rec.SystemId);
+        Mgt.Apply(TransferHeader, status);
+        ActionContext.SetObjectType(ObjectType::Page);
+        ActionContext.SetObjectId(Page::"PK Transfer Order Header API");
+        ActionContext.AddEntityKey(Rec.FieldNo(SystemId), Rec.SystemId);
+        ActionContext.SetResultCode(WebServiceActionResultCode::Get);
+    end;
 
     trigger OnAfterGetRecord()
     var
