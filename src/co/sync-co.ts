@@ -329,6 +329,9 @@ interface DeposcoCustomerOrderPayload {
     // typed slot for the same person — both are sent so it shows wherever Deposco surfaces either).
     customAttribute5?: string;
     salesRepContact?: { name: string; firstName: string; lastName: string };
+    // BC External Document No. (the customer's PO ref) — Deposco prints it on the shipping
+    // label from customAttribute4 (ops, 2026-10-22).
+    customAttribute4?: string;
     channels: unknown[];
     coLines: { data: DeposcoCoLine[] };
   };
@@ -443,6 +446,7 @@ function buildCustomerOrder(header: BcRow, rawLines: BcRow[], extras: { salesRep
       ...(ship ? { shipVia: ship.shipVia, shipVendor: ship.shipVendor, freightTermsType: ship.freightTermsType } : {}),
       ...freight,
       shipToContact: shipToContact(header, soNumber),
+      ...(pick(header, 'External_Document_No').trim() ? { customAttribute4: pick(header, 'External_Document_No').trim() } : {}),
       ...(extras.salesRep ? {
         customAttribute5: extras.salesRep,
         salesRepContact: (() => { const p = extras.salesRep.trim().split(/\s+/); return { name: extras.salesRep, firstName: capName(p[0]), lastName: capName(p.slice(1).join(' ') || p[0]) }; })(),
