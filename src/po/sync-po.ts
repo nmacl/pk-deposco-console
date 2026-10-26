@@ -21,7 +21,7 @@ import { getBcToken } from '../auth.js';
 import { getDeposcoToken, type DeposcoConfig } from '../deposco.js';
 import { loadBcConfig, loadDeposcoConfig, type SyncBcConfig } from '../sync/config.js';
 import { bcApiBase, bcOdataBase, bmiApiBase, getCompanyId, authReq } from '../sync/bc-client.js';
-import { postDeposcoOrder, lookupDeposcoOrderId, fetchDeposcoReceipts, latestReceiptDate, todayLocal, type PostResult } from '../sync/orders.js';
+import { postDeposcoOrder, lookupDeposcoOrderId, reopenDeposcoOrder, fetchDeposcoReceipts, latestReceiptDate, todayLocal, type PostResult } from '../sync/orders.js';
 import { ensureTradingPartner, partnerRef } from '../sync/partners.js';
 import { startRun, finishRun, logEvent, closeDb, dailyDedupe } from '../sync/db-log.js';
 
@@ -256,7 +256,18 @@ async function pushPo(
   // liveOnly: a PO whose only Deposco copy is Canceled must count as absent, so the re-push sends
   // orderStatus 'New' and reopens it. Without it the update path is taken and Deposco 400s with
   // "cannot be updated while in the status of Canceled" forever (WSP35045, 2026-10-16).
-  const existing = await lookupDeposcoOrderId(deposcoCfg, deposcoToken, '/orders/purchaseOrders', { number: po.number }, { liveOnly: true });
+  let existing = await lookupDeposcoOrderId(deposcoCfg, deposcoToken, '/orders/purchaseOrders', { number: po.number }, { liveOnly: true });
+  if (existing === null) {
+    // Deposco keys POs on number, so a Canceled copy blocks a fresh create (the order POST refuses
+    // the Canceled→New status change). Reopen it through /status, then UPDATE it like any live PO.
+    // Mirrors the sales-order remediation path ops already use: cancel in Deposco, fix in BC, re-push.
+    const cancelled = await lookupDeposcoOrderId(deposcoCfg, deposcoToken, '/orders/purchaseOrders', { number: po.number });
+    if (cancelled !== null) {
+      console.log(`[push] ${po.number}: Deposco copy id=${cancelled} is Canceled — reopening via /status so the re-push can update it`);
+      if (await reopenDeposcoOrder(deposcoCfg, deposcoToken, '/orders/purchaseOrders', cancelled, po.number)) existing = cancelled;
+      else console.error(`[push] ${po.number}: ❌ could not reopen the Canceled Deposco PO — un-cancel it in the Deposco UI, then re-push`);
+    }
+  }
   const isCreate = existing === null;
 
   // ONE GET: lines already flattened with location + webshopVariantCode + qty + cost + date.

@@ -107,6 +107,32 @@ export async function lookupDeposcoOrderId(
   return chosen.self?.id ?? null;
 }
 
+/**
+ * Reopen a Canceled Deposco order so the upsert POST can update it again. Deposco keys purchase
+ * orders on `number`, so unlike customer orders a cancelled PO cannot be shadowed by a fresh copy:
+ * the order POST 400s with "Order status updates are not accepted for order at this API Endpoint
+ * ... Please use the `/status` endpoint" (WSP35045, 2026-10-16). GET {endpoint}/{id}/status returns
+ * {"orderStatus":"Canceled"}; the write shape is unconfirmed, so PUT is tried first, then POST.
+ * Returns true when a follow-up GET shows the order is no longer cancelled.
+ */
+export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endpoint: string, id: number, logKey: string): Promise<boolean> {
+  const url = `${cfg.apiBase}${endpoint}/${id}/status`;
+  for (const method of ['put', 'post'] as const) {
+    try {
+      await authReq(method, url, token, { data: { orderStatus: 'New' } });
+      break;
+    } catch (err) {
+      const e = err as AxiosError;
+      console.warn(`[reopen] ${logKey}: ${method.toUpperCase()} ${endpoint}/${id}/status → HTTP ${e.response?.status ?? '?'}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 300)}`);
+      if (method === 'post') return false;
+    }
+  }
+  const after = await authReq<{ orderStatus?: string }>('get', url, token);
+  const ok = !isCancelled(after);
+  console.log(`[reopen] ${logKey}: Deposco id=${id} status now "${after.orderStatus ?? '?'}"${ok ? '' : ' — still cancelled'}`);
+  return ok;
+}
+
 export interface DeposcoReceipt {
   receivedItem: { businessKey: { number: string } };
   receivedPackQuantity: number;

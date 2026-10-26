@@ -111,7 +111,7 @@ export function deposcoThrottle(): Promise<void> {
 const isDeposco = (url: string): boolean => url.includes('deposco.com');
 
 export async function authReq<T>(
-  method: 'get' | 'post' | 'patch',
+  method: 'get' | 'post' | 'patch' | 'put',
   url: string,
   token: string,
   opts: { data?: unknown; params?: Record<string, unknown>; headers?: Record<string, string>; timeout?: number } = {},
