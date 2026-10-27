@@ -118,13 +118,28 @@ export async function lookupDeposcoOrderId(
 export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endpoint: string, id: number, logKey: string): Promise<boolean> {
   const url = `${cfg.apiBase}${endpoint}/${id}/status`;
   const tried: string[] = [];
-  for (const method of ['put', 'post'] as const) {
+  // 2026-10-27 (sync_events action=reopen): PUT → 405, POST {orderStatus:'New'} → 400 with an EMPTY
+  // body, so POST is the verb and the payload shape is wrong. Sweep the plausible shapes, stop at
+  // the first 2xx; the reopen fail row records every rejection so the winner can be read back.
+  // ponytail: trim to the accepted variant once the DB shows one.
+  const variants: Array<{ data?: unknown; params?: Record<string, unknown> }> = [
+    { data: { orderStatus: 'New' } },
+    { data: { status: 'New' } },
+    { data: { orderStatus: 'Open' } },
+    { data: { orderStatus: 'Hold' } },
+    { params: { orderStatus: 'New' } },
+    { data: { orderStatus: 'New', businessUnit: cfg.company } },
+  ];
+  for (const v of variants) {
+    const label = `POST ${endpoint}/${id}/status ${JSON.stringify(v)}`;
     try {
-      await authReq(method, url, token, { data: { orderStatus: 'New' } });
+      const r = await authReq('post', url, token, v);
+      console.log(`[reopen] ${logKey}: ${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
+      tried.push(`${label} → ok`);
       break;
     } catch (err) {
       // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
-      const msg = `${method.toUpperCase()} ${endpoint}/${id}/status → ${(err as Error).message}`;
+      const msg = `${label} → ${(err as Error).message}`;
       console.warn(`[reopen] ${logKey}: ${msg.slice(0, 400)}`);
       tried.push(msg);
     }
