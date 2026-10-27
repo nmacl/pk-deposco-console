@@ -122,20 +122,26 @@ export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endp
   // body, so POST is the verb and the payload shape is wrong. Sweep the plausible shapes, stop at
   // the first 2xx; the reopen fail row records every rejection so the winner can be read back.
   // ponytail: trim to the accepted variant once the DB shows one.
-  const variants: Array<{ data?: unknown; params?: Record<string, unknown> }> = [
-    { data: { orderStatus: 'New' } },
-    { data: { status: 'New' } },
-    { data: { orderStatus: 'Open' } },
-    { data: { orderStatus: 'Hold' } },
-    { params: { orderStatus: 'New' } },
-    { data: { orderStatus: 'New', businessUnit: cfg.company } },
+  // Round 1 (15:43Z): every body shape on POST {endpoint}/{id}/status → bare 400, even the
+  // body-less query-param form, so the payload is not what is rejected. Round 2 varies verb + path.
+  const bu = cfg.company;
+  const upsertShaped = { businessUnit: bu, number: logKey, orderStatus: 'New' };
+  const variants: Array<{ method: 'post' | 'put' | 'patch'; path: string; data?: unknown }> = [
+    { method: 'patch', path: `${endpoint}/${id}/status`, data: { orderStatus: 'New' } },
+    { method: 'post',  path: `${endpoint}/${id}/status`, data: upsertShaped },
+    { method: 'post',  path: `${endpoint}/${encodeURIComponent(logKey)}/status`, data: { orderStatus: 'New' } },
+    { method: 'put',   path: `${endpoint}/${encodeURIComponent(logKey)}/status`, data: { orderStatus: 'New' } },
+    { method: 'post',  path: `${endpoint}/status`, data: upsertShaped },
+    { method: 'post',  path: `${endpoint}/status`, data: [upsertShaped] },
+    { method: 'post',  path: `/orders/${encodeURIComponent(logKey)}/status`, data: { orderStatus: 'New' } },
+    { method: 'post',  path: `${endpoint}/${id}/status`, data: { orderStatus: 'New', reason: 'reopened by BC re-push' } },
   ];
   for (const v of variants) {
-    const label = `POST ${endpoint}/${id}/status ${JSON.stringify(v)}`;
+    const label = `${v.method.toUpperCase()} ${v.path} ${JSON.stringify(v.data)}`;
     try {
-      const r = await authReq('post', url, token, v);
+      const r = await authReq(v.method, `${cfg.apiBase}${v.path}`, token, { data: v.data });
       console.log(`[reopen] ${logKey}: ${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
-      tried.push(`${label} → ok`);
+      tried.push(`${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
       break;
     } catch (err) {
       // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
