@@ -122,27 +122,29 @@ export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endp
   // body, so POST is the verb and the payload shape is wrong. Sweep the plausible shapes, stop at
   // the first 2xx; the reopen fail row records every rejection so the winner can be read back.
   // ponytail: trim to the accepted variant once the DB shows one.
-  // Round 1 (15:43Z): every body shape on POST {endpoint}/{id}/status → bare 400, even body-less.
-  // Round 2 (15:51Z): PUT/PATCH → 405; number-keyed path → "Parameter orderId … should be of type
-  // Long", so POST {endpoint}/{id}/status IS the endpoint. Round 3: is the bare 400 "transition
-  // not allowed"? Posting the current status (Canceled) is a no-op — a 2xx there means the shape
-  // is right and Canceled is terminal; a 400 means the shape is still wrong.
-  const variants: Array<{ method: 'post' | 'put' | 'patch'; path: string; data?: unknown }> = [
-    { method: 'post', path: `${endpoint}/${id}/status`, data: { orderStatus: 'Canceled' } },
-    { method: 'post', path: `${endpoint}/${id}/status`, data: { orderStatus: 'NEW' } },
-    { method: 'post', path: `${endpoint}/${id}/status`, data: { orderStatus: 'Ready' } },
-    { method: 'post', path: `${endpoint}/${id}/status`, data: { orderStatus: 'Released' } },
-    { method: 'post', path: `${endpoint}/${id}/status`, data: { orderStatus: { name: 'New' } } },
-    { method: 'post', path: `${endpoint}/${id}/status`, data: 'New' },
+  // Round 1 (15:43Z): every JSON body on POST {endpoint}/{id}/status → bare 400, even body-less.
+  // Round 2 (15:51Z): PUT/PATCH → 405; number-keyed path → "orderId … should be of type Long".
+  // Round 3 (16:00Z): even the no-op {orderStatus:'Canceled'} → bare 400, so the TRANSITION is not
+  // what is refused — the request shape is. A bare 400 (no errors[] body) reads like a framework
+  // "missing parameter" rejection. Round 4: query-param names, a path segment, form bodies.
+  const sp = `${endpoint}/${id}/status`;
+  const form = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  const variants: Array<{ method: 'post'; path: string; data?: unknown; params?: Record<string, unknown>; headers?: Record<string, string> }> = [
+    { method: 'post', path: sp, params: { status: 'New' } },
+    { method: 'post', path: sp, params: { newStatus: 'New' } },
+    { method: 'post', path: sp, params: { orderStatus: 'New' }, data: { orderStatus: 'New' } },
+    { method: 'post', path: `${sp}/New`, data: {} },
+    { method: 'post', path: sp, data: 'orderStatus=New', headers: form },
+    { method: 'post', path: sp, data: 'status=New', headers: form },
+    { method: 'post', path: sp, data: { orderStatus: 'New' }, headers: { Accept: 'application/json' } },
   ];
   for (const v of variants) {
-    const label = `${v.method.toUpperCase()} ${v.path} ${JSON.stringify(v.data)}`;
+    const label = `${v.method.toUpperCase()} ${v.path}${v.params ? '?' + new URLSearchParams(v.params as Record<string, string>).toString() : ''} ${JSON.stringify(v.data)}${v.headers ? ' ' + JSON.stringify(v.headers) : ''}`;
     try {
-      const r = await authReq(v.method, `${cfg.apiBase}${v.path}`, token, { data: v.data });
+      const r = await authReq(v.method, `${cfg.apiBase}${v.path}`, token, { data: v.data, params: v.params, headers: v.headers });
       console.log(`[reopen] ${logKey}: ${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
       tried.push(`${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
-      // Do not stop on the no-op probe: keep looking for one that actually reopens.
-      if (!(typeof v.data === 'object' && v.data !== null && (v.data as { orderStatus?: unknown }).orderStatus === 'Canceled')) break;
+      break;
     } catch (err) {
       // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
       const msg = `${label} → ${(err as Error).message}`;
