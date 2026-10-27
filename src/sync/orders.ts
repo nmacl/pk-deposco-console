@@ -122,35 +122,23 @@ export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endp
   // body, so POST is the verb and the payload shape is wrong. Sweep the plausible shapes, stop at
   // the first 2xx; the reopen fail row records every rejection so the winner can be read back.
   // ponytail: trim to the accepted variant once the DB shows one.
-  // Round 1 (15:43Z): every JSON body on POST {endpoint}/{id}/status → bare 400, even body-less.
-  // Round 2 (15:51Z): PUT/PATCH → 405; number-keyed path → "orderId … should be of type Long".
-  // Round 3 (16:00Z): even the no-op {orderStatus:'Canceled'} → bare 400, so the TRANSITION is not
-  // what is refused — the request shape is. A bare 400 (no errors[] body) reads like a framework
-  // "missing parameter" rejection. Round 4: query-param names, a path segment, form bodies.
-  const sp = `${endpoint}/${id}/status`;
-  const form = { 'Content-Type': 'application/x-www-form-urlencoded' };
-  const variants: Array<{ method: 'post'; path: string; data?: unknown; params?: Record<string, unknown>; headers?: Record<string, string> }> = [
-    { method: 'post', path: sp, params: { status: 'New' } },
-    { method: 'post', path: sp, params: { newStatus: 'New' } },
-    { method: 'post', path: sp, params: { orderStatus: 'New' }, data: { orderStatus: 'New' } },
-    { method: 'post', path: `${sp}/New`, data: {} },
-    { method: 'post', path: sp, data: 'orderStatus=New', headers: form },
-    { method: 'post', path: sp, data: 'status=New', headers: form },
-    { method: 'post', path: sp, data: { orderStatus: 'New' }, headers: { Accept: 'application/json' } },
-  ];
-  for (const v of variants) {
-    const label = `${v.method.toUpperCase()} ${v.path}${v.params ? '?' + new URLSearchParams(v.params as Record<string, string>).toString() : ''} ${JSON.stringify(v.data)}${v.headers ? ' ' + JSON.stringify(v.headers) : ''}`;
-    try {
-      const r = await authReq(v.method, `${cfg.apiBase}${v.path}`, token, { data: v.data, params: v.params, headers: v.headers });
-      console.log(`[reopen] ${logKey}: ${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
-      tried.push(`${label} → ok ${JSON.stringify(r).slice(0, 200)}`);
-      break;
-    } catch (err) {
-      // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
-      const msg = `${label} → ${(err as Error).message}`;
-      console.warn(`[reopen] ${logKey}: ${msg.slice(0, 400)}`);
-      tried.push(msg);
-    }
+  // 2026-10-27 probe rounds (sync_events action=reopen, WSP35045 / id 9342):
+  //   PUT, PATCH                                  → 405
+  //   POST {endpoint}/{number}/status             → "Parameter orderId … should be of type Long"
+  //   POST {endpoint}/status, /status/New         → 405 / 404
+  //   POST {endpoint}/{id}/status with ANY body   → bare 400, no errors[] — JSON {orderStatus|status:
+  //     New|NEW|Open|Hold|Ready|Released|Canceled(no-op)}, {orderStatus:{name}}, bare string,
+  //     form-encoded, ?status= / ?newStatus= / ?orderStatus=, +businessUnit, +Accept header.
+  // So POST {endpoint}/{id:Long}/status is the endpoint, and it refuses everything we have sent,
+  // including the no-op. Either Canceled is terminal there or the body needs a field the gated
+  // Developer Portal documents. One attempt per tick, recorded below, until that page is read.
+  try {
+    await authReq('post', url, token, { data: { orderStatus: 'New' } });
+  } catch (err) {
+    // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
+    const msg = `POST ${endpoint}/${id}/status {"orderStatus":"New"} → ${(err as Error).message}`;
+    console.warn(`[reopen] ${logKey}: ${msg.slice(0, 400)}`);
+    tried.push(msg);
   }
   const after = await authReq<{ orderStatus?: string }>('get', url, token);
   const ok = !isCancelled(after);
