@@ -117,19 +117,28 @@ export async function lookupDeposcoOrderId(
  */
 export async function reopenDeposcoOrder(cfg: DeposcoConfig, token: string, endpoint: string, id: number, logKey: string): Promise<boolean> {
   const url = `${cfg.apiBase}${endpoint}/${id}/status`;
+  const tried: string[] = [];
   for (const method of ['put', 'post'] as const) {
     try {
       await authReq(method, url, token, { data: { orderStatus: 'New' } });
       break;
     } catch (err) {
-      const e = err as AxiosError;
-      console.warn(`[reopen] ${logKey}: ${method.toUpperCase()} ${endpoint}/${id}/status → HTTP ${e.response?.status ?? '?'}: ${JSON.stringify(e.response?.data ?? e.message).slice(0, 300)}`);
-      if (method === 'post') return false;
+      // authReq throws a plain Error whose message already carries "HTTP <status>: <body> — <path>".
+      const msg = `${method.toUpperCase()} ${endpoint}/${id}/status → ${(err as Error).message}`;
+      console.warn(`[reopen] ${logKey}: ${msg.slice(0, 400)}`);
+      tried.push(msg);
     }
   }
   const after = await authReq<{ orderStatus?: string }>('get', url, token);
   const ok = !isCancelled(after);
   console.log(`[reopen] ${logKey}: Deposco id=${id} status now "${after.orderStatus ?? '?'}"${ok ? '' : ' — still cancelled'}`);
+  if (!ok) {
+    // Only POs reopen today. Persist Deposco's answer: Railway stdout is the only other place the
+    // response lands, and without this row the /status write shape cannot be debugged from the DB.
+    const summary = `reopen via /status failed — still "${after.orderStatus ?? '?'}": ${tried.map((t) => t.slice(0, 220)).join(' || ')}`;
+    await logEvent({ worker: 'po', direction: 'bc->deposco', entityType: 'order', entityId: logKey, action: 'reopen', status: 'fail', side: 'deposco',
+      message: summary.slice(0, 300), detail: { id, after, tried }, dedupeKey: dailyDedupe('po-reopen', logKey, summary) });
+  }
   return ok;
 }
 
