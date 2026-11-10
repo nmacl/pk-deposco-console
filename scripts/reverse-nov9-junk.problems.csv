@@ -1,0 +1,2 @@
+deposco_adjustment_id,bc_item_no,variant_code,location,reversal_qty,qty_actually_posted,status,reason
+5186,6000013647,00002,WESTERLY,-7,0,fail,"You have insufficient quantity of Item 6000013647 on inventory."

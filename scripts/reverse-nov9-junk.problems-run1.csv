@@ -1,0 +1,7 @@
+deposco_adjustment_id,bc_item_no,variant_code,location,reversal_qty,qty_actually_posted,status,reason
+6980,500548818,00002,WESTERLY,-1,0,fail,"HTTP ECONNABORTED: ""timeout of 30000ms exceeded"" — POST /v2.0/c93df08a-282d-4d69-b189-3b021ad6218e/PRODUCTION/api/bmi/pk/v1.0/companies(0f7be801-6df3-f011-8405-0022481cc88c)/bmiInventoryAdjustments"
+5908,100044044,00012,WESTERLY,-2,0,fail,"HTTP ECONNABORTED: ""timeout of 30000ms exceeded"" — POST /v2.0/c93df08a-282d-4d69-b189-3b021ad6218e/PRODUCTION/api/bmi/pk/v1.0/companies(0f7be801-6df3-f011-8405-0022481cc88c)/bmiInventoryAdjustments"
+5907,500545949,00005,WESTERLY,-54,0,fail,"The record in table Item Ledger Entry already exists. Identification fields and values: Entry No.='5164046'"
+5457,6000009056,00001,WESTERLY,-2,-1,clamped,"CLAMPED (desync): Deposco delta -2, BC on-hand 1 — floored to 0 (short 1)"
+5186,6000013647,00002,WESTERLY,-7,0,fail,"You have insufficient quantity of Item 6000013647 on inventory."
+4358,6000009836,00001,WESTERLY,-6,0,fail,"HTTP ECONNABORTED: ""timeout of 30000ms exceeded"" — POST /v2.0/c93df08a-282d-4d69-b189-3b021ad6218e/PRODUCTION/api/bmi/pk/v1.0/companies(0f7be801-6df3-f011-8405-0022481cc88c)/bmiInventoryAdjustments"
