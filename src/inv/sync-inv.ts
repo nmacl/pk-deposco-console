@@ -125,7 +125,17 @@ interface Desync { id: number; webshop: string; item: string; location: string; 
 async function pull(cfg: SyncBcConfig, deposcoCfg: DeposcoConfig, companyId: string, state: State, onlyId?: number): Promise<void> {
   const dToken = await getDeposcoToken(deposcoCfg);
   const bToken = await getBcToken(cfg);
-  const all = await fetchInventoryAdjustments(deposcoCfg, dToken, {}); // all types — cursor must clear the whole range
+  // Ask Deposco for true adjustments only. With its Inventory General Ledger switched on (2026-11-09
+  // 12:45 CT → 11-10 12:00 CT, ids 4124-7452) this feed also carries every bin move, shipment and
+  // receipt (MOV/SHP/REC), and the unfiltered API labels all of them "Adjustment" — the pull posted
+  // 2,860 of them to BC as positive adjustments ($1.43M) before it was caught. The actionType filter
+  // is the only field that tells them apart: it returns ADJ records and nothing else. Status changes
+  // are no longer fetched (they were only ever skipped), and the cursor still advances past the gaps
+  // because it is a high-water mark over whatever comes back.
+  // Cost: while the ledger is on, real manual adjustments are written as MAD and the filter hides
+  // those too — nothing posts rather than everything. A single --adj replay stays unfiltered so one
+  // of those can still be pulled by id.
+  const all = await fetchInventoryAdjustments(deposcoCfg, dToken, onlyId ? {} : { actionType: 'Adjustment' });
 
   let inRange = all.filter((a) => a.self?.id != null);
   if (onlyId) inRange = inRange.filter((a) => a.self.id === onlyId);
